@@ -10,6 +10,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
 use std::sync::Mutex;
 
+use serde::Serialize;
+
 /// 指标保留时长：24 小时。
 pub const RETENTION_MINUTES: i64 = 24 * 60;
 /// 单个排行在每个分钟桶里最多保留的条目数。超过后新值不再进入排行，
@@ -413,20 +415,20 @@ impl Agg {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct Count {
     pub name: String,
     pub count: u64,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct Point {
     pub ts: i64,
     pub requests: u64,
     pub blocked: u64,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct DashboardData {
     pub requests: u64,
     pub pv: u64,
@@ -444,6 +446,8 @@ pub struct DashboardData {
     pub series: Vec<Point>,
     pub ops: Vec<u32>,
     pub range_secs: i64,
+    /// 原始 IP 列表只给 GeoIP 聚合使用，不下发到前端
+    #[serde(skip)]
     pub ips: Vec<(IpAddr, u32)>,
 }
 

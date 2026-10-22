@@ -153,7 +153,7 @@ pub struct EventFilter {
 }
 
 /// 一条分钟级流量聚合。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct TrafficBucketRow {
     pub minute: i64,
     pub app: String,
@@ -565,16 +565,162 @@ impl Store {
 
     /// 取一段时间内（检测 + 限流）事件命中的规则串，用于分类统计。
     pub fn event_rule_strings(&self, since: i64, limit: usize) -> Result<Vec<String>, StoreError> {
+        self.event_rule_strings_between(since, i64::MAX, limit)
+    }
+
+    /// 同上，但带右边界，供按天生成的报告使用。
+    pub fn event_rule_strings_between(
+        &self,
+        since: i64,
+        until: i64,
+        limit: usize,
+    ) -> Result<Vec<String>, StoreError> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 r#"
                 SELECT rules FROM events
-                WHERE ts >= ?1 AND kind IN ('detect', 'ratelimit') AND rules <> ''
+                WHERE ts >= ?1 AND ts < ?2 AND kind IN ('detect', 'ratelimit') AND rules <> ''
                 ORDER BY ts DESC
-                LIMIT ?2
+                LIMIT ?3
                 "#,
             )?;
-            let rows = stmt.query_map(params![since, limit as i64], |r| r.get(0))?;
+            let rows = stmt.query_map(params![since, until, limit as i64], |r| r.get(0))?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        })
+    }
+
+    /// 按事件类型统计，返回 `(类型, 条数)`，按条数倒序。
+    ///
+    /// `action` 传 `Some("block")` 时只统计被拦截的事件。
+    pub fn event_kind_counts(
+        &self,
+        since: i64,
+        until: i64,
+        action: Option<&str>,
+    ) -> Result<Vec<(String, usize)>, StoreError> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT kind, COUNT(*) FROM events
+                WHERE ts >= ?1 AND ts < ?2 AND (?3 IS NULL OR action = ?3)
+                GROUP BY kind ORDER BY COUNT(*) DESC
+                "#,
+            )?;
+            let rows = stmt.query_map(params![since, until, action], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as usize))
+            })?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        })
+    }
+
+    /// 事件趋势：按固定宽度与类型聚合，返回 `(桶起点, 类型, 条数)`。
+    pub fn event_series_by_kind(
+        &self,
+        since: i64,
+        until: i64,
+        group_secs: i64,
+    ) -> Result<Vec<(i64, String, usize)>, StoreError> {
+        let group = group_secs.max(60);
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT (ts / ?3) * ?3 AS bucket, kind, COUNT(*) FROM events
+                WHERE ts >= ?1 AND ts < ?2
+                GROUP BY bucket, kind ORDER BY bucket
+                "#,
+            )?;
+            let rows = stmt.query_map(params![since, until, group], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)? as usize,
+                ))
+            })?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        })
+    }
+
+    /// 时间范围内去重来源 IP 数。
+    pub fn event_ip_count(
+        &self,
+        since: i64,
+        until: i64,
+        action: Option<&str>,
+    ) -> Result<usize, StoreError> {
+        self.with_conn(|conn| {
+            let n: i64 = conn.query_row(
+                r#"
+                SELECT COUNT(DISTINCT client_ip) FROM events
+                WHERE ts >= ?1 AND ts < ?2 AND (?3 IS NULL OR action = ?3)
+                  AND client_ip <> ''
+                "#,
+                params![since, until, action],
+                |r| r.get(0),
+            )?;
+            Ok(n as usize)
+        })
+    }
+
+    /// 来源 IP 排行，`(ip, 事件数)`，按事件数倒序。
+    pub fn top_event_ips(
+        &self,
+        since: i64,
+        until: i64,
+        action: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<(String, usize)>, StoreError> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT client_ip, COUNT(*) FROM events
+                WHERE ts >= ?1 AND ts < ?2 AND (?3 IS NULL OR action = ?3)
+                  AND client_ip <> ''
+                GROUP BY client_ip ORDER BY COUNT(*) DESC, client_ip
+                LIMIT ?4
+                "#,
+            )?;
+            let rows = stmt.query_map(params![since, until, action, limit as i64], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as usize))
+            })?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        })
+    }
+
+    /// ACL 命中原因分布（黑名单、CIDR、方法限制等），返回 `(原因, 条数)`。
+    pub fn acl_reason_counts(
+        &self,
+        since: i64,
+        until: i64,
+        limit: usize,
+    ) -> Result<Vec<(String, usize)>, StoreError> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT rules, COUNT(*) FROM events
+                WHERE ts >= ?1 AND ts < ?2 AND kind = 'acl' AND rules <> ''
+                GROUP BY rules ORDER BY COUNT(*) DESC, rules
+                LIMIT ?3
+                "#,
+            )?;
+            let rows = stmt.query_map(params![since, until, limit as i64], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as usize))
+            })?;
             let mut out = Vec::new();
             for r in rows {
                 out.push(r?);
@@ -1437,6 +1583,42 @@ mod tests {
         assert_eq!(rules.len(), 2);
         assert!(rules.iter().any(|r| r == "xss-script-tag"));
         assert!(rules.iter().any(|r| r == "cc-ip"));
+    }
+
+    #[test]
+    fn security_aggregates_by_kind_and_ip() {
+        let s = store();
+        s.insert_event(&Event::new(NOW, EventKind::Detect, "1.1.1.1").with_action("block"))
+            .unwrap();
+        s.insert_event(&Event::new(NOW + 1, EventKind::Detect, "1.1.1.1").with_action("log"))
+            .unwrap();
+        s.insert_event(
+            &Event::new(NOW + 2, EventKind::Challenge, "2.2.2.2").with_action("block"),
+        )
+        .unwrap();
+        s.insert_event(
+            &Event::new(NOW + 3, EventKind::Acl, "2.2.2.2").with_rules("黑名单规则 ban-1"),
+        )
+        .unwrap();
+
+        let kinds = s.event_kind_counts(NOW, NOW + 10, None).unwrap();
+        assert_eq!(kinds.iter().find(|(k, _)| k == "detect").unwrap().1, 2);
+
+        let blocked = s.event_kind_counts(NOW, NOW + 10, Some("block")).unwrap();
+        assert_eq!(blocked.iter().map(|(_, n)| n).sum::<usize>(), 2);
+
+        let ips = s.top_event_ips(NOW, NOW + 10, None, 10).unwrap();
+        assert_eq!(ips[0], ("1.1.1.1".to_string(), 2));
+        assert_eq!(s.event_ip_count(NOW, NOW + 10, None).unwrap(), 2);
+        assert_eq!(s.event_ip_count(NOW, NOW + 10, Some("block")).unwrap(), 2);
+
+        let series = s.event_series_by_kind(NOW, NOW + 10, 60).unwrap();
+        assert!(series.iter().any(|(_, kind, _)| kind == "challenge"));
+
+        let acl = s.acl_reason_counts(NOW, NOW + 10, 10).unwrap();
+        assert_eq!(acl[0], ("黑名单规则 ban-1".to_string(), 1));
+
+        assert!(s.event_rule_strings_between(NOW, NOW + 2, 10).unwrap().is_empty());
     }
 
     #[test]

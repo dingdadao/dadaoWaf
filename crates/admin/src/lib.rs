@@ -7,6 +7,7 @@
 
 pub mod geoip;
 
+use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -74,6 +75,11 @@ pub fn router(state: Ctx) -> Router {
         .route("/", get(index))
         .route("/api/stats", get(stats))
         .route("/api/stats/geo", get(geo_stats))
+        .route("/api/security", get(security))
+        .route("/api/reports", get(list_reports))
+        .route("/api/reports/{day}", get(report_detail))
+        .route("/api/reports/{day}/csv", get(report_csv))
+        .route("/api/screen", get(screen))
         .route("/api/geoip", get(geoip_status))
         .route("/api/apps", get(list_apps).post(upsert_app))
         .route("/api/apps/{id}", delete(delete_app))
@@ -190,6 +196,12 @@ struct Stats {
     hourly: Vec<HourBucket>,
     /// 最近 24 小时的攻击类型分布
     categories: Vec<CategoryCount>,
+    /// 本次查询的时间范围（秒）
+    range: i64,
+    /// 本次查询的应用过滤
+    app: Option<String>,
+    /// 流量看板完整数据，供统计报表「流量分析」页签使用
+    traffic: homewaf_proxy::TrafficDashboard,
 }
 
 #[derive(Serialize)]
@@ -205,13 +217,19 @@ struct CategoryCount {
     count: usize,
 }
 
-async fn stats(State(ctx): State<Ctx>, headers: HeaderMap) -> Response {
+async fn stats(
+    State(ctx): State<Ctx>,
+    headers: HeaderMap,
+    Query(q): Query<RangeQuery>,
+) -> Response {
     if !authorized(&ctx, &headers) {
         return unauthorized();
     }
 
     let state = ctx.shared.load_full();
     let now = homewaf_acl::now_unix();
+    let range = q.range.unwrap_or(86_400).clamp(60, 86_400);
+    let app = norm_app(&q.app);
 
     let events_blocked = ctx
         .store
@@ -240,38 +258,8 @@ async fn stats(State(ctx): State<Ctx>, headers: HeaderMap) -> Response {
         hourly[idx].blocked += blocked;
     }
 
-    // 分类映射必须读取当前生效规则集，否则订阅规则会全部落进 other
-    let matcher = state.engine.matcher();
-    let mut category_counts: std::collections::HashMap<&str, usize> =
-        std::collections::HashMap::new();
-    let rule_categories: std::collections::HashMap<&str, &str> = matcher
-        .metas()
-        .map(|r| (r.id.as_str(), r.category.as_str()))
-        .collect();
-
-    for rules in ctx
-        .store
-        .event_rule_strings(start, 50_000)
-        .unwrap_or_default()
-    {
-        for rule in rules.split(',').filter(|s| !s.is_empty()) {
-            let category = rule_categories
-                .get(rule)
-                .copied()
-                .unwrap_or_else(|| if rule.starts_with("cc-") { "cc" } else { "other" });
-            *category_counts.entry(category).or_insert(0) += 1;
-        }
-    }
-
-    let mut categories: Vec<CategoryCount> = category_counts
-        .into_iter()
-        .map(|(name, count)| CategoryCount {
-            name: name.to_string(),
-            count,
-        })
-        .collect();
-    categories.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.name.cmp(&b.name)));
-    categories.truncate(8);
+    let categories = attack_categories(&state, &ctx.store, start, now + 1);
+    let traffic = ctx.metrics.dashboard(range, app, now);
 
     Json(Stats {
         apps: state.router.len(),
@@ -284,6 +272,9 @@ async fn stats(State(ctx): State<Ctx>, headers: HeaderMap) -> Response {
         observe_mode: state.engine.is_observe_mode(),
         hourly,
         categories,
+        range,
+        app: app.map(str::to_string),
+        traffic,
     })
     .into_response()
 }
@@ -293,12 +284,136 @@ async fn stats(State(ctx): State<Ctx>, headers: HeaderMap) -> Response {
 // ============================================================
 
 #[derive(Deserialize)]
-struct GeoQuery {
+struct RangeQuery {
     /// 时间范围（秒），默认 24 小时
     #[serde(default)]
     range: Option<i64>,
     #[serde(default)]
     app: Option<String>,
+}
+
+/// 统一去掉空白的应用过滤，`""` 视为不过滤。
+fn norm_app(app: &Option<String>) -> Option<&str> {
+    app.as_deref().map(str::trim).filter(|s| !s.is_empty())
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct NameCount {
+    name: String,
+    count: usize,
+}
+
+#[derive(Serialize)]
+struct IpRow {
+    ip: String,
+    count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    geo: Option<geoip::GeoInfo>,
+}
+
+/// 安全态势趋势点：按事件类型分列。
+#[derive(Default, Serialize)]
+struct KindPoint {
+    ts: i64,
+    detect: usize,
+    ban: usize,
+    acl: usize,
+    ratelimit: usize,
+    challenge: usize,
+}
+
+/// 把事件命中的规则 id 映射成攻击类型分布。
+///
+/// 映射表取自当前生效的检测规则集，订阅规则也能正确归类。
+fn attack_categories(
+    state: &homewaf_proxy::RuntimeState,
+    store: &Store,
+    since: i64,
+    until: i64,
+) -> Vec<CategoryCount> {
+    let matcher = state.engine.matcher();
+    let rule_categories: std::collections::HashMap<&str, &str> = matcher
+        .metas()
+        .map(|r| (r.id.as_str(), r.category.as_str()))
+        .collect();
+
+    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for rules in store
+        .event_rule_strings_between(since, until, 50_000)
+        .unwrap_or_default()
+    {
+        for rule in rules.split(',').filter(|s| !s.is_empty()) {
+            let category = rule_categories
+                .get(rule)
+                .copied()
+                .unwrap_or_else(|| if rule.starts_with("cc-") { "cc" } else { "other" });
+            *counts.entry(category).or_insert(0) += 1;
+        }
+    }
+
+    let mut out: Vec<CategoryCount> = counts
+        .into_iter()
+        .map(|(name, count)| CategoryCount {
+            name: name.to_string(),
+            count,
+        })
+        .collect();
+    out.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.name.cmp(&b.name)));
+    out.truncate(8);
+    out
+}
+
+/// 规则命中排行。一个事件可能同时命中多条规则，逐条计数。
+fn rule_hits(store: &Store, since: i64, until: i64, limit: usize) -> Vec<NameCount> {
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for rules in store
+        .event_rule_strings_between(since, until, 50_000)
+        .unwrap_or_default()
+    {
+        for rule in rules.split(',').filter(|s| !s.is_empty()) {
+            *counts.entry(rule.to_string()).or_insert(0) += 1;
+        }
+    }
+    let mut out: Vec<NameCount> = counts
+        .into_iter()
+        .map(|(name, count)| NameCount { name, count })
+        .collect();
+    out.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.name.cmp(&b.name)));
+    out.truncate(limit);
+    out
+}
+
+/// 给来源 IP 排行补上归属地。查库发生在控制台请求路径，不在代理热路径。
+fn ip_rows(geoip: &geoip::GeoIp, pairs: &[(String, usize)]) -> Vec<IpRow> {
+    pairs
+        .iter()
+        .map(|(ip, count)| IpRow {
+            ip: ip.clone(),
+            count: *count,
+            geo: ip.parse::<IpAddr>().ok().and_then(|ip| geoip.lookup(ip)),
+        })
+        .collect()
+}
+
+/// 把 `(ip, 次数)` 转成地图聚合结果。
+fn geo_stats_from(geoip: &geoip::GeoIp, pairs: &[(String, usize)]) -> geoip::GeoStats {
+    let parsed: Vec<(IpAddr, u32)> = pairs
+        .iter()
+        .filter_map(|(ip, n)| ip.parse::<IpAddr>().ok().map(|ip| (ip, *n as u32)))
+        .collect();
+    geoip.resolve(&parsed)
+}
+
+/// 百分比，保留两位小数；分母为 0 时返回 0。
+fn rate(part: u64, total: u64) -> f64 {
+    if total == 0 {
+        return 0.0;
+    }
+    ((part as f64) * 10_000.0 / (total as f64)).round() / 100.0
+}
+
+fn date_of(ts: i64) -> String {
+    format_utc(ts).chars().take(10).collect()
 }
 
 async fn geoip_status(State(ctx): State<Ctx>, headers: HeaderMap) -> Response {
@@ -314,20 +429,565 @@ async fn geoip_status(State(ctx): State<Ctx>, headers: HeaderMap) -> Response {
 async fn geo_stats(
     State(ctx): State<Ctx>,
     headers: HeaderMap,
-    Query(q): Query<GeoQuery>,
+    Query(q): Query<RangeQuery>,
 ) -> Response {
     if !authorized(&ctx, &headers) {
         return unauthorized();
     }
     let range = q.range.unwrap_or(86_400).clamp(60, 86_400);
-    let app = q
-        .app
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
+    let app = norm_app(&q.app);
     let now = homewaf_acl::now_unix();
     let data = ctx.metrics.dashboard(range, app, now);
     Json(ctx.geoip.resolve(&data.ips)).into_response()
+}
+
+// ============================================================
+// 安全态势
+// ============================================================
+
+/// 安全态势最多回看 30 天，避免一张页面把整库扫一遍。
+const SECURITY_MAX_RANGE: i64 = 30 * 86_400;
+
+#[derive(Serialize)]
+struct SecurityTotals {
+    events: usize,
+    blocked: usize,
+    attack_ips: usize,
+}
+
+#[derive(Serialize)]
+struct SecurityStats {
+    generated_at: i64,
+    range: i64,
+    totals: SecurityTotals,
+    /// 事件类型分布：detect / ban / acl / ratelimit / challenge
+    kinds: Vec<NameCount>,
+    /// 按类型拆分的趋势，供多线折线图
+    series: Vec<KindPoint>,
+    /// 按攻击类型（规则分类）分布
+    categories: Vec<CategoryCount>,
+    /// ACL 命中原因：黑名单、CIDR、方法限制等
+    acl_reasons: Vec<NameCount>,
+    /// 规则命中排行
+    rules: Vec<NameCount>,
+    /// 攻击来源排行（带归属地）
+    top_ips: Vec<IpRow>,
+    /// 实时事件流
+    recent: Vec<homewaf_store::Event>,
+}
+
+async fn security(
+    State(ctx): State<Ctx>,
+    headers: HeaderMap,
+    Query(q): Query<RangeQuery>,
+) -> Response {
+    if !authorized(&ctx, &headers) {
+        return unauthorized();
+    }
+
+    let now = homewaf_acl::now_unix();
+    let range = q.range.unwrap_or(86_400).clamp(60, SECURITY_MAX_RANGE);
+    let since = now - range + 1;
+    let until = now + 1;
+
+    let kinds: Vec<NameCount> = ctx
+        .store
+        .event_kind_counts(since, until, None)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(name, count)| NameCount { name, count })
+        .collect();
+    let blocked: usize = ctx
+        .store
+        .event_kind_counts(since, until, Some("block"))
+        .unwrap_or_default()
+        .iter()
+        .map(|(_, n)| n)
+        .sum();
+    let events: usize = kinds.iter().map(|k| k.count).sum();
+    let attack_ips = ctx
+        .store
+        .event_ip_count(since, until, Some("block"))
+        .unwrap_or(0);
+
+    let group = if range <= 3_600 {
+        60
+    } else if range <= 21_600 {
+        300
+    } else {
+        3_600
+    };
+    let mut points: std::collections::BTreeMap<i64, KindPoint> = std::collections::BTreeMap::new();
+    for (ts, kind, n) in ctx
+        .store
+        .event_series_by_kind(since, until, group)
+        .unwrap_or_default()
+    {
+        let p = points.entry(ts).or_insert_with(|| KindPoint {
+            ts,
+            ..Default::default()
+        });
+        match kind.as_str() {
+            "detect" => p.detect += n,
+            "ban" => p.ban += n,
+            "acl" => p.acl += n,
+            "ratelimit" => p.ratelimit += n,
+            "challenge" => p.challenge += n,
+            _ => {}
+        }
+    }
+
+    let state = ctx.shared.load_full();
+    let categories = attack_categories(&state, &ctx.store, since, until);
+    let acl_reasons = ctx
+        .store
+        .acl_reason_counts(since, until, 10)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(name, count)| NameCount { name, count })
+        .collect();
+    let rules = rule_hits(&ctx.store, since, until, 10);
+    let top = ctx
+        .store
+        .top_event_ips(since, until, None, 10)
+        .unwrap_or_default();
+    let top_ips = ip_rows(&ctx.geoip, &top);
+    let recent = ctx
+        .store
+        .query_events(&homewaf_store::EventFilter {
+            limit: 20,
+            since: Some(since),
+            ..Default::default()
+        })
+        .map(|(events, _)| events)
+        .unwrap_or_default();
+
+    Json(SecurityStats {
+        generated_at: now,
+        range,
+        totals: SecurityTotals {
+            events,
+            blocked,
+            attack_ips,
+        },
+        kinds,
+        series: points.into_values().collect(),
+        categories,
+        acl_reasons,
+        rules,
+        top_ips,
+        recent,
+    })
+    .into_response()
+}
+
+// ============================================================
+// 防护报告
+// ============================================================
+
+#[derive(Deserialize)]
+struct ReportsQuery {
+    /// 回看天数，默认 30
+    #[serde(default)]
+    days: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct ReportQuery {
+    #[serde(default)]
+    app: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ReportSummary {
+    /// 报告 id 就是当天 00:00 的 Unix 时间戳
+    id: i64,
+    date: String,
+    requests: u64,
+    blocked: u64,
+    events: usize,
+    block_rate: f64,
+}
+
+#[derive(Serialize)]
+struct ReportDetail {
+    id: i64,
+    date: String,
+    app: Option<String>,
+    generated_at: i64,
+    totals: homewaf_store::TrafficTotals,
+    block_rate: f64,
+    four_xx_rate: f64,
+    five_xx_rate: f64,
+    /// 按小时拆分的请求 / 拦截趋势
+    series: Vec<homewaf_store::TrafficPoint>,
+    kinds: Vec<NameCount>,
+    categories: Vec<CategoryCount>,
+    acl_reasons: Vec<NameCount>,
+    rules: Vec<NameCount>,
+    top_ips: Vec<IpRow>,
+    geo: geoip::GeoStats,
+}
+
+async fn list_reports(
+    State(ctx): State<Ctx>,
+    headers: HeaderMap,
+    Query(q): Query<ReportsQuery>,
+) -> Response {
+    if !authorized(&ctx, &headers) {
+        return unauthorized();
+    }
+
+    let days = q.days.unwrap_or(30).clamp(1, 365);
+    let now = homewaf_acl::now_unix();
+    let since = now - days * 86_400;
+
+    let mut by_day: std::collections::BTreeMap<i64, ReportSummary> =
+        std::collections::BTreeMap::new();
+    for d in ctx.store.traffic_days(since, 400).unwrap_or_default() {
+        let entry = by_day.entry(d.day).or_insert(ReportSummary {
+            id: d.day,
+            date: date_of(d.day),
+            requests: 0,
+            blocked: 0,
+            events: 0,
+            block_rate: 0.0,
+        });
+        entry.requests = d.requests;
+        entry.blocked = d.blocked;
+    }
+    for (day, _kind, n) in ctx.store.daily_event_counts(since).unwrap_or_default() {
+        let entry = by_day.entry(day).or_insert(ReportSummary {
+            id: day,
+            date: date_of(day),
+            requests: 0,
+            blocked: 0,
+            events: 0,
+            block_rate: 0.0,
+        });
+        entry.events += n;
+    }
+
+    let mut reports: Vec<ReportSummary> = by_day.into_values().collect();
+    for r in &mut reports {
+        r.block_rate = rate(r.blocked, r.requests);
+    }
+    reports.sort_by_key(|a| std::cmp::Reverse(a.id));
+
+    Json(serde_json::json!({"reports": reports})).into_response()
+}
+
+/// 汇总某一天的报告数据。`day` 会向下对齐到自然日。
+fn build_report(
+    ctx: &AdminState,
+    day: i64,
+    app: Option<&str>,
+) -> Result<ReportDetail, homewaf_store::StoreError> {
+    let day = day - day.rem_euclid(86_400);
+    let until = day + 86_400;
+    let totals = ctx.store.traffic_totals(day, until, app)?;
+    let series = ctx.store.traffic_series(day, until, app, 3_600)?;
+    let kinds: Vec<NameCount> = ctx
+        .store
+        .event_kind_counts(day, until, None)?
+        .into_iter()
+        .map(|(name, count)| NameCount { name, count })
+        .collect();
+    let state = ctx.shared.load_full();
+    let categories = attack_categories(&state, &ctx.store, day, until);
+    let acl_reasons = ctx
+        .store
+        .acl_reason_counts(day, until, 10)?
+        .into_iter()
+        .map(|(name, count)| NameCount { name, count })
+        .collect();
+    let rules = rule_hits(&ctx.store, day, until, 10);
+    let top = ctx.store.top_event_ips(day, until, None, 50)?;
+    let top_ips = ip_rows(&ctx.geoip, &top);
+    let geo = geo_stats_from(&ctx.geoip, &ctx.store.top_event_ips(day, until, None, 200)?);
+
+    Ok(ReportDetail {
+        id: day,
+        date: date_of(day),
+        app: app.map(str::to_string),
+        generated_at: homewaf_acl::now_unix(),
+        block_rate: rate(totals.blocked, totals.requests),
+        four_xx_rate: rate(totals.status_4xx, totals.requests),
+        five_xx_rate: rate(totals.status_5xx, totals.requests),
+        totals,
+        series,
+        kinds,
+        categories,
+        acl_reasons,
+        rules,
+        top_ips,
+        geo,
+    })
+}
+
+async fn report_detail(
+    State(ctx): State<Ctx>,
+    headers: HeaderMap,
+    Path(day): Path<i64>,
+    Query(q): Query<ReportQuery>,
+) -> Response {
+    if !authorized(&ctx, &headers) {
+        return unauthorized();
+    }
+    let app = norm_app(&q.app);
+    match build_report(&ctx, day, app) {
+        Ok(report) => Json(report).into_response(),
+        Err(e) => internal(e).into_response(),
+    }
+}
+
+/// 报告导出为 CSV，包含汇总、趋势、攻击类型、来源、规则与名单命中。
+async fn report_csv(
+    State(ctx): State<Ctx>,
+    headers: HeaderMap,
+    Path(day): Path<i64>,
+    Query(q): Query<ReportQuery>,
+) -> Response {
+    if !authorized(&ctx, &headers) {
+        return unauthorized();
+    }
+    let app = norm_app(&q.app);
+    let Ok(r) = build_report(&ctx, day, app) else {
+        return internal("生成报告失败").into_response();
+    };
+
+    let mut out = String::with_capacity(4_096);
+    out.push('\u{feff}');
+    out.push_str(&format!("防护报告,{},{}\r\n\r\n", r.date, r.app.as_deref().unwrap_or("全部应用")));
+    out.push_str("指标,值\r\n");
+    out.push_str(&format!("请求数,{}\r\n", r.totals.requests));
+    out.push_str(&format!("页面浏览量,{}\r\n", r.totals.pv));
+    out.push_str(&format!("独立 IP,{}\r\n", r.totals.unique_ips));
+    out.push_str(&format!("独立访客,{}\r\n", r.totals.unique_visitors));
+    out.push_str(&format!("拦截数,{}\r\n", r.totals.blocked));
+    out.push_str(&format!("拦截率,{:.2}%\r\n", r.block_rate));
+    out.push_str(&format!("4xx 数,{}\r\n", r.totals.status_4xx));
+    out.push_str(&format!("4xx 率,{:.2}%\r\n", r.four_xx_rate));
+    out.push_str(&format!("5xx 数,{}\r\n", r.totals.status_5xx));
+    out.push_str(&format!("5xx 率,{:.2}%\r\n\r\n", r.five_xx_rate));
+
+    out.push_str("小时,请求数,拦截数\r\n");
+    for p in &r.series {
+        out.push_str(&format!(
+            "{},{},{}\r\n",
+            format_utc(p.ts),
+            p.requests,
+            p.blocked
+        ));
+    }
+    out.push_str("\r\n");
+
+    out.push_str("事件类型,数量\r\n");
+    for k in &r.kinds {
+        out.push_str(&format!("{},{}\r\n", csv_field(&k.name), k.count));
+    }
+    out.push_str("\r\n攻击类型,数量\r\n");
+    for c in &r.categories {
+        out.push_str(&format!("{},{}\r\n", csv_field(&c.name), c.count));
+    }
+    out.push_str("\r\n命中规则,数量\r\n");
+    for x in &r.rules {
+        out.push_str(&format!("{},{}\r\n", csv_field(&x.name), x.count));
+    }
+    out.push_str("\r\n名单/策略命中,数量\r\n");
+    for x in &r.acl_reasons {
+        out.push_str(&format!("{},{}\r\n", csv_field(&x.name), x.count));
+    }
+    out.push_str("\r\n来源 IP,事件数,国家,省市,城市\r\n");
+    for row in &r.top_ips {
+        let (country, region, city) = match &row.geo {
+            Some(g) => (
+                g.country.as_str(),
+                format!("{} {}", g.province, g.city),
+                g.city.as_str(),
+            ),
+            None => ("", String::new(), ""),
+        };
+        out.push_str(&format!(
+            "{},{},{},{},{}\r\n",
+            csv_field(&row.ip),
+            row.count,
+            csv_field(country),
+            csv_field(region.trim()),
+            csv_field(city),
+        ));
+    }
+
+    let filename = format!("homewaf-report-{}.csv", r.date);
+    (
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "text/csv; charset=utf-8".to_string(),
+            ),
+            (
+                axum::http::header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{filename}\""),
+            ),
+            (
+                axum::http::header::CACHE_CONTROL,
+                "no-store".to_string(),
+            ),
+        ],
+        out,
+    )
+        .into_response()
+}
+
+// ============================================================
+// 防护大屏
+// ============================================================
+
+#[derive(Serialize)]
+struct ScreenKpi {
+    requests: u64,
+    pv: u64,
+    blocked: u64,
+    unique_ips: u64,
+    unique_visitors: u64,
+    attack_ips: usize,
+    block_rate: f64,
+    /// 最近 60 秒平均每秒请求数
+    qps: f64,
+    /// 最近 60 秒峰值
+    peak_qps: u32,
+}
+
+#[derive(Serialize)]
+struct ScreenData {
+    generated_at: i64,
+    today: i64,
+    kpi: ScreenKpi,
+    /// 最近 60 秒每秒请求数
+    ops: Vec<u32>,
+    /// 最近 30 天请求 / 拦截趋势
+    trend: Vec<homewaf_store::TrafficPoint>,
+    /// 最近 30 天事件量趋势
+    attack_trend: Vec<NameCount>,
+    kinds: Vec<NameCount>,
+    categories: Vec<CategoryCount>,
+    blocked_rules: Vec<NameCount>,
+    top_ips: Vec<IpRow>,
+    /// 最近 24 小时访问来源地图
+    geo: geoip::GeoStats,
+    /// 最近 30 天攻击来源地图
+    attack_geo: geoip::GeoStats,
+    recent: Vec<homewaf_store::Event>,
+}
+
+async fn screen(State(ctx): State<Ctx>, headers: HeaderMap) -> Response {
+    if !authorized(&ctx, &headers) {
+        return unauthorized();
+    }
+
+    let now = homewaf_acl::now_unix();
+    let today = now - now.rem_euclid(86_400);
+    let totals = ctx
+        .store
+        .traffic_totals(today, today + 86_400, None)
+        .unwrap_or_default();
+
+    // 实时 QPS 用最近 60 秒桶计算，不用瞬时单秒值，避免动画抖动
+    let realtime = ctx.metrics.dashboard(60, None, now);
+    let qps = if realtime.ops.is_empty() {
+        0.0
+    } else {
+        realtime.ops.iter().map(|v| *v as f64).sum::<f64>() / realtime.ops.len() as f64
+    };
+    let peak_qps = realtime.ops.iter().copied().max().unwrap_or(0);
+
+    let kinds: Vec<NameCount> = ctx
+        .store
+        .event_kind_counts(today, now + 1, None)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(name, count)| NameCount { name, count })
+        .collect();
+    let attack_ips = ctx
+        .store
+        .event_ip_count(today, now + 1, Some("block"))
+        .unwrap_or(0);
+
+    let state = ctx.shared.load_full();
+    let categories = attack_categories(&state, &ctx.store, today, now + 1);
+    let blocked_rules = rule_hits(&ctx.store, today, now + 1, 10);
+    let top = ctx
+        .store
+        .top_event_ips(today, now + 1, None, 10)
+        .unwrap_or_default();
+    let top_ips = ip_rows(&ctx.geoip, &top);
+
+    let since_30d = now - 30 * 86_400;
+    let trend = ctx
+        .store
+        .traffic_series(since_30d, now + 86_400, None, 86_400)
+        .unwrap_or_default();
+    let mut daily: std::collections::BTreeMap<i64, usize> = std::collections::BTreeMap::new();
+    for (day, _kind, n) in ctx
+        .store
+        .daily_event_counts(since_30d)
+        .unwrap_or_default()
+    {
+        *daily.entry(day).or_insert(0) += n;
+    }
+    let attack_trend: Vec<NameCount> = daily
+        .into_iter()
+        .map(|(day, count)| NameCount {
+            name: date_of(day),
+            count,
+        })
+        .collect();
+
+    // 访问来源取内存快照（24 小时），攻击来源取事件表（30 天）
+    let geo = ctx
+        .geoip
+        .resolve(&ctx.metrics.dashboard(86_400, None, now).ips);
+    let attack_pairs = ctx
+        .store
+        .top_event_ips(since_30d, now + 1, Some("block"), 500)
+        .unwrap_or_default();
+    let attack_geo = geo_stats_from(&ctx.geoip, &attack_pairs);
+
+    let recent = ctx
+        .store
+        .query_events(&homewaf_store::EventFilter {
+            limit: 20,
+            ..Default::default()
+        })
+        .map(|(events, _)| events)
+        .unwrap_or_default();
+
+    Json(ScreenData {
+        generated_at: now,
+        today,
+        kpi: ScreenKpi {
+            requests: totals.requests,
+            pv: totals.pv,
+            blocked: totals.blocked,
+            unique_ips: totals.unique_ips,
+            unique_visitors: totals.unique_visitors,
+            attack_ips,
+            block_rate: rate(totals.blocked, totals.requests),
+            qps: (qps * 10.0).round() / 10.0,
+            peak_qps,
+        },
+        ops: realtime.ops,
+        trend,
+        attack_trend,
+        kinds,
+        categories,
+        blocked_rules,
+        top_ips,
+        geo,
+        attack_geo,
+        recent,
+    })
+    .into_response()
 }
 
 // ============================================================
@@ -2052,5 +2712,94 @@ mod tests {
         assert_eq!(format_utc(0), "1970-01-01 00:00:00");
         assert_eq!(format_utc(1_700_000_000), "2023-11-14 22:13:20");
         assert_eq!(format_utc(951_782_400), "2000-02-29 00:00:00");
+    }
+
+    // ============================================================
+    // 统计报表聚合
+    // ============================================================
+
+    #[test]
+    fn rate_handles_zero_and_rounding() {
+        assert_eq!(rate(0, 0), 0.0);
+        assert_eq!(rate(1, 3), 33.33);
+        assert_eq!(rate(2, 2), 100.0);
+    }
+
+    #[test]
+    fn date_of_takes_calendar_day() {
+        assert_eq!(date_of(0), "1970-01-01");
+        assert_eq!(date_of(1_700_000_000), "2023-11-14");
+    }
+
+    #[test]
+    fn norm_app_trims_and_drops_empty() {
+        assert_eq!(norm_app(&None), None);
+        assert_eq!(norm_app(&Some("   ".to_string())), None);
+        assert_eq!(norm_app(&Some(" nas ".to_string())), Some("nas"));
+    }
+
+    #[test]
+    fn report_summarizes_day() {
+        let st = state();
+        let day = 1_700_006_400;
+        st.store
+            .save_traffic(&[homewaf_store::TrafficBucketRow {
+                minute: day + 60,
+                app: "nas".to_string(),
+                requests: 10,
+                pv: 8,
+                blocked: 2,
+                status_4xx: 3,
+                status_5xx: 1,
+                unique_ips: 2,
+                unique_visitors: 2,
+                ips: vec![1, 2],
+                visitors: vec![10, 20],
+            }])
+            .unwrap();
+        st.store
+            .insert_event(
+                &homewaf_store::Event::new(day + 30, homewaf_store::EventKind::Detect, "1.1.1.1")
+                    .with_rules("sqli-union")
+                    .with_action("block"),
+            )
+            .unwrap();
+
+        // 传入一天中间的任意时刻，也会对齐到当天
+        let r = build_report(&st, day + 100, None).unwrap();
+        assert_eq!(r.id, day);
+        assert_eq!(r.date, date_of(day));
+        assert_eq!(r.totals.requests, 10);
+        assert_eq!(r.totals.blocked, 2);
+        assert_eq!(r.block_rate, 20.0);
+        assert_eq!(r.four_xx_rate, 30.0);
+        assert_eq!(r.kinds.len(), 1);
+        assert_eq!(r.top_ips[0].ip, "1.1.1.1");
+        assert!(r.top_ips[0].geo.is_none(), "未配置 mmdb 时不做归属地");
+    }
+
+    #[test]
+    fn report_filters_by_app() {
+        let st = state();
+        let day = 1_700_006_400;
+        st.store
+            .save_traffic(&[
+                homewaf_store::TrafficBucketRow {
+                    minute: day + 60,
+                    app: "nas".to_string(),
+                    requests: 5,
+                    ..Default::default()
+                },
+                homewaf_store::TrafficBucketRow {
+                    minute: day + 60,
+                    app: "blog".to_string(),
+                    requests: 7,
+                    ..Default::default()
+                },
+            ])
+            .unwrap();
+
+        assert_eq!(build_report(&st, day, Some("nas")).unwrap().totals.requests, 5);
+        assert_eq!(build_report(&st, day, None).unwrap().totals.requests, 12);
     }
 }

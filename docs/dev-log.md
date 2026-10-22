@@ -102,6 +102,26 @@
 - 事件筛选补齐 `challenge` 类型（前端下拉与标签映射），此前只记录了事件但筛选不到。
 - 测试：admin 44 个、全工作区 **515 个测试全绿**，clippy 零警告。
 
+### 20:05 — 统计报表 API（任务 #13）
+
+- `GET /api/stats?range=&app=`：在保留原有概览字段（apps/upstreams/hourly/categories 等）的基础上，
+  追加 `range`、`app` 与完整 `traffic`（DashboardData：请求/PV/UV/独立 IP/拦截/状态码/OS/浏览器/
+  Top host·path·referer/趋势序列/实时 OPS），前端概览无需改接口即可平滑迁移。
+- `GET /api/security?range=`：安全态势聚合 —— 事件类型分布、按类型趋势、攻击类型分布、ACL 命中原因
+  （黑名单/CIDR/方法限制等）、规则命中 Top、攻击来源 IP（带 GeoIP 归属地）与最近 20 条事件。
+  范围上限 30 天，趋势桶按 1min / 5min / 1h 自适应。
+- `GET /api/reports?days=`：按天合并流量与事件，输出日报列表（请求、拦截、拦截率、事件数）。
+- `GET /api/reports/{day}`：日报详情（小时趋势、事件/攻击类型、规则与名单命中、来源 IP + 归属地、4xx/5xx 率）；
+  `GET /api/reports/{day}/csv`：同一报告的 CSV 导出（BOM + 分段，Excel 直接打开）。
+- `GET /api/screen`：大屏数据 —— 今日 KPI（请求/PV/UV/独立 IP/拦截/攻击 IP/拦截率/实时 QPS/峰值）、
+  60 秒 OPS、30 天请求与事件趋势、攻击类型与拦截规则、Top 攻击 IP、24 小时访问来源地图（内存快照）
+  与 30 天攻击来源地图（事件表），以及最近事件。
+- `store` 新增聚合查询：`event_kind_counts`、`event_series_by_kind`、`event_ip_count`、
+  `top_event_ips`、`acl_reason_counts`、`event_rule_strings_between`；全部走 SQL 分组，
+  不在控制台里搬运整库事件。
+- 代理侧 `DashboardData` 加 `Serialize`，原始 IP 列表 `#[serde(skip)]`，不下发前端。
+- 测试：store 39、admin 49，clippy 零警告；5 个新接口冒烟全部 200，CSV 导出头与内容正确。
+
 ---
 
 ## 下一步开发任务
@@ -127,4 +147,4 @@
 
 ### 当前进度估计
 
-基线（初始提交）→ 防护增强 → 规则订阅 → 指标底座已入库；统计报表四页签的前端与 API 是下一批次主体。整体功能完成度约 **55%–60%**（对照差距分析）。
+基线（初始提交）→ 防护增强 → 规则订阅 → 指标底座 → GeoIP → 统计 API 已入库；四页签前端是下一批次主体。整体功能完成度约 **65%**（对照差距分析）。
