@@ -1,0 +1,23 @@
+# 端到端测试用配置：本地起两个端口，不涉及 TLS
+server:
+  listen: ["127.0.0.1:18080"]
+  admin:
+    listen: "127.0.0.1:19443"
+
+limits:
+  request_timeout: 10s
+
+applications:
+  - id: test
+    name: "测试应用"
+    domains:
+      primary: "nas.home.lan"
+      aliases: ["alias.home.lan"]
+    upstreams:
+      - addr: 127.0.0.1
+        port: 18081
+    routes:
+      - path: /other
+        upstreams:
+          - addr: 127.0.0.1
+            port: 18082

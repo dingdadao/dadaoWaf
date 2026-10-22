@@ -1,0 +1,213 @@
+# HomeWAF 配置示例
+#
+# 校验：homewaf validate configs/example.yaml
+# 输出规范化配置：homewaf dump configs/example.yaml
+
+server:
+  workers: 0                    # 0 = 按 CPU 自动
+  listen:                       # 明文 HTTP
+    - "[::]:80"
+    - "0.0.0.0:80"
+  # HTTPS 监听。启用前必须先配置 tls.cert 与 tls.key
+  tls_listen: []
+  # tls_listen:
+  #   - "[::]:443"
+  #   - "0.0.0.0:443"
+  admin:
+    listen: "127.0.0.1:9443"    # 管理面只监听回环
+
+tls:
+  min_version: "1.2"
+  alpn: ["h2", "http/1.1"]
+  # 全局单证书（M0）。多证书 SNI 在 T2 实现。
+  # 启用 tls_listen 时必填，例如：
+  #   cert: "/etc/homewaf/cert.pem"
+  #   key: "/etc/homewaf/key.pem"
+  cert: null
+  key: null
+  hsts:
+    enabled: true
+    max_age: 31536000
+    include_subdomains: true
+
+acme:
+  enabled: false                # 首次部署改为 true，并填写邮箱
+  email: ""
+  challenge: dns-01             # 家庭环境推荐：无需 80 端口
+  provider: cloudflare
+  credentials:
+    api_token: "${CF_API_TOKEN}"
+  renew_before_days: 30
+
+# 真实客户端 IP。前面有 CDN / Tunnel / frp 时必须开启。
+real_ip:
+  enabled: false                # 未配置可信网段时解析头部等于允许伪造
+  preset: cloudflare            # cloudflare | aliyun-cdn | tencent-cdn | cloudfront | frp
+  trusted_proxies: []
+  header_priority:
+    - CF-Connecting-IP
+    - True-Client-IP
+    - X-Real-IP
+    - X-Forwarded-For
+  max_chain_depth: 3
+  on_untrusted_header: ignore
+  log_both: true
+
+limits:
+  max_header_size: 32KB
+  max_header_count: 100
+  max_body_size: 10MB
+  max_url_length: 8192
+  queue_capacity: 1024
+  queue_timeout: 200ms
+  detect_budget: 50ms
+  request_timeout: 30s
+
+# 防护开关：17 类攻击，三态 off / monitor / block
+protection:
+  preset: balanced              # lenient | balanced | strict | custom
+  observe_mode:
+    enabled: false              # 首次部署建议 true，观察 7 天
+    auto_disable_after: 7d
+  sqli: block
+  xss: block
+  cmdi: block
+  path_traversal: block
+  xxe: block
+  ssrf: block
+  file_upload: monitor
+  deserialization: monitor
+  webshell: monitor
+  sensitive_leak: monitor
+
+acl:
+  private_network:
+    action: allow               # 内网设备默认放行
+    cidrs:
+      - 10.0.0.0/8
+      - 172.16.0.0/12
+      - 192.168.0.0/16
+      - 127.0.0.0/8
+      - fd00::/8
+      - ::1/128
+  ipv6_prefix_match: 64         # IPv6 按 /64 聚合，应对地址漂移
+  auto_ban:
+    enabled: true
+    trigger_score: 50
+    durations: ["5m", "30m", "2h", "24h"]
+  # 静态规则：白名单永远优先于黑名单，越具体的前缀越优先
+  rules:
+    # 放行监控探针，即使它触发了规则
+    - id: allow-monitor
+      cidr: 192.168.1.200/32
+      action: allow
+      note: "内网监控探针"
+    # 封禁一个恶意扫描段
+    - id: block-scanner
+      cidr: 203.0.113.0/24
+      action: deny
+      note: "扫描器段"
+    # 只对某个应用生效
+    - id: block-app-abuser
+      cidr: 198.51.100.0/24
+      action: deny
+      scope: nas
+      expires_at: 1790000000    # Unix 秒，到期自动失效
+
+# IP 组订阅
+ip_groups:
+  - name: chaitin-shared
+    enabled: false              # 首次导入建议先 dry-run
+    source:
+      url: "https://ip-35193.rivers.chaitin.cn/api/share/ip_group/cb8cc6282f7f4b58abf9f48b45a1f67b?format=cidr"
+      format: auto
+      interval: 6h
+      timeout: 15s
+    action: challenge
+    scope: []
+    expires: 24h
+    guards:
+      max_entries: 200000
+      min_prefix_v4: 8
+      min_prefix_v6: 32
+      max_delta_ratio: 0.5
+      max_response_bytes: 10MB
+    on_failure: keep-last
+
+# 规则包订阅
+rule_feeds:
+  - name: official-core
+    url: "https://rules.example.com/core-v1.hwrule"
+    channel: stable
+    auto_update: true
+    check_interval: 24h
+    update_window: "03:00-05:00"
+    require_signature: true
+    public_key: "ed25519:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="  # 替换为官方公钥
+    shadow_period: 6h
+    rollback_on_error: true
+
+ratelimit:
+  global_qps: 2000
+  per_ip_qps: 100
+  per_ip_conn: 64
+  per_url_qps: 200
+
+logging:
+  level: info
+  format: json
+  retention_days: 30
+  body_capture: on-block
+  redact:
+    headers: ["authorization", "cookie", "x-api-key"]
+    params: ["password", "token", "id_card"]
+
+# 应用：一个应用 = 一个对外服务 = 一个域名
+applications:
+  - id: nas
+    name: "NAS 管理"
+    domains:
+      primary: "nas.home.lan"
+    upstreams:                  # 默认上游
+      - addr: 192.168.1.5
+        port: 5000
+    routes:                     # 一个应用多个端口
+      - path: /jellyfin
+        upstreams:
+          - addr: 192.168.1.5
+            port: 8096
+        rewrite:
+          mode: strip_prefix
+      - path: /ha
+        upstreams:
+          - addr: 192.168.1.6
+            port: 8123
+      - path: /admin            # 管理后台从严
+        policy:
+          preset: strict
+          require_auth: totp
+          allow_cidr:
+            - 192.168.1.0/24
+            - fd00::/8
+          observe_mode:
+            enabled: false
+    policy:
+      preset: balanced
+
+  - id: photos
+    name: "家庭相册"
+    domains:
+      primary: "photos.home.lan"
+      aliases:
+        - "photo.home.lan"
+    upstreams:
+      - addr: 192.168.1.5
+        port: 2342
+    timeouts:
+      read: 300s                # 大文件下载不断流
+    policy:
+      preset: lenient           # 相册从宽，避免误拦上传
+      max_body_size: 2GB
+      fail_policy: open         # 检测超时放行，不中断传输
+      protection:
+        file_upload: monitor

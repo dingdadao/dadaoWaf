@@ -1,0 +1,977 @@
+//! HomeWAF 持久化层（SQLite）。
+//!
+//! 一次解决三个问题：
+//! 1. **封禁重启丢失**——内存态封禁在进程退出后清零，攻击者立刻回来
+//! 2. **订阅变更幅度失效**——重启后没有"上次列表"可比，护栏形同虚设
+//! 3. **事件无处存**——控制台需要历史数据
+//!
+//! 用 `bundled` 特性把 SQLite 源码编进去，不依赖系统库。
+
+use std::path::Path;
+use std::sync::Mutex;
+
+use rusqlite::{params, Connection};
+
+mod config_store;
+
+pub use config_store::{AclRuleRow, IpGroupRow, WhitelistRow};
+
+/// 存储层错误。
+#[derive(Debug, thiserror::Error)]
+pub enum StoreError {
+    #[error("数据库错误：{0}")]
+    Sqlite(#[from] rusqlite::Error),
+    #[error("数据库被其他线程占用")]
+    Poisoned,
+    #[error("数据解析失败：{0}")]
+    Decode(String),
+    #[error("数据序列化失败：{0}")]
+    Encode(String),
+}
+
+/// 一条封禁记录。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BanRecord {
+    pub ip: String,
+    /// 封禁截止时间（Unix 秒）
+    pub until: i64,
+    pub offenses: u32,
+    pub score: u32,
+    pub reason: String,
+    pub created_at: i64,
+}
+
+/// 事件类型。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EventKind {
+    /// 检测命中
+    Detect,
+    /// 自动封禁
+    Ban,
+    /// ACL 拒绝
+    Acl,
+}
+
+impl EventKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            EventKind::Detect => "detect",
+            EventKind::Ban => "ban",
+            EventKind::Acl => "acl",
+        }
+    }
+
+    pub fn parse_kind(s: &str) -> Self {
+        match s {
+            "ban" => EventKind::Ban,
+            "acl" => EventKind::Acl,
+            _ => EventKind::Detect,
+        }
+    }
+}
+
+/// 一条安全事件。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Event {
+    pub id: i64,
+    pub ts: i64,
+    pub kind: EventKind,
+    pub client_ip: String,
+    pub app: String,
+    pub path: String,
+    /// 命中的规则 id，逗号分隔
+    pub rules: String,
+    pub score: u32,
+    /// `block` / `log` / `observe` / `ban`
+    pub action: String,
+}
+
+impl Event {
+    /// 构造一条待写入的事件（`id` 由数据库分配）。其余字段用 builder 补齐。
+    pub fn new(ts: i64, kind: EventKind, client_ip: impl Into<String>) -> Self {
+        Self {
+            id: 0,
+            ts,
+            kind,
+            client_ip: client_ip.into(),
+            app: String::new(),
+            path: String::new(),
+            rules: String::new(),
+            score: 0,
+            action: String::new(),
+        }
+    }
+
+    pub fn with_app(mut self, app: impl Into<String>) -> Self {
+        self.app = app.into();
+        self
+    }
+
+    pub fn with_path(mut self, path: impl Into<String>) -> Self {
+        self.path = path.into();
+        self
+    }
+
+    pub fn with_rules(mut self, rules: impl Into<String>) -> Self {
+        self.rules = rules.into();
+        self
+    }
+
+    pub fn with_score(mut self, score: u32) -> Self {
+        self.score = score;
+        self
+    }
+
+    pub fn with_action(mut self, action: impl Into<String>) -> Self {
+        self.action = action.into();
+        self
+    }
+}
+
+/// 事件查询条件。`None` 表示不限制该维度。
+#[derive(Debug, Clone, Default)]
+pub struct EventFilter {
+    pub limit: usize,
+    pub offset: usize,
+    /// detect / ban / acl
+    pub kind: Option<String>,
+    /// 精确匹配来源 IP
+    pub ip: Option<String>,
+    /// block / log / observe
+    pub action: Option<String>,
+    /// 起始时间（Unix 秒，含）
+    pub since: Option<i64>,
+}
+
+/// SQLite 存储。
+pub struct Store {
+    conn: Mutex<Connection>,
+}
+
+impl Store {
+    /// 打开（或创建）数据库文件，并初始化表结构。
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        let conn = Connection::open(path)?;
+        let store = Self {
+            conn: Mutex::new(conn),
+        };
+        store.migrate()?;
+        Ok(store)
+    }
+
+    /// 内存数据库，用于测试。
+    pub fn open_memory() -> Result<Self, StoreError> {
+        let conn = Connection::open_in_memory()?;
+        let store = Self {
+            conn: Mutex::new(conn),
+        };
+        store.migrate()?;
+        Ok(store)
+    }
+
+    /// 借出连接执行一段操作。给子模块用，避免把 `conn` 暴露成 pub。
+    pub(crate) fn with_conn<T>(
+        &self,
+        f: impl FnOnce(&Connection) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::Poisoned)?;
+        f(&conn)
+    }
+
+    fn migrate(&self) -> Result<(), StoreError> {        let conn = self.conn.lock().map_err(|_| StoreError::Poisoned)?;
+        conn.execute_batch(
+            r#"
+            PRAGMA journal_mode = WAL;
+            PRAGMA synchronous = NORMAL;
+
+            CREATE TABLE IF NOT EXISTS bans (
+                ip         TEXT PRIMARY KEY,
+                until      INTEGER NOT NULL,
+                offenses   INTEGER NOT NULL DEFAULT 1,
+                score      INTEGER NOT NULL DEFAULT 0,
+                reason     TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS events (
+                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts        INTEGER NOT NULL,
+                kind      TEXT NOT NULL,
+                client_ip TEXT NOT NULL DEFAULT '',
+                app       TEXT NOT NULL DEFAULT '',
+                path      TEXT NOT NULL DEFAULT '',
+                rules     TEXT NOT NULL DEFAULT '',
+                score     INTEGER NOT NULL DEFAULT 0,
+                action    TEXT NOT NULL DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts DESC);
+
+            CREATE TABLE IF NOT EXISTS feed_state (
+                name       TEXT PRIMARY KEY,
+                entries    TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+
+            -- 应用：一行一个应用，完整结构序列化成 JSON。
+            -- 用 JSON 而不是拆列：应用数量在家庭场景 < 50，全量加载进内存即可，
+            -- 拆列会让"加一个字段就要改表"变成常态。
+            CREATE TABLE IF NOT EXISTS applications (
+                id             TEXT PRIMARY KEY,
+                primary_domain TEXT NOT NULL,
+                enabled        INTEGER NOT NULL DEFAULT 1,
+                body           TEXT NOT NULL,
+                created_at     INTEGER NOT NULL,
+                updated_at     INTEGER NOT NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_app_domain ON applications(primary_domain);
+
+            -- 全局设置：一段 JSON 一个键，如 protection / real_ip / acl / tls
+            CREATE TABLE IF NOT EXISTS settings (
+                key        TEXT PRIMARY KEY,
+                value      TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+
+            -- ACL 静态规则
+            CREATE TABLE IF NOT EXISTS acl_rules (
+                id         TEXT PRIMARY KEY,
+                cidr       TEXT NOT NULL,
+                action     TEXT NOT NULL,
+                scope      TEXT,
+                expires_at INTEGER,
+                note       TEXT,
+                created_at INTEGER NOT NULL
+            );
+
+            -- IP 组订阅
+            CREATE TABLE IF NOT EXISTS ip_groups (
+                name          TEXT PRIMARY KEY,
+                enabled       INTEGER NOT NULL DEFAULT 1,
+                body          TEXT NOT NULL,
+                updated_at    INTEGER NOT NULL
+            );
+
+            -- 检测白名单（误报豁免）
+            CREATE TABLE IF NOT EXISTS detect_whitelist (
+                id         TEXT PRIMARY KEY,
+                app        TEXT,
+                path       TEXT,
+                rule_id    TEXT,
+                note       TEXT,
+                created_at INTEGER NOT NULL
+            );
+            "#,
+        )?;
+        Ok(())
+    }
+
+    // ============================================================
+    // 封禁
+    // ============================================================
+
+    /// 写入或更新一条封禁。
+    pub fn upsert_ban(&self, record: &BanRecord, now: i64) -> Result<(), StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::Poisoned)?;
+        conn.execute(
+            r#"
+            INSERT INTO bans (ip, until, offenses, score, reason, created_at, updated_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+            ON CONFLICT(ip) DO UPDATE SET
+                until      = excluded.until,
+                offenses   = excluded.offenses,
+                score      = excluded.score,
+                reason     = excluded.reason,
+                updated_at = excluded.updated_at
+            "#,
+            params![
+                record.ip,
+                record.until,
+                record.offenses,
+                record.score,
+                record.reason,
+                now
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// 加载所有未过期的封禁。
+    pub fn load_active_bans(&self, now: i64) -> Result<Vec<BanRecord>, StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::Poisoned)?;
+        let mut stmt = conn.prepare(
+            "SELECT ip, until, offenses, score, reason, created_at
+             FROM bans WHERE until > ?1 ORDER BY until DESC",
+        )?;
+        let rows = stmt.query_map(params![now], |row| {
+            Ok(BanRecord {
+                ip: row.get(0)?,
+                until: row.get(1)?,
+                offenses: row.get(2)?,
+                score: row.get(3)?,
+                reason: row.get(4)?,
+                created_at: row.get(5)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// 删除一条封禁（手动解封）。
+    pub fn delete_ban(&self, ip: &str) -> Result<bool, StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::Poisoned)?;
+        let n = conn.execute("DELETE FROM bans WHERE ip = ?1", params![ip])?;
+        Ok(n > 0)
+    }
+
+    /// 清理已过期的封禁记录，返回删除条数。
+    pub fn cleanup_bans(&self, now: i64) -> Result<usize, StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::Poisoned)?;
+        let n = conn.execute("DELETE FROM bans WHERE until <= ?1", params![now])?;
+        Ok(n)
+    }
+
+    /// 封禁总数（含已过期）。
+    pub fn ban_count(&self) -> Result<usize, StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::Poisoned)?;
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM bans", [], |r| r.get(0))?;
+        Ok(n as usize)
+    }
+
+    // ============================================================
+    // 事件
+    // ============================================================
+
+    /// 写入一条事件。
+    pub fn insert_event(&self, event: &Event) -> Result<i64, StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::Poisoned)?;
+        conn.execute(
+            r#"
+            INSERT INTO events (ts, kind, client_ip, app, path, rules, score, action)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "#,
+            params![
+                event.ts,
+                event.kind.as_str(),
+                event.client_ip,
+                event.app,
+                event.path,
+                event.rules,
+                event.score,
+                event.action
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// 最近的若干条事件（按时间倒序）。
+    pub fn recent_events(&self, limit: usize) -> Result<Vec<Event>, StoreError> {
+        let (events, _) = self.query_events(&EventFilter {
+            limit,
+            ..Default::default()
+        })?;
+        Ok(events)
+    }
+
+    /// 按条件查询事件，返回 (当前页, 总数)。
+    ///
+    /// 用 `(?1 IS NULL OR col = ?1)` 的模式做可选条件：参数个数固定，
+    /// 不需要动态拼 SQL，也就不会有拼接注入的风险。
+    pub fn query_events(&self, f: &EventFilter) -> Result<(Vec<Event>, usize), StoreError> {
+        self.with_conn(|conn| {
+            let total: i64 = conn.query_row(
+                r#"
+                SELECT COUNT(*) FROM events
+                WHERE (?1 IS NULL OR kind = ?1)
+                  AND (?2 IS NULL OR client_ip = ?2)
+                  AND (?3 IS NULL OR action = ?3)
+                  AND (?4 IS NULL OR ts >= ?4)
+                "#,
+                params![
+                    f.kind.as_deref(),
+                    f.ip.as_deref(),
+                    f.action.as_deref(),
+                    f.since
+                ],
+                |r| r.get(0),
+            )?;
+
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT id, ts, kind, client_ip, app, path, rules, score, action
+                FROM events
+                WHERE (?1 IS NULL OR kind = ?1)
+                  AND (?2 IS NULL OR client_ip = ?2)
+                  AND (?3 IS NULL OR action = ?3)
+                  AND (?4 IS NULL OR ts >= ?4)
+                ORDER BY ts DESC, id DESC
+                LIMIT ?5 OFFSET ?6
+                "#,
+            )?;
+            let rows = stmt.query_map(
+                params![
+                    f.kind.as_deref(),
+                    f.ip.as_deref(),
+                    f.action.as_deref(),
+                    f.since,
+                    f.limit as i64,
+                    f.offset as i64
+                ],
+                |row| {
+                    Ok(Event {
+                        id: row.get(0)?,
+                        ts: row.get(1)?,
+                        kind: EventKind::parse_kind(&row.get::<_, String>(2)?),
+                        client_ip: row.get(3)?,
+                        app: row.get(4)?,
+                        path: row.get(5)?,
+                        rules: row.get(6)?,
+                        score: row.get(7)?,
+                        action: row.get(8)?,
+                    })
+                },
+            )?;
+
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok((out, total as usize))
+        })
+    }
+
+    /// 事件总数。
+    pub fn event_count(&self) -> Result<usize, StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::Poisoned)?;
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))?;
+        Ok(n as usize)
+    }
+
+    /// 删除早于 `before` 的事件，返回删除条数。用于控制库体积。
+    pub fn prune_events(&self, before: i64) -> Result<usize, StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::Poisoned)?;
+        let n = conn.execute("DELETE FROM events WHERE ts < ?1", params![before])?;
+        Ok(n)
+    }
+
+    // ============================================================
+    // 订阅状态
+    // ============================================================
+
+    /// 保存订阅上次成功导入的条目（用于变更幅度校验）。
+    pub fn save_feed_state(&self, name: &str, entries: &str, now: i64) -> Result<(), StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::Poisoned)?;
+        conn.execute(
+            r#"
+            INSERT INTO feed_state (name, entries, updated_at) VALUES (?1, ?2, ?3)
+            ON CONFLICT(name) DO UPDATE SET
+                entries = excluded.entries,
+                updated_at = excluded.updated_at
+            "#,
+            params![name, entries, now],
+        )?;
+        Ok(())
+    }
+
+    /// 读取订阅上次的条目。
+    pub fn load_feed_state(&self, name: &str) -> Result<Option<String>, StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::Poisoned)?;
+        let mut stmt = conn.prepare("SELECT entries FROM feed_state WHERE name = ?1")?;
+        let mut rows = stmt.query(params![name])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(row.get(0)?)),
+            None => Ok(None),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn store() -> Store {
+        Store::open_memory().expect("内存库应可用")
+    }
+
+    const NOW: i64 = 1_700_000_000;
+
+    fn ban(ip: &str, until: i64) -> BanRecord {
+        BanRecord {
+            ip: ip.to_string(),
+            until,
+            offenses: 1,
+            score: 50,
+            reason: "sqli".to_string(),
+            created_at: NOW,
+        }
+    }
+
+    #[test]
+    fn schema_is_created() {
+        let s = store();
+        assert_eq!(s.ban_count().unwrap(), 0);
+        assert_eq!(s.event_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn upsert_and_load_ban() {
+        let s = store();
+        s.upsert_ban(&ban("203.0.113.9", NOW + 300), NOW).unwrap();
+
+        let bans = s.load_active_bans(NOW).unwrap();
+        assert_eq!(bans.len(), 1);
+        assert_eq!(bans[0].ip, "203.0.113.9");
+        assert_eq!(bans[0].until, NOW + 300);
+    }
+
+    #[test]
+    fn expired_ban_not_loaded() {
+        let s = store();
+        s.upsert_ban(&ban("203.0.113.9", NOW - 1), NOW).unwrap();
+        assert!(s.load_active_bans(NOW).unwrap().is_empty());
+        // 但仍存在库里，等待清理
+        assert_eq!(s.ban_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn upsert_updates_existing() {
+        let s = store();
+        s.upsert_ban(&ban("203.0.113.9", NOW + 300), NOW).unwrap();
+
+        let mut second = ban("203.0.113.9", NOW + 1800);
+        second.offenses = 2;
+        s.upsert_ban(&second, NOW + 10).unwrap();
+
+        let bans = s.load_active_bans(NOW).unwrap();
+        assert_eq!(bans.len(), 1, "同一 IP 不应产生两条记录");
+        assert_eq!(bans[0].offenses, 2);
+        assert_eq!(bans[0].until, NOW + 1800);
+    }
+
+    #[test]
+    fn delete_ban_works() {
+        let s = store();
+        s.upsert_ban(&ban("203.0.113.9", NOW + 300), NOW).unwrap();
+        assert!(s.delete_ban("203.0.113.9").unwrap());
+        assert!(!s.delete_ban("203.0.113.9").unwrap(), "重复删除返回 false");
+        assert_eq!(s.ban_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn cleanup_removes_expired() {
+        let s = store();
+        s.upsert_ban(&ban("203.0.113.1", NOW - 10), NOW).unwrap();
+        s.upsert_ban(&ban("203.0.113.2", NOW + 300), NOW).unwrap();
+
+        let removed = s.cleanup_bans(NOW).unwrap();
+        assert_eq!(removed, 1);
+        assert_eq!(s.ban_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn insert_and_query_events() {
+        let s = store();
+        let e = Event::new(NOW, EventKind::Detect, "203.0.113.9")
+            .with_app("nas")
+            .with_path("/api")
+            .with_rules("sqli-union-select")
+            .with_score(50)
+            .with_action("block");
+        let id = s.insert_event(&e).unwrap();
+        assert!(id > 0);
+
+        let events = s.recent_events(10).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, EventKind::Detect);
+        assert_eq!(events[0].client_ip, "203.0.113.9");
+        assert_eq!(events[0].score, 50);
+    }
+
+    #[test]
+    fn events_ordered_newest_first() {
+        let s = store();
+        for i in 0..3 {
+            s.insert_event(&Event::new(NOW + i, EventKind::Detect, "1.2.3.4"))
+                .unwrap();
+        }
+        let events = s.recent_events(10).unwrap();
+        assert_eq!(events[0].ts, NOW + 2, "最新事件应排在最前");
+    }
+
+    #[test]
+    fn recent_events_respects_limit() {
+        let s = store();
+        for _ in 0..5 {
+            s.insert_event(&Event::new(NOW, EventKind::Ban, "1.2.3.4")).unwrap();
+        }
+        assert_eq!(s.recent_events(2).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn prune_events_removes_old() {
+        let s = store();
+        s.insert_event(&Event::new(NOW - 100, EventKind::Detect, "1.1.1.1"))
+            .unwrap();
+        s.insert_event(&Event::new(NOW, EventKind::Detect, "2.2.2.2"))
+            .unwrap();
+
+        let removed = s.prune_events(NOW - 50).unwrap();
+        assert_eq!(removed, 1);
+        assert_eq!(s.event_count().unwrap(), 1);
+    }
+
+    // ============================================================
+    // 事件查询
+    // ============================================================
+
+    fn seed_events(s: &Store) {
+        // 5 条：3 detect（2 block + 1 log）、2 ban
+        for (i, (kind, ip, action)) in [
+            (EventKind::Detect, "1.1.1.1", "block"),
+            (EventKind::Detect, "1.1.1.1", "log"),
+            (EventKind::Detect, "2.2.2.2", "block"),
+            (EventKind::Ban, "1.1.1.1", "ban"),
+            (EventKind::Ban, "3.3.3.3", "ban"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            s.insert_event(
+                &Event::new(NOW + i as i64, *kind, *ip).with_action(*action),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn query_events_paginates() {
+        let s = store();
+        seed_events(&s);
+
+        let (page1, total) = s
+            .query_events(&EventFilter {
+                limit: 2,
+                offset: 0,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(total, 5, "总数应是全部，不是当前页");
+        assert_eq!(page1.len(), 2);
+        // 最新的在前
+        assert!(page1[0].ts > page1[1].ts);
+
+        let (page3, _) = s
+            .query_events(&EventFilter {
+                limit: 2,
+                offset: 4,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(page3.len(), 1, "最后一页只剩 1 条");
+    }
+
+    #[test]
+    fn query_events_filters_by_kind() {
+        let s = store();
+        seed_events(&s);
+
+        let (detect, total) = s
+            .query_events(&EventFilter {
+                limit: 50,
+                kind: Some("detect".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(total, 3);
+        assert!(detect.iter().all(|e| e.kind == EventKind::Detect));
+
+        let (bans, total) = s
+            .query_events(&EventFilter {
+                limit: 50,
+                kind: Some("ban".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(total, 2);
+        assert!(bans.iter().all(|e| e.kind == EventKind::Ban));
+    }
+
+    #[test]
+    fn query_events_filters_by_ip() {
+        let s = store();
+        seed_events(&s);
+
+        let (events, total) = s
+            .query_events(&EventFilter {
+                limit: 50,
+                ip: Some("1.1.1.1".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(total, 3);
+        assert!(events.iter().all(|e| e.client_ip == "1.1.1.1"));
+    }
+
+    #[test]
+    fn query_events_filters_by_action() {
+        let s = store();
+        seed_events(&s);
+
+        let (_, total) = s
+            .query_events(&EventFilter {
+                limit: 50,
+                action: Some("block".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(total, 2);
+    }
+
+    #[test]
+    fn query_events_combines_filters() {
+        let s = store();
+        seed_events(&s);
+
+        let (events, total) = s
+            .query_events(&EventFilter {
+                limit: 50,
+                kind: Some("detect".to_string()),
+                ip: Some("1.1.1.1".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(total, 2, "detect + 1.1.1.1 应命中 2 条");
+        assert!(events.iter().all(|e| e.kind == EventKind::Detect && e.client_ip == "1.1.1.1"));
+    }
+
+    #[test]
+    fn query_events_since_filter() {
+        let s = store();
+        seed_events(&s);
+
+        // 只要 NOW+3 之后的事件
+        let (_, total) = s
+            .query_events(&EventFilter {
+                limit: 50,
+                since: Some(NOW + 3),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(total, 2);
+    }
+
+    #[test]
+    fn query_events_empty_result() {
+        let s = store();
+        seed_events(&s);
+
+        let (events, total) = s
+            .query_events(&EventFilter {
+                limit: 50,
+                ip: Some("9.9.9.9".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(events.is_empty());
+        assert_eq!(total, 0);
+    }
+
+    #[test]
+    fn feed_state_roundtrip() {        let s = store();
+        assert!(s.load_feed_state("chaitin").unwrap().is_none());
+
+        s.save_feed_state("chaitin", "1.2.3.0/24\n4.5.6.0/24", NOW)
+            .unwrap();
+        let loaded = s.load_feed_state("chaitin").unwrap().unwrap();
+        assert!(loaded.contains("1.2.3.0/24"));
+    }
+
+    #[test]
+    fn feed_state_overwrites() {
+        let s = store();
+        s.save_feed_state("g", "old", NOW).unwrap();
+        s.save_feed_state("g", "new", NOW + 10).unwrap();
+        assert_eq!(s.load_feed_state("g").unwrap().unwrap(), "new");
+    }
+
+    #[test]
+    fn ban_survives_reopen() {        // 用临时文件验证真正的持久化
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("homewaf-store-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        {
+            let s = Store::open(&path).unwrap();
+            s.upsert_ban(&ban("203.0.113.9", NOW + 300), NOW).unwrap();
+        }
+        {
+            let s = Store::open(&path).unwrap();
+            let bans = s.load_active_bans(NOW).unwrap();
+            assert_eq!(bans.len(), 1, "重开后封禁应还在");
+            assert_eq!(bans[0].ip, "203.0.113.9");
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ============================================================
+    // 配置读写（DB 作为唯一配置源）
+    // ============================================================
+
+    #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+    struct DemoApp {
+        name: String,
+        port: u16,
+        tags: Vec<String>,
+    }
+
+    fn demo(name: &str, port: u16) -> DemoApp {
+        DemoApp {
+            name: name.to_string(),
+            port,
+            tags: vec!["a".into(), "b".into()],
+        }
+    }
+
+    #[test]
+    fn application_roundtrip() {
+        let s = store();
+        let app = demo("nas", 8080);
+        s.upsert_application("nas", "nas.home.lan", true, &app, NOW)
+            .unwrap();
+
+        let apps: Vec<DemoApp> = s.list_applications().unwrap();
+        assert_eq!(apps.len(), 1);
+        assert_eq!(apps[0], app);
+        assert_eq!(s.app_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn application_upsert_updates() {
+        let s = store();
+        s.upsert_application("nas", "nas.home.lan", true, &demo("v1", 80), NOW)
+            .unwrap();
+        s.upsert_application("nas", "nas.home.lan", true, &demo("v2", 81), NOW + 10)
+            .unwrap();
+
+        let apps: Vec<DemoApp> = s.list_applications().unwrap();
+        assert_eq!(apps.len(), 1, "同 id 不应产生两行");
+        assert_eq!(apps[0].name, "v2");
+    }
+
+    #[test]
+    fn application_delete() {
+        let s = store();
+        s.upsert_application("a", "a.home.lan", true, &demo("a", 80), NOW)
+            .unwrap();
+        assert!(s.delete_application("a").unwrap());
+        assert!(!s.delete_application("a").unwrap());
+        assert_eq!(s.app_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn applications_ordered_by_id() {
+        let s = store();
+        for id in ["c", "a", "b"] {
+            s.upsert_application(id, &format!("{id}.lan"), true, &demo(id, 80), NOW)
+                .unwrap();
+        }
+        let ids: Vec<String> = s
+            .list_applications::<DemoApp>()
+            .unwrap()
+            .into_iter()
+            .map(|a| a.name)
+            .collect();
+        assert_eq!(ids, vec!["a", "b", "c"], "顺序应稳定");
+    }
+
+    #[test]
+    fn settings_roundtrip() {
+        let s = store();
+        assert!(s.get_setting::<DemoApp>("protection").unwrap().is_none());
+
+        s.set_setting("protection", &demo("p", 1), NOW).unwrap();
+        let got: DemoApp = s.get_setting("protection").unwrap().unwrap();
+        assert_eq!(got, demo("p", 1));
+        assert_eq!(s.list_setting_keys().unwrap(), vec!["protection"]);
+    }
+
+    #[test]
+    fn settings_overwrite() {
+        let s = store();
+        s.set_setting("k", &demo("v1", 1), NOW).unwrap();
+        s.set_setting("k", &demo("v2", 2), NOW + 5).unwrap();
+        let got: DemoApp = s.get_setting("k").unwrap().unwrap();
+        assert_eq!(got.name, "v2");
+    }
+
+    #[test]
+    fn acl_rule_roundtrip() {
+        let s = store();
+        let rule = AclRuleRow {
+            id: "block-x".to_string(),
+            cidr: "203.0.113.0/24".to_string(),
+            action: "deny".to_string(),
+            scope: Some("nas".to_string()),
+            expires_at: Some(NOW + 3600),
+            note: Some("测试".to_string()),
+        };
+        s.upsert_acl_rule(&rule, NOW).unwrap();
+
+        let rules = s.list_acl_rules().unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0], rule);
+        assert_eq!(s.acl_rule_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn acl_rule_delete() {
+        let s = store();
+        let rule = AclRuleRow {
+            id: "r".to_string(),
+            cidr: "1.2.3.4/32".to_string(),
+            action: "deny".to_string(),
+            scope: None,
+            expires_at: None,
+            note: None,
+        };
+        s.upsert_acl_rule(&rule, NOW).unwrap();
+        assert!(s.delete_acl_rule("r").unwrap());
+        assert_eq!(s.acl_rule_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn ip_group_roundtrip() {
+        let s = store();
+        s.upsert_ip_group("chaitin", true, &demo("g", 1), NOW).unwrap();
+
+        let groups = s.list_ip_groups().unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].name, "chaitin");
+        assert!(groups[0].enabled);
+        let body: DemoApp = serde_json::from_str(&groups[0].body).unwrap();
+        assert_eq!(body.name, "g");
+    }
+
+    #[test]
+    fn corrupted_json_returns_decode_error() {
+        let s = store();
+        // 直接塞坏数据
+        s.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO applications (id, primary_domain, enabled, body, created_at, updated_at)
+                 VALUES ('x', 'x.lan', 1, 'not-json', 0, 0)",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let result = s.list_applications::<DemoApp>();
+        assert!(result.is_err(), "损坏数据应报错而不是 panic");
+    }
+}

@@ -1,0 +1,15 @@
+[package]
+name = "homewaf-detect"
+description = "HomeWAF 检测引擎（归一化 + 规则匹配）"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+homewaf-config = { path = "../config" }
+regex = "1"
+aho-corasick = "1"
+serde.workspace = true
+thiserror.workspace = true
+tracing = "0.1"

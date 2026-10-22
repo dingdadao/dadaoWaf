@@ -1,0 +1,1077 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>HomeWAF 控制台</title>
+<style>
+  :root {
+    --bg: #f7f7f5;
+    --card: #ffffff;
+    --border: #e5e4df;
+    --text: #2c2c2a;
+    --muted: #888780;
+    --accent: #185fa5;
+    --accent-soft: #eef2f7;
+    --danger: #a32d2d;
+    --ok: #0f6e56;
+    --warn: #854f0b;
+    --sidebar: #1f1f1e;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Helvetica Neue", sans-serif;
+    font-size: 14px; line-height: 1.6;
+  }
+
+  /* ---------- 布局 ---------- */
+  .app { display: flex; height: 100vh; overflow: hidden; }
+
+  .sidebar {
+    width: 196px; flex-shrink: 0; background: var(--sidebar); color: #c9c8c3;
+    display: flex; flex-direction: column; padding: 0;
+  }
+  .brand {
+    padding: 18px 20px 14px; font-size: 15px; font-weight: 600; color: #fff;
+    letter-spacing: 0.02em; border-bottom: 1px solid #333331;
+  }
+  .brand small { display: block; font-size: 11px; font-weight: 400; color: #7d7c77; margin-top: 2px; }
+  .nav { padding: 8px 0; flex: 1; overflow-y: auto; }
+  .nav a {
+    display: block; padding: 8px 20px; font-size: 13px; color: #b5b4af;
+    text-decoration: none; cursor: pointer; border-left: 2px solid transparent;
+  }
+  .nav a:hover { background: #2a2a28; color: #e8e7e2; }
+  .nav a.active { background: #2a2a28; color: #fff; border-left-color: #4a9eda; }
+  .nav .badge {
+    float: right; font-size: 11px; background: #3a3a37; color: #b5b4af;
+    padding: 0 6px; border-radius: 8px; margin-top: 3px;
+  }
+  .nav .badge.alert { background: #5c2020; color: #f0b0b0; }
+
+  main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+
+  .topbar {
+    height: 52px; flex-shrink: 0; background: var(--card);
+    border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 0 24px;
+  }
+  .topbar h1 { font-size: 15px; margin: 0; font-weight: 600; }
+  .topbar .meta { display: flex; gap: 18px; font-size: 12px; color: var(--muted); }
+  .topbar .meta b { color: var(--text); font-weight: 500; }
+
+  .content { flex: 1; overflow-y: auto; padding: 20px 24px 40px; }
+
+  .page { display: none; }
+  .page.active { display: block; }
+
+  /* ---------- 通用 ---------- */
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 20px; }
+  .stat { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
+  .stat .label { color: var(--muted); font-size: 12px; margin-bottom: 6px; }
+  .stat .value { font-size: 24px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .stat.danger .value { color: var(--danger); }
+  .stat.ok .value { color: var(--ok); }
+
+  section.card {
+    background: var(--card); border: 1px solid var(--border); border-radius: 8px;
+    margin-bottom: 16px; overflow: hidden;
+  }
+  section.card > header {
+    padding: 12px 16px; border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  }
+  section.card > header h2 { font-size: 14px; margin: 0; font-weight: 600; }
+
+  table { width: 100%; border-collapse: collapse; }
+  th, td { padding: 9px 16px; text-align: left; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { font-weight: 500; color: var(--muted); font-size: 12px; background: #fafaf8; }
+  tr:last-child td { border-bottom: none; }
+  code { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; }
+
+  .tag { display: inline-block; padding: 1px 8px; border-radius: 4px; font-size: 12px; background: var(--accent-soft); color: var(--accent); }
+  .tag.deny, .tag.block { background: #fdeeee; color: var(--danger); }
+  .tag.allow { background: #e8f5ef; color: var(--ok); }
+  .tag.log, .tag.observe { background: #fdf3e6; color: var(--warn); }
+
+  button {
+    font: inherit; font-size: 13px; padding: 5px 12px; border-radius: 6px;
+    border: 1px solid var(--border); background: var(--card); color: var(--text); cursor: pointer;
+  }
+  button:hover { background: #f0efec; }
+  button:disabled { opacity: 0.5; cursor: default; }
+  button.danger { color: var(--danger); border-color: #f0c8c8; }
+  button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+  button.primary:hover { background: #134a80; }
+
+  .empty { padding: 28px 16px; color: var(--muted); text-align: center; font-size: 13px; }
+
+  form { padding: 16px; display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); align-items: end; border-bottom: 1px solid var(--border); }
+  form .wide { grid-column: 1 / -1; }
+  form .hint { grid-column: 1 / -1; font-size: 12px; color: var(--muted); margin-top: -4px; }
+  input, select {
+    font: inherit; font-size: 13px; padding: 6px 10px; border-radius: 6px;
+    border: 1px solid var(--border); background: #fff; color: var(--text); width: 100%;
+  }
+  label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+
+  .msg { padding: 10px 16px; font-size: 13px; display: none; margin-bottom: 16px; border-radius: 8px; }
+  .msg.show { display: block; }
+  .msg.error { background: #fdeeee; color: var(--danger); border: 1px solid #f0c8c8; }
+  .msg.ok { background: #e8f5ef; color: var(--ok); border: 1px solid #b8e0cd; }
+
+  .filters { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .filters select, .filters input { width: auto; min-width: 110px; padding: 4px 8px; font-size: 12px; }
+
+  .pager {
+    display: flex; gap: 12px; align-items: center; justify-content: center;
+    padding: 12px; font-size: 12px; color: var(--muted); border-top: 1px solid var(--border);
+  }
+  .pager:empty { display: none; }
+
+  .fieldset { padding: 16px; display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); border-bottom: 1px solid var(--border); }
+  .fieldset:last-child { border-bottom: none; }
+  .fieldset h3 { grid-column: 1 / -1; font-size: 13px; margin: 0; color: var(--muted); font-weight: 500; }
+  .fieldset .row { grid-column: 1 / -1; display: flex; align-items: center; gap: 8px; font-size: 13px; }
+  .fieldset .row input { width: auto; }
+  .fieldset .wide { grid-column: 1 / -1; }
+  .fieldset .hint { grid-column: 1 / -1; font-size: 12px; color: var(--muted); margin-top: -6px; }
+
+  /* ---------- 日志页 ---------- */
+  .logtable { font-size: 12.5px; }
+  .logtable th { padding: 8px 12px; }
+  .logtable td { padding: 7px 12px; white-space: nowrap; }
+  .logtable tbody tr { cursor: pointer; }
+  .logtable tbody tr:hover { background: #fafaf8; }
+  .logtable .mono { font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+  .logtable .path { max-width: 280px; overflow: hidden; text-overflow: ellipsis; }
+  .logtable .num { text-align: right; font-variant-numeric: tabular-nums; }
+  .logtable .req { color: #8a6a9e; }
+  .logtable .muted { color: var(--muted); }
+
+  .status {
+    display: inline-block; min-width: 38px; text-align: center;
+    padding: 1px 6px; border-radius: 4px; font-size: 12px; font-weight: 500;
+    font-variant-numeric: tabular-nums;
+  }
+  .status.st-2 { background: #e8f5ef; color: var(--ok); }
+  .status.st-3 { background: #eef2f7; color: var(--accent); }
+  .status.st-4 { background: #fdf3e6; color: var(--warn); }
+  .status.st-5 { background: #fdeeee; color: var(--danger); }
+
+  .rawrow td {
+    background: #fafaf8; padding: 0 !important;
+    border-bottom: 1px solid var(--border);
+  }
+  .rawrow pre {
+    margin: 0; padding: 10px 14px; font-size: 11.5px; line-height: 1.6;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    color: #5f5e5a; white-space: pre-wrap; word-break: break-all;
+  }
+  .rawrow.hidden { display: none; }
+</style>
+</head>
+<body>
+<div class="app">
+
+  <aside class="sidebar">
+    <div class="brand">HomeWAF<small>家用 Web 应用防火墙</small></div>
+    <nav class="nav" id="nav">
+      <a data-page="overview" class="active">概览</a>
+      <a data-page="apps">应用</a>
+      <a data-page="rules">访问控制</a>
+      <a data-page="whitelist">检测白名单</a>
+      <a data-page="feeds">IP 组订阅</a>
+      <a data-page="bans">封禁<span class="badge" id="nav-bans">0</span></a>
+      <a data-page="events">事件</a>
+      <a data-page="logs">日志</a>
+      <a data-page="settings">设置</a>
+    </nav>
+  </aside>
+
+  <main>
+    <div class="topbar">
+      <h1 id="page-title">概览</h1>
+      <div class="meta">
+        <span id="top-mode">–</span>
+        <span>检测规则 <b id="top-rules">–</b></span>
+        <span>封禁 <b id="top-bans">–</b></span>
+      </div>
+    </div>
+
+    <div class="content">
+      <div class="msg" id="msg"></div>
+
+      <!-- ========== 概览 ========== -->
+      <div class="page active" data-page="overview">
+        <div class="grid">
+          <div class="stat"><div class="label">应用</div><div class="value" id="s-apps">–</div></div>
+          <div class="stat"><div class="label">上游</div><div class="value" id="s-upstreams">–</div></div>
+          <div class="stat"><div class="label">ACL 规则</div><div class="value" id="s-rules">–</div></div>
+          <div class="stat danger"><div class="label">当前封禁</div><div class="value" id="s-bans">–</div></div>
+          <div class="stat"><div class="label">事件总数</div><div class="value" id="s-events">–</div></div>
+          <div class="stat"><div class="label">检测规则</div><div class="value" id="s-detect">–</div></div>
+        </div>
+        <section class="card">
+          <header><h2>最近拦截</h2></header>
+          <div id="overview-events"></div>
+        </section>
+      </div>
+
+      <!-- ========== 应用 ========== -->
+      <div class="page" data-page="apps">
+        <section class="card">
+          <header>
+            <h2>应用列表</h2>
+            <button class="primary" onclick="showAppForm()">+ 新建应用</button>
+          </header>
+          <form id="app-form" onsubmit="submitApp(event)" style="display:none">
+            <div><label for="af-id">ID</label><input id="af-id" placeholder="nas" required></div>
+            <div><label for="af-domain">对外域名</label><input id="af-domain" placeholder="nas.home.lan" required></div>
+            <div><label for="af-ports">监听端口（逗号分隔）</label><input id="af-ports" placeholder="80, 443"></div>
+            <div class="hint">留空接受任意端口；填了则只在该端口响应</div>
+            <div class="wide"><label for="af-addr">上游服务器</label><input id="af-addr" placeholder="http://192.168.1.5:8080" required></div>
+            <div class="hint">不写协议默认 http:80；写 https:// 默认 443；端口可省略</div>
+            <div style="display:flex;gap:8px;align-items:center">
+              <button type="submit" class="primary" id="af-submit">保存</button>
+              <button type="button" onclick="hideAppForm()">取消</button>
+            </div>
+          </form>
+          <div id="apps"></div>
+        </section>
+      </div>
+
+      <!-- ========== ACL 规则 ========== -->
+      <div class="page" data-page="rules">
+        <section class="card">
+          <header>
+            <h2>访问控制规则</h2>
+            <button class="primary" onclick="showRuleForm()">+ 新建规则</button>
+          </header>
+          <form id="rule-form" onsubmit="submitRule(event)" style="display:none">
+            <div><label for="rf-cidr">网段</label><input id="rf-cidr" placeholder="203.0.113.0/24" required></div>
+            <div><label for="rf-action">动作</label>
+              <select id="rf-action"><option value="deny">拒绝</option><option value="allow">放行</option></select>
+            </div>
+            <div><label for="rf-scope">作用域（留空为全局）</label><input id="rf-scope" placeholder="nas"></div>
+            <div><label for="rf-note">备注</label><input id="rf-note" placeholder="可选"></div>
+            <div style="display:flex;gap:8px;align-items:center">
+              <button type="submit" class="primary" id="rf-submit">添加</button>
+              <button type="button" onclick="hideRuleForm()">取消</button>
+            </div>
+          </form>
+          <div id="rules"></div>
+        </section>
+      </div>
+
+      <!-- ========== 白名单 ========== -->
+      <div class="page" data-page="whitelist">
+        <section class="card">
+          <header>
+            <h2>检测白名单（误报豁免）</h2>
+            <button class="primary" onclick="showWlForm()">+ 添加白名单</button>
+          </header>
+          <form id="wl-form" onsubmit="submitWl(event)" style="display:none">
+            <div><label for="wl-app">应用（留空为全部）</label><input id="wl-app" placeholder="nas"></div>
+            <div><label for="wl-path">路径前缀（留空为不限）</label><input id="wl-path" placeholder="/admin/editor"></div>
+            <div><label for="wl-rule">只豁免某条规则（留空跳过全部检测）</label><input id="wl-rule" placeholder="xss-script-tag"></div>
+            <div><label for="wl-note">备注</label><input id="wl-note" placeholder="文章编辑器需要提交 HTML"></div>
+            <div style="display:flex;gap:8px;align-items:center">
+              <button type="submit" class="primary" id="wl-submit">添加</button>
+              <button type="button" onclick="hideWlForm()">取消</button>
+            </div>
+          </form>
+          <div id="whitelist"></div>
+        </section>
+      </div>
+
+      <!-- ========== IP 组订阅 ========== -->
+      <div class="page" data-page="feeds">
+        <section class="card">
+          <header>
+            <h2>IP 组订阅</h2>
+            <button class="primary" onclick="showFeedForm()">+ 添加订阅</button>
+          </header>
+          <form id="feed-form" onsubmit="submitFeed(event)" style="display:none">
+            <div><label for="ff-name">名称</label><input id="ff-name" placeholder="chaitin" required></div>
+            <div class="wide"><label for="ff-url">订阅地址（必须 HTTPS）</label><input id="ff-url" placeholder="https://chaitin.cn/api/ip-group/xxxx" required></div>
+            <div><label for="ff-action">命中动作</label>
+              <select id="ff-action"><option value="block">拒绝</option><option value="challenge">人机验证</option><option value="log">仅记录</option></select>
+            </div>
+            <div><label for="ff-scope">作用域（留空为全部）</label><input id="ff-scope" placeholder="nas"></div>
+            <div style="display:flex;gap:8px;align-items:center">
+              <button type="submit" class="primary" id="ff-submit">添加并拉取</button>
+              <button type="button" onclick="hideFeedForm()">取消</button>
+            </div>
+          </form>
+          <div id="feeds"></div>
+        </section>
+      </div>
+
+      <!-- ========== 封禁 ========== -->
+      <div class="page" data-page="bans">
+        <section class="card">
+          <header><h2>当前封禁</h2></header>
+          <div id="bans"></div>
+        </section>
+      </div>
+
+      <!-- ========== 事件 ========== -->
+      <div class="page" data-page="events">
+        <section class="card">
+          <header>
+            <h2>安全事件</h2>
+            <div class="filters">
+              <select id="ev-kind" onchange="eventPage=0;loadEvents()">
+                <option value="">全部类型</option><option value="detect">检测</option>
+                <option value="ban">封禁</option><option value="acl">ACL</option>
+              </select>
+              <select id="ev-action" onchange="eventPage=0;loadEvents()">
+                <option value="">全部处置</option><option value="block">拦截</option>
+                <option value="log">记录</option><option value="observe">观察</option>
+              </select>
+              <input id="ev-ip" placeholder="来源 IP" onkeydown="if(event.key==='Enter'){eventPage=0;loadEvents()}">
+              <button onclick="eventPage=0;loadEvents()">查询</button>
+            </div>
+          </header>
+          <div id="events"></div>
+          <div id="events-pager" class="pager"></div>
+        </section>
+      </div>
+
+      <!-- ========== 日志 ========== -->
+      <div class="page" data-page="logs">
+        <section class="card">
+          <header>
+            <h2>运行日志</h2>
+            <div class="filters">
+              <select id="log-kind" onchange="loadLogs()">
+                <option value="access">访问日志</option>
+                <option value="upstream">反代日志</option>
+                <option value="security">安全日志</option>
+                <option value="error">错误日志</option>
+              </select>
+              <input id="log-q" placeholder="关键字 / 请求 ID" style="min-width:200px"
+                     onkeydown="if(event.key==='Enter')loadLogs()">
+              <select id="log-limit" onchange="loadLogs()">
+                <option value="100">100 条</option>
+                <option value="200" selected>200 条</option>
+                <option value="500">500 条</option>
+                <option value="1000">1000 条</option>
+              </select>
+              <button onclick="loadLogs()">刷新</button>
+            </div>
+          </header>
+          <div id="log-meta" style="padding:8px 16px;font-size:12px;color:var(--muted);border-bottom:1px solid var(--border)"></div>
+          <div id="logview"></div>
+        </section>
+      </div>
+
+      <!-- ========== 设置 ========== -->
+      <div class="page" data-page="settings">
+        <section class="card">
+          <header>
+            <h2>设置</h2>
+            <button class="primary" id="save-settings" onclick="saveSettings()">保存设置</button>
+          </header>
+          <div id="settings"></div>
+        </section>
+      </div>
+
+    </div>
+  </main>
+</div>
+
+<script>
+// ============================================================
+// 基础工具
+// ============================================================
+const api = async (path, opts = {}) => {
+  const res = await fetch('/api' + path, { headers: { 'Content-Type': 'application/json' }, ...opts });
+  if (!res.ok) throw new Error((await res.text()) || res.statusText);
+  return res.status === 204 ? null : res.json();
+};
+
+const showMsg = (text, kind = 'ok') => {
+  const el = document.getElementById('msg');
+  el.textContent = text;
+  el.className = 'msg show ' + kind;
+  setTimeout(() => { el.className = 'msg'; }, 4000);
+};
+
+const esc = (s) => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const fmtDuration = (secs) => secs >= 3600 ? Math.floor(secs/3600)+' 小时'
+  : secs >= 60 ? Math.floor(secs/60)+' 分钟' : secs+' 秒';
+const fmtTime = (ts) => new Date(ts * 1000).toLocaleString('zh-CN', { hour12: false });
+const actionLabel = (a) => ({ block: '拒绝', challenge: '人机验证', log: '仅记录' }[a] || a);
+
+// ============================================================
+// 页面切换
+// ============================================================
+const PAGE_TITLES = {
+  overview: '概览', apps: '应用', rules: '访问控制', whitelist: '检测白名单',
+  feeds: 'IP 组订阅', bans: '封禁', events: '事件', logs: '日志', settings: '设置',
+};
+
+document.getElementById('nav').addEventListener('click', (e) => {
+  const link = e.target.closest('a[data-page]');
+  if (!link) return;
+  const page = link.dataset.page;
+
+  document.querySelectorAll('.nav a').forEach(a => a.classList.toggle('active', a === link));
+  document.querySelectorAll('.page').forEach(p => p.classList.toggle('active', p.dataset.page === page));
+  document.getElementById('page-title').textContent = PAGE_TITLES[page] || page;
+
+  // 切换时按需加载
+  ({ apps: loadApps, rules: loadRules, whitelist: loadWhitelist, feeds: loadFeeds,
+     bans: loadBans, events: loadEvents, logs: loadLogs, settings: loadSettings,
+     overview: loadStats }[page] || (() => {}))();
+});
+
+// ============================================================
+// 概览
+// ============================================================
+async function loadStats() {
+  try {
+    const s = await api('/stats');
+    document.getElementById('s-apps').textContent = s.apps;
+    document.getElementById('s-upstreams').textContent = s.upstreams;
+    document.getElementById('s-rules').textContent = s.acl_rules;
+    document.getElementById('s-bans').textContent = s.active_bans;
+    document.getElementById('s-events').textContent = s.events_total;
+    document.getElementById('s-detect').textContent = s.detect_rules;
+
+    document.getElementById('top-rules').textContent = s.detect_rules;
+    document.getElementById('top-bans').textContent = s.active_bans;
+    document.getElementById('top-mode').textContent = s.observe_mode ? '观察模式' : '拦截模式';
+    document.getElementById('nav-bans').textContent = s.active_bans;
+    document.getElementById('nav-bans').className = 'badge' + (s.active_bans > 0 ? ' alert' : '');
+
+    loadOverviewEvents();
+  } catch (e) {
+    showMsg('加载概览失败：' + e.message, 'error');
+  }
+}
+
+async function loadOverviewEvents() {
+  const el = document.getElementById('overview-events');
+  try {
+    const res = await api('/events?limit=5');
+    if (!res.events.length) { el.innerHTML = '<div class="empty">还没有安全事件</div>'; return; }
+    el.innerHTML = `<table>
+      <thead><tr><th>时间</th><th>来源</th><th>规则</th><th>处置</th></tr></thead>
+      <tbody>${res.events.map(e => `<tr>
+        <td>${fmtTime(e.ts)}</td><td><code>${esc(e.client_ip)}</code></td>
+        <td><code>${esc(e.rules)}</code></td>
+        <td><span class="tag ${esc(e.action)}">${esc(e.action)}</span></td>
+      </tr>`).join('')}</tbody></table>`;
+  } catch { el.innerHTML = '<div class="empty">加载失败</div>'; }
+}
+
+// ============================================================
+// 应用
+// ============================================================
+let appsCache = [];
+let editingApp = null;
+
+async function loadApps() {
+  const el = document.getElementById('apps');
+  try {
+    const apps = await api('/apps');
+    appsCache = apps;
+    if (!apps.length) { el.innerHTML = '<div class="empty">还没有应用，点右上角新建</div>'; return; }
+    el.innerHTML = `<table>
+      <thead><tr><th>ID</th><th>入口域名</th><th>代理地址</th><th>状态</th><th>路由</th><th></th></tr></thead>
+      <tbody>${apps.map(a => `<tr>
+        <td><code>${esc(a.id)}</code></td>
+        <td>${esc(a.domains.primary)}${a.domains.aliases.length ? `<br><span class="sub" style="margin:0">+${a.domains.aliases.length} 别名</span>` : ''}</td>
+        <td>${a.upstreams.map(u => `<code>${esc(u.port ? `${u.addr}:${u.port}` : u.addr)}</code>`).join('<br>')}</td>
+        <td>${a.enabled ? '<span class="tag allow">启用</span>' : '<span class="tag deny">禁用</span>'}</td>
+        <td>${a.routes.length}</td>
+        <td style="white-space:nowrap">
+          <button onclick="editApp('${esc(a.id)}')">编辑</button>
+          <button class="danger" onclick="deleteApp('${esc(a.id)}')">删除</button>
+        </td>
+      </tr>`).join('')}</tbody></table>`;
+  } catch (e) { el.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`; }
+}
+
+function showAppForm(app) {
+  editingApp = app || null;
+  const f = document.getElementById('app-form');
+  f.style.display = 'grid';
+  const idEl = document.getElementById('af-id');
+  idEl.value = app?.id || '';
+  idEl.readOnly = !!app;
+  idEl.style.background = app ? '#f5f5f2' : '#fff';
+  document.getElementById('af-domain').value = app?.domains?.primary || '';
+  document.getElementById('af-ports').value = (app?.listen_ports || []).join(', ');
+  const u = app?.upstreams?.[0];
+  document.getElementById('af-addr').value = u ? (u.port ? `${u.addr}:${u.port}` : u.addr) : '';
+  document.getElementById('af-submit').textContent = app ? '保存修改' : '创建';
+  idEl.focus();
+}
+
+function hideAppForm() {
+  document.getElementById('app-form').style.display = 'none';
+  editingApp = null;
+}
+
+function editApp(id) {
+  const app = appsCache.find(a => a.id === id);
+  if (app) showAppForm(app);
+}
+
+async function submitApp(e) {
+  e.preventDefault();
+  const btn = document.getElementById('af-submit');
+  const id = document.getElementById('af-id').value.trim();
+  const domain = document.getElementById('af-domain').value.trim();
+  const addr = document.getElementById('af-addr').value.trim();
+  const portsRaw = document.getElementById('af-ports').value.trim();
+
+  if (!/^[a-z0-9][a-z0-9-]*$/.test(id)) return showMsg('ID 只能包含小写字母、数字和横线', 'error');
+  if (!addr) return showMsg('上游服务器不能为空', 'error');
+
+  const listenPorts = portsRaw
+    ? portsRaw.split(',').map(s => parseInt(s.trim(), 10)).filter(p => p > 0 && p <= 65535)
+    : [];
+  if (portsRaw && !listenPorts.length) return showMsg('监听端口格式不对，应该是 80, 443 这样', 'error');
+
+  // 编辑时保留其他字段；别名域名不在表单里了，但要保留已有数据
+  const app = {
+    ...(editingApp || {}),
+    id,
+    name: editingApp?.name || id,
+    domains: {
+      primary: domain,
+      aliases: editingApp?.domains?.aliases || [],
+    },
+    listen_ports: listenPorts,
+    upstreams: [{ addr }],
+    enabled: editingApp?.enabled ?? true,
+  };
+
+  btn.disabled = true; btn.textContent = '保存中…';
+  try {
+    await api('/apps', { method: 'POST', body: JSON.stringify(app) });
+    showMsg(editingApp ? `已更新 ${id}` : `已创建 ${id}`);
+    hideAppForm(); loadApps(); loadStats();
+  } catch (err) { showMsg('保存失败：' + err.message, 'error'); }
+  finally { btn.disabled = false; btn.textContent = editingApp ? '保存修改' : '创建'; }
+}
+
+async function deleteApp(id) {
+  if (!confirm(`删除应用 ${id}？该域名的请求会立即停止转发。`)) return;
+  try {
+    await api('/apps/' + encodeURIComponent(id), { method: 'DELETE' });
+    showMsg(`已删除 ${id}`); loadApps(); loadStats();
+  } catch (e) { showMsg('删除失败：' + e.message, 'error'); }
+}
+
+// ============================================================
+// ACL 规则
+// ============================================================
+async function loadRules() {
+  const el = document.getElementById('rules');
+  try {
+    const rules = await api('/rules');
+    if (!rules.length) { el.innerHTML = '<div class="empty">还没有规则</div>'; return; }
+    el.innerHTML = `<table>
+      <thead><tr><th>ID</th><th>网段</th><th>动作</th><th>作用域</th><th>备注</th><th></th></tr></thead>
+      <tbody>${rules.map(r => `<tr>
+        <td><code>${esc(r.id)}</code></td><td><code>${esc(r.cidr)}</code></td>
+        <td><span class="tag ${esc(r.action)}">${r.action === 'allow' ? '放行' : '拒绝'}</span></td>
+        <td>${r.scope ? esc(r.scope) : '<span class="sub" style="margin:0">全局</span>'}</td>
+        <td>${esc(r.note || '')}</td>
+        <td><button class="danger" onclick="deleteRule('${esc(r.id)}')">删除</button></td>
+      </tr>`).join('')}</tbody></table>`;
+  } catch (e) { el.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`; }
+}
+
+function showRuleForm() {
+  document.getElementById('rule-form').style.display = 'grid';
+  ['rf-cidr', 'rf-scope', 'rf-note'].forEach(id => document.getElementById(id).value = '');
+  document.getElementById('rf-action').value = 'deny';
+  document.getElementById('rf-cidr').focus();
+}
+function hideRuleForm() { document.getElementById('rule-form').style.display = 'none'; }
+
+async function submitRule(e) {
+  e.preventDefault();
+  const btn = document.getElementById('rf-submit');
+  const cidr = document.getElementById('rf-cidr').value.trim();
+  const action = document.getElementById('rf-action').value;
+  const scope = document.getElementById('rf-scope').value.trim();
+  const note = document.getElementById('rf-note').value.trim();
+
+  if (!/^[0-9a-fA-F:.]+\/\d{1,3}$/.test(cidr)) return showMsg('网段格式应为 CIDR，如 203.0.113.0/24', 'error');
+
+  btn.disabled = true; btn.textContent = '添加中…';
+  try {
+    await api('/rules', { method: 'POST', body: JSON.stringify({ cidr, action, scope: scope || null, note: note || null }) });
+    showMsg(`规则已添加：${cidr}`);
+    hideRuleForm(); loadRules(); loadStats();
+  } catch (err) { showMsg('添加失败：' + err.message, 'error'); }
+  finally { btn.disabled = false; btn.textContent = '添加'; }
+}
+
+async function deleteRule(id) {
+  if (!confirm(`删除规则 ${id}？`)) return;
+  try { await api('/rules/' + encodeURIComponent(id), { method: 'DELETE' }); showMsg('已删除'); loadRules(); loadStats(); }
+  catch (e) { showMsg('删除失败：' + e.message, 'error'); }
+}
+
+// ============================================================
+// 白名单
+// ============================================================
+async function loadWhitelist() {
+  const el = document.getElementById('whitelist');
+  try {
+    const rows = await api('/whitelist');
+    if (!rows.length) { el.innerHTML = '<div class="empty">没有白名单。误报时在这里给特定路径开豁免，不要关掉整类检测。</div>'; return; }
+    el.innerHTML = `<table>
+      <thead><tr><th>ID</th><th>应用</th><th>路径前缀</th><th>豁免规则</th><th>备注</th><th></th></tr></thead>
+      <tbody>${rows.map(w => `<tr>
+        <td><code>${esc(w.id)}</code></td>
+        <td>${w.app ? esc(w.app) : '<span class="sub" style="margin:0">全部</span>'}</td>
+        <td>${w.path ? `<code>${esc(w.path)}</code>` : '<span class="sub" style="margin:0">不限</span>'}</td>
+        <td>${w.rule_id ? `<code>${esc(w.rule_id)}</code>` : '<span class="tag log">跳过全部检测</span>'}</td>
+        <td>${esc(w.note || '')}</td>
+        <td><button class="danger" onclick="deleteWl('${esc(w.id)}')">删除</button></td>
+      </tr>`).join('')}</tbody></table>`;
+  } catch (e) { el.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`; }
+}
+
+function showWlForm() {
+  document.getElementById('wl-form').style.display = 'grid';
+  ['wl-app', 'wl-path', 'wl-rule', 'wl-note'].forEach(id => document.getElementById(id).value = '');
+  document.getElementById('wl-app').focus();
+}
+function hideWlForm() { document.getElementById('wl-form').style.display = 'none'; }
+
+async function submitWl(e) {
+  e.preventDefault();
+  const btn = document.getElementById('wl-submit');
+  const app = document.getElementById('wl-app').value.trim();
+  const path = document.getElementById('wl-path').value.trim();
+  const ruleId = document.getElementById('wl-rule').value.trim();
+  const note = document.getElementById('wl-note').value.trim();
+
+  if (!app && !path && !ruleId) return showMsg('至少要填应用、路径或规则之一，否则等于关闭全部检测', 'error');
+  if (path && !path.startsWith('/')) return showMsg('路径必须以 / 开头', 'error');
+
+  btn.disabled = true; btn.textContent = '添加中…';
+  try {
+    await api('/whitelist', { method: 'POST', body: JSON.stringify({ app: app || null, path: path || null, rule_id: ruleId || null, note: note || null }) });
+    showMsg('白名单已添加'); hideWlForm(); loadWhitelist();
+  } catch (err) { showMsg('添加失败：' + err.message, 'error'); }
+  finally { btn.disabled = false; btn.textContent = '添加'; }
+}
+
+async function deleteWl(id) {
+  if (!confirm(`删除白名单 ${id}？`)) return;
+  try { await api('/whitelist/' + encodeURIComponent(id), { method: 'DELETE' }); showMsg('已删除'); loadWhitelist(); }
+  catch (e) { showMsg('删除失败：' + e.message, 'error'); }
+}
+
+// ============================================================
+// IP 组订阅
+// ============================================================
+async function loadFeeds() {
+  const el = document.getElementById('feeds');
+  try {
+    const feeds = await api('/feeds');
+    if (!feeds.length) { el.innerHTML = '<div class="empty">还没有订阅。添加一个恶意 IP 库，防护能力会强很多。</div>'; return; }
+    el.innerHTML = `<table>
+      <thead><tr><th>名称</th><th>地址</th><th>动作</th><th>作用域</th><th>状态</th><th></th></tr></thead>
+      <tbody>${feeds.map(f => `<tr>
+        <td><code>${esc(f.name)}</code></td>
+        <td style="max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"><code>${esc(f.source.url)}</code></td>
+        <td><span class="tag ${f.action === 'log' ? 'log' : 'deny'}">${actionLabel(f.action)}</span></td>
+        <td>${f.scope?.length ? esc(f.scope.join(', ')) : '<span class="sub" style="margin:0">全部</span>'}</td>
+        <td>${f.enabled ? '<span class="tag allow">启用</span>' : '<span class="tag">停用</span>'}</td>
+        <td style="white-space:nowrap">
+          <button onclick="refreshFeed('${esc(f.name)}')">刷新</button>
+          <button class="danger" onclick="deleteFeed('${esc(f.name)}')">删除</button>
+        </td>
+      </tr>`).join('')}</tbody></table>`;
+  } catch (e) { el.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`; }
+}
+
+function showFeedForm() {
+  document.getElementById('feed-form').style.display = 'grid';
+  ['ff-name', 'ff-url', 'ff-scope'].forEach(id => document.getElementById(id).value = '');
+  document.getElementById('ff-action').value = 'block';
+  document.getElementById('ff-name').focus();
+}
+function hideFeedForm() { document.getElementById('feed-form').style.display = 'none'; }
+
+async function submitFeed(e) {
+  e.preventDefault();
+  const btn = document.getElementById('ff-submit');
+  const name = document.getElementById('ff-name').value.trim();
+  const url = document.getElementById('ff-url').value.trim();
+  const action = document.getElementById('ff-action').value;
+  const scope = document.getElementById('ff-scope').value.trim();
+
+  if (!url.startsWith('https://')) return showMsg('订阅地址必须是 HTTPS（明文 HTTP 可能被中间人投毒）', 'error');
+
+  btn.disabled = true; btn.textContent = '拉取中…';
+  try {
+    const res = await api('/feeds', { method: 'POST', body: JSON.stringify({ name, url, action, scope: scope ? [scope] : [] }) });
+    if (res && res.warning) showMsg(res.warning, 'error');
+    else showMsg(`订阅 ${name} 已添加并拉取成功`);
+    hideFeedForm(); loadFeeds(); loadStats();
+  } catch (err) { showMsg('添加失败：' + err.message, 'error'); }
+  finally { btn.disabled = false; btn.textContent = '添加并拉取'; }
+}
+
+async function refreshFeed(name) {
+  showMsg(`正在重新拉取 ${name}…`);
+  try {
+    const res = await api('/feeds/' + encodeURIComponent(name) + '/refresh', { method: 'POST' });
+    if (res && res.warning) showMsg(res.warning, 'error');
+    else showMsg(`${name} 已刷新`);
+    loadFeeds();
+  } catch (e) { showMsg('刷新失败：' + e.message, 'error'); }
+}
+
+async function deleteFeed(name) {
+  if (!confirm(`删除订阅 ${name}？对应的规则会立即失效。`)) return;
+  try { await api('/feeds/' + encodeURIComponent(name), { method: 'DELETE' }); showMsg('已删除'); loadFeeds(); loadStats(); }
+  catch (e) { showMsg('删除失败：' + e.message, 'error'); }
+}
+
+// ============================================================
+// 封禁
+// ============================================================
+async function loadBans() {
+  const el = document.getElementById('bans');
+  try {
+    const bans = await api('/bans');
+    if (!bans.length) { el.innerHTML = '<div class="empty">当前没有封禁</div>'; return; }
+    el.innerHTML = `<table>
+      <thead><tr><th>IP</th><th>剩余</th><th>次数</th><th>原因</th><th></th></tr></thead>
+      <tbody>${bans.map(b => `<tr>
+        <td><code>${esc(b.ip)}</code></td>
+        <td>${fmtDuration(b.remaining_secs)}</td>
+        <td>${b.offenses}</td>
+        <td><code>${esc(b.reason)}</code></td>
+        <td><button class="danger" onclick="unban('${esc(b.ip)}')">解封</button></td>
+      </tr>`).join('')}</tbody></table>`;
+  } catch (e) { el.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`; }
+}
+
+async function unban(ip) {
+  if (!confirm(`确定解封 ${ip}？`)) return;
+  try { await api('/bans/' + encodeURIComponent(ip), { method: 'DELETE' }); showMsg(`已解封 ${ip}`); loadBans(); loadStats(); }
+  catch (e) { showMsg('解封失败：' + e.message, 'error'); }
+}
+
+// ============================================================
+// 事件
+// ============================================================
+let eventPage = 0;
+const EVENT_PAGE_SIZE = 20;
+
+async function loadEvents() {
+  const el = document.getElementById('events');
+  const pager = document.getElementById('events-pager');
+  const params = new URLSearchParams({ limit: String(EVENT_PAGE_SIZE), offset: String(eventPage * EVENT_PAGE_SIZE) });
+  const kind = document.getElementById('ev-kind').value;
+  const action = document.getElementById('ev-action').value;
+  const ip = document.getElementById('ev-ip').value.trim();
+  if (kind) params.set('kind', kind);
+  if (action) params.set('action', action);
+  if (ip) params.set('ip', ip);
+
+  try {
+    const res = await api('/events?' + params);
+    const { events, total } = res;
+    if (!events.length) {
+      el.innerHTML = '<div class="empty">没有符合条件的事件</div>';
+      pager.innerHTML = ''; return;
+    }
+    el.innerHTML = `<table>
+      <thead><tr><th>时间</th><th>类型</th><th>来源 IP</th><th>应用</th><th>规则</th><th>分数</th><th>处置</th></tr></thead>
+      <tbody>${events.map(e => `<tr>
+        <td>${fmtTime(e.ts)}</td><td>${esc(e.kind)}</td>
+        <td><code>${esc(e.client_ip)}</code></td><td>${esc(e.app)}</td>
+        <td><code>${esc(e.rules)}</code></td><td>${e.score}</td>
+        <td><span class="tag ${esc(e.action)}">${esc(e.action)}</span></td>
+      </tr>`).join('')}</tbody></table>`;
+
+    const pages = Math.max(1, Math.ceil(total / EVENT_PAGE_SIZE));
+    pager.innerHTML = `
+      <button ${eventPage === 0 ? 'disabled' : ''} onclick="eventPage--;loadEvents()">上一页</button>
+      <span>第 ${eventPage + 1} / ${pages} 页 · 共 ${total} 条</span>
+      <button ${eventPage + 1 >= pages ? 'disabled' : ''} onclick="eventPage++;loadEvents()">下一页</button>`;
+  } catch (e) {
+    el.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`;
+    pager.innerHTML = '';
+  }
+}
+
+// ============================================================
+// 日志
+// ============================================================
+async function loadLogs() {
+  const view = document.getElementById('logview');
+  const meta = document.getElementById('log-meta');
+  const kind = document.getElementById('log-kind').value;
+  const q = document.getElementById('log-q').value.trim();
+  const limit = document.getElementById('log-limit').value;
+
+  view.innerHTML = '<div class="empty">加载中…</div>';
+  try {
+    const params = new URLSearchParams({ kind, limit });
+    if (q) params.set('q', q);
+    const res = await api('/logs?' + params);
+
+    meta.textContent = res.file
+      ? `${res.file} · 匹配 ${res.total} 条 · 显示最新 ${res.lines.length} 条`
+      : '暂无日志文件（还没产生该类型的日志）';
+
+    const rows = res.lines
+      .map(l => { try { return JSON.parse(l); } catch { return null; } })
+      .filter(Boolean);
+
+    if (!rows.length) {
+      view.innerHTML = '<div class="empty">没有匹配的日志</div>';
+      return;
+    }
+    view.innerHTML = renderLogTable(kind, rows);
+  } catch (e) {
+    view.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`;
+    meta.textContent = '';
+  }
+}
+
+const timeOnly = (ts) => ts ? new Date(ts).toLocaleTimeString('zh-CN', { hour12: false }) : '';
+const fullTime = (ts) => ts ? new Date(ts).toLocaleString('zh-CN', { hour12: false }) : '';
+const statusCls = (s) => s >= 500 ? 'st-5' : s >= 400 ? 'st-4' : s >= 300 ? 'st-3' : 'st-2';
+
+/// 点行展开原始 JSON
+function toggleRaw(id) {
+  const el = document.getElementById('raw-' + id);
+  if (el) el.classList.toggle('hidden');
+}
+
+/// 每种日志有自己的列，不要把所有字段摊平成一坨
+function renderLogTable(kind, rows) {
+  if (kind === 'access') return accessTable(rows);
+  if (kind === 'upstream') return upstreamTable(rows);
+  if (kind === 'security') return securityTable(rows);
+  return genericTable(rows);
+}
+
+function accessTable(rows) {
+  return `<table class="logtable">
+    <thead><tr><th>时间</th><th>方法</th><th>路径</th><th>状态</th><th>上游</th>
+    <th style="text-align:right">耗时</th><th>来源 IP</th><th>ID</th></tr></thead>
+    <tbody>${rows.map((o, i) => {
+      const f = o.fields || {};
+      const st = f.status ?? 0;
+      const id = `acc-${i}`;
+      return `<tr onclick="toggleRaw('${id}')">
+        <td class="mono muted">${timeOnly(o.timestamp)}</td>
+        <td>${esc(f.method || '')}</td>
+        <td class="mono path" title="${esc(f.path || '')}">${esc(f.path || '')}</td>
+        <td><span class="status ${statusCls(st)}">${st || '-'}</span></td>
+        <td class="mono muted">${esc(f.upstream || '-')}</td>
+        <td class="num">${f.latency_us ? f.latency_us + ' μs' : '-'}</td>
+        <td class="mono">${esc(f.client_ip || '-')}</td>
+        <td class="mono req">${esc(f.req || '')}</td>
+      </tr>
+      <tr class="rawrow hidden" id="raw-${id}"><td colspan="8"><pre>${esc(JSON.stringify(o, null, 2))}</pre></td></tr>`;
+    }).join('')}</tbody></table>`;
+}
+
+function upstreamTable(rows) {
+  return `<table class="logtable">
+    <thead><tr><th>时间</th><th>上游</th><th>状态</th><th style="text-align:right">耗时</th>
+    <th>备份</th><th>错误</th><th>ID</th></tr></thead>
+    <tbody>${rows.map((o, i) => {
+      const f = o.fields || {};
+      const st = f.status ?? 0;
+      const id = `up-${i}`;
+      return `<tr onclick="toggleRaw('${id}')">
+        <td class="mono muted">${timeOnly(o.timestamp)}</td>
+        <td class="mono">${esc(f.upstream || '-')}</td>
+        <td><span class="status ${statusCls(st)}">${st || '-'}</span></td>
+        <td class="num">${f.latency_us ? f.latency_us + ' μs' : '-'}</td>
+        <td>${f.backup ? '<span class="tag log">备份</span>' : '<span class="muted">-</span>'}</td>
+        <td class="mono" style="color:var(--danger)">${esc(f.error || '')}</td>
+        <td class="mono req">${esc(f.req || '')}</td>
+      </tr>
+      <tr class="rawrow hidden" id="raw-${id}"><td colspan="7"><pre>${esc(JSON.stringify(o, null, 2))}</pre></td></tr>`;
+    }).join('')}</tbody></table>`;
+}
+
+function securityTable(rows) {
+  return `<table class="logtable">
+    <thead><tr><th>时间</th><th>事件</th><th>来源 IP</th><th>规则</th>
+    <th style="text-align:right">分数</th><th>应用</th><th>ID</th></tr></thead>
+    <tbody>${rows.map((o, i) => {
+      const f = o.fields || {};
+      const id = `sec-${i}`;
+      const isBan = (f.message || '').includes('封禁');
+      const rules = f.rules ? String(f.rules).replace(/[\[\]"]/g, '') : '';
+      return `<tr onclick="toggleRaw('${id}')">
+        <td class="mono muted">${timeOnly(o.timestamp)}</td>
+        <td>${isBan ? '<span class="tag deny">封禁</span>' : '<span class="tag log">检测</span>'}
+            <span style="margin-left:6px">${esc(f.message || '')}</span></td>
+        <td class="mono">${esc(f.client_ip || '-')}</td>
+        <td class="mono">${esc(rules || '-')}</td>
+        <td class="num">${f.score ?? '-'}</td>
+        <td>${esc(f.app || '-')}</td>
+        <td class="mono req">${esc(f.req || '')}</td>
+      </tr>
+      <tr class="rawrow hidden" id="raw-${id}"><td colspan="7"><pre>${esc(JSON.stringify(o, null, 2))}</pre></td></tr>`;
+    }).join('')}</tbody></table>`;
+}
+
+function genericTable(rows) {
+  return `<table class="logtable">
+    <thead><tr><th>时间</th><th>级别</th><th>消息</th><th>ID</th></tr></thead>
+    <tbody>${rows.map((o, i) => {
+      const f = o.fields || {};
+      const id = `gen-${i}`;
+      const lvl = o.level || '';
+      return `<tr onclick="toggleRaw('${id}')">
+        <td class="mono muted">${fullTime(o.timestamp)}</td>
+        <td><span class="tag ${lvl === 'ERROR' ? 'deny' : 'log'}">${esc(lvl)}</span></td>
+        <td>${esc(f.message || '')}</td>
+        <td class="mono req">${esc(f.req || '')}</td>
+      </tr>
+      <tr class="rawrow hidden" id="raw-${id}"><td colspan="4"><pre>${esc(JSON.stringify(o, null, 2))}</pre></td></tr>`;
+    }).join('')}</tbody></table>`;
+}
+
+// ============================================================
+// 设置
+// ============================================================
+let settingsCache = {};
+
+const numVal = (id) => parseInt(document.getElementById(id).value, 10) || 0;
+const selVal = (id) => document.getElementById(id).value || null;
+const listVal = (id) => document.getElementById(id).value.split(',').map(s => s.trim()).filter(Boolean);
+
+const toggleSelect = (id, val) => `
+  <select id="${id}">
+    <option value="" ${!val ? 'selected' : ''}>跟随档位</option>
+    <option value="off" ${val === 'off' ? 'selected' : ''}>关闭</option>
+    <option value="monitor" ${val === 'monitor' ? 'selected' : ''}>仅记录</option>
+    <option value="block" ${val === 'block' ? 'selected' : ''}>拦截</option>
+  </select>`;
+
+async function loadSettings() {
+  const el = document.getElementById('settings');
+  try {
+    const s = await api('/settings');
+    settingsCache = s;
+    renderSettings(s);
+  } catch (e) { el.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`; }
+}
+
+function renderSettings(s) {
+  const p = s.protection || {};
+  const acl = s.acl || {};
+  const ab = acl.auto_ban || {};
+  const pn = acl.private_network || {};
+  const ri = s.real_ip || {};
+  const rl = s.ratelimit || {};
+
+  document.getElementById('settings').innerHTML = `
+    <div class="fieldset">
+      <h3>防护策略</h3>
+      <label class="row"><input type="checkbox" id="set-observe" ${p.observe_mode?.enabled ? 'checked' : ''}>
+        观察模式（只记录不拦截，建议首次部署开一周）</label>
+      <div><label for="set-threshold">拦截阈值</label>
+        <input type="number" id="set-threshold" min="1" max="100" value="${p.block_threshold ?? 50}"></div>
+      <div><label for="set-sqli">SQL 注入</label>${toggleSelect('set-sqli', p.sqli)}</div>
+      <div><label for="set-xss">XSS</label>${toggleSelect('set-xss', p.xss)}</div>
+      <div><label for="set-cmdi">命令注入</label>${toggleSelect('set-cmdi', p.cmdi)}</div>
+      <div><label for="set-traversal">路径穿越</label>${toggleSelect('set-traversal', p.path_traversal)}</div>
+    </div>
+    <div class="fieldset">
+      <h3>自动封禁</h3>
+      <label class="row"><input type="checkbox" id="set-autoban" ${ab.enabled ? 'checked' : ''}> 启用自动封禁</label>
+      <div><label for="set-trigger">触发分数</label>
+        <input type="number" id="set-trigger" min="1" max="500" value="${ab.trigger_score ?? 50}"></div>
+      <div><label for="set-ipv6">IPv6 聚合前缀</label>
+        <input type="number" id="set-ipv6" min="0" max="128" value="${acl.ipv6_prefix_match ?? 64}"></div>
+      <div><label for="set-private">内网网段策略</label>
+        <select id="set-private">
+          <option value="allow" ${pn.action === 'allow' ? 'selected' : ''}>直接放行</option>
+          <option value="normal" ${pn.action === 'normal' ? 'selected' : ''}>正常检测</option>
+          <option value="deny" ${pn.action === 'deny' ? 'selected' : ''}>直接拒绝</option>
+        </select></div>
+      <div class="hint">封禁时长档位：${(ab.durations || []).join(' → ') || '未配置'}</div>
+    </div>
+    <div class="fieldset">
+      <h3>真实 IP 还原</h3>
+      <label class="row"><input type="checkbox" id="set-realip" ${ri.enabled ? 'checked' : ''}>
+        启用（前面有 CDN / Tunnel / frp 时必开）</label>
+      <div class="wide"><label for="set-trusted">可信代理网段（逗号分隔）</label>
+        <input id="set-trusted" placeholder="127.0.0.1/32, 10.0.0.0/8" value="${(ri.trusted_proxies || []).join(', ')}"></div>
+      <div class="wide"><label for="set-headers">头部优先级（逗号分隔）</label>
+        <input id="set-headers" placeholder="CF-Connecting-IP, X-Real-IP" value="${(ri.header_priority || []).join(', ')}"></div>
+      <div class="hint">只有来自可信代理的请求才会解析这些头，其余一律用直连 IP。</div>
+    </div>
+    <div class="fieldset">
+      <h3>限流</h3>
+      <div><label for="set-gqps">全局 QPS</label><input type="number" id="set-gqps" min="0" value="${rl.global_qps ?? 2000}"></div>
+      <div><label for="set-iqps">单 IP QPS</label><input type="number" id="set-iqps" min="0" value="${rl.per_ip_qps ?? 100}"></div>
+    </div>`;
+}
+
+async function saveSettings() {
+  const btn = document.getElementById('save-settings');
+  btn.disabled = true; btn.textContent = '保存中…';
+  try {
+    const p = { ...settingsCache.protection };
+    p.observe_mode = { ...(p.observe_mode || {}), enabled: document.getElementById('set-observe').checked };
+    p.block_threshold = numVal('set-threshold');
+    p.sqli = selVal('set-sqli'); p.xss = selVal('set-xss');
+    p.cmdi = selVal('set-cmdi'); p.path_traversal = selVal('set-traversal');
+
+    const acl = { ...settingsCache.acl };
+    delete acl.rules;
+    acl.auto_ban = { ...(acl.auto_ban || {}), enabled: document.getElementById('set-autoban').checked, trigger_score: numVal('set-trigger') };
+    acl.ipv6_prefix_match = numVal('set-ipv6');
+    acl.private_network = { ...(acl.private_network || {}), action: document.getElementById('set-private').value };
+
+    const ri = { ...settingsCache.real_ip };
+    ri.enabled = document.getElementById('set-realip').checked;
+    ri.trusted_proxies = listVal('set-trusted');
+    ri.header_priority = listVal('set-headers');
+
+    const rl = { ...settingsCache.ratelimit };
+    rl.global_qps = numVal('set-gqps'); rl.per_ip_qps = numVal('set-iqps');
+
+    await api('/settings/protection', { method: 'PUT', body: JSON.stringify(p) });
+    await api('/settings/acl', { method: 'PUT', body: JSON.stringify(acl) });
+    await api('/settings/real_ip', { method: 'PUT', body: JSON.stringify(ri) });
+    await api('/settings/ratelimit', { method: 'PUT', body: JSON.stringify(rl) });
+
+    showMsg('设置已保存并立即生效');
+    loadSettings(); loadStats();
+  } catch (e) {
+    showMsg('保存失败：' + e.message, 'error');
+    loadSettings();
+  } finally { btn.disabled = false; btn.textContent = '保存设置'; }
+}
+
+// ============================================================
+// 启动
+// ============================================================
+loadStats();
+setInterval(loadStats, 5000);
+</script>
+</body>
+</html>

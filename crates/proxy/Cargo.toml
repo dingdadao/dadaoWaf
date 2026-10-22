@@ -1,0 +1,30 @@
+[package]
+name = "homewaf-proxy"
+description = "HomeWAF 代理层（Pingora 集成）"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+homewaf-config = { path = "../config" }
+homewaf-router = { path = "../router" }
+homewaf-acl = { path = "../acl" }
+homewaf-detect = { path = "../detect" }
+homewaf-store = { path = "../store" }
+ipnet.workspace = true
+serde_json.workspace = true
+# 主动健康检查探测
+ureq = "3"
+pingora = { version = "0.9", default-features = false, features = ["proxy", "rustls"] }
+# 显式依赖以锁住版本，见 workspace Cargo.toml 的说明
+tokio = { workspace = true }
+http = "1"
+# 与 pingora 内部使用的版本保持一致
+bytes = "1"
+async-trait = "0.1"
+anyhow = "1"
+thiserror.workspace = true
+tracing = "0.1"
+# 热重载：无锁原子替换运行时状态
+arc-swap = "1"

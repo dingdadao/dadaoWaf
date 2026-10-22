@@ -1,0 +1,19 @@
+# 检测引擎测试：拦截模式
+server:
+  listen: ["127.0.0.1:18080"]
+  admin:
+    listen: "127.0.0.1:19443"
+
+protection:
+  observe_mode:
+    enabled: false
+  block_threshold: 50
+
+applications:
+  - id: test
+    name: "检测测试"
+    domains:
+      primary: "nas.home.lan"
+    upstreams:
+      - addr: 127.0.0.1
+        port: 18081

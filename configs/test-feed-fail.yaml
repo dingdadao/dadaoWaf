@@ -1,0 +1,22 @@
+# 订阅容错测试：订阅源不可达时，服务仍应正常启动
+server:
+  listen: ["127.0.0.1:18080"]
+  admin:
+    listen: "127.0.0.1:19443"
+
+ip_groups:
+  - name: unreachable
+    enabled: true
+    source:
+      url: "https://127.0.0.1:1/list.txt"
+      timeout: 2s
+    action: block
+
+applications:
+  - id: test
+    name: "测试"
+    domains:
+      primary: "nas.home.lan"
+    upstreams:
+      - addr: 127.0.0.1
+        port: 18081

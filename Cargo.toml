@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/config",
+    "crates/router",
+    "crates/acl",
+    "crates/detect",
+    "crates/store",
+    "crates/admin",
+    "crates/proxy",
+    "crates/cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.82"
+repository = "https://github.com/example/homewaf"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+serde_json = "1"
+serde_path_to_error = "0.1"
+thiserror = "2"
+ipnet = { version = "2", features = ["serde"] }
+# 锁死在 1.53：tokio >= 1.54 给 BufReader::with_capacity(0) 加了 assert，
+# 而 pingora 0.9 内部会用容量 0 构造 BufStream，升级后启动即 panic。
+# 详见 docs/implementation.md 的 ADR-007。
+tokio = "=1.53.0"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"

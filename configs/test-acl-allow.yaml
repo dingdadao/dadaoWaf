@@ -1,0 +1,26 @@
+# ACL 测试：白名单优先于黑名单
+server:
+  listen: ["127.0.0.1:18080"]
+  admin:
+    listen: "127.0.0.1:19443"
+
+acl:
+  private_network:
+    action: normal
+  rules:
+    - id: deny-loopback
+      cidr: 127.0.0.0/8
+      action: deny
+    - id: allow-local
+      cidr: 127.0.0.1/32
+      action: allow
+      note: "更具体的白名单应胜出"
+
+applications:
+  - id: test
+    name: "ACL 测试"
+    domains:
+      primary: "nas.home.lan"
+    upstreams:
+      - addr: 127.0.0.1
+        port: 18081

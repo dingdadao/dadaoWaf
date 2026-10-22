@@ -1,0 +1,22 @@
+[package]
+name = "homewaf-admin"
+description = "HomeWAF 管理 API 与 Web 控制台"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+homewaf-config = { path = "../config" }
+homewaf-store = { path = "../store" }
+homewaf-acl = { path = "../acl" }
+homewaf-router = { path = "../router" }
+homewaf-detect = { path = "../detect" }
+homewaf-proxy = { path = "../proxy" }
+ipnet.workspace = true
+axum = "0.8"
+anyhow = "1"
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "macros", "time"] }
+serde.workspace = true
+serde_json.workspace = true
+tracing = "0.1"

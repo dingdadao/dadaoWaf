@@ -1,0 +1,11 @@
+/target
+**/*.rs.bk
+*.pdb
+.DS_Store
+/data
+*.db
+*.db-wal
+*.db-shm
+
+# 工具会话数据（含本地记忆与临时产物）
+.workbuddy-ai/

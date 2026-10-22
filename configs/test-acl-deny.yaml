@@ -1,0 +1,23 @@
+# ACL 测试：封禁本机
+server:
+  listen: ["127.0.0.1:18080"]
+  admin:
+    listen: "127.0.0.1:19443"
+
+acl:
+  private_network:
+    action: normal          # 关掉内网默认放行，否则 127.0.0.1 会被放行
+  rules:
+    - id: block-local
+      cidr: 127.0.0.1/32
+      action: deny
+      note: "测试：封禁本机"
+
+applications:
+  - id: test
+    name: "ACL 测试"
+    domains:
+      primary: "nas.home.lan"
+    upstreams:
+      - addr: 127.0.0.1
+        port: 18081

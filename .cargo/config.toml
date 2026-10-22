@@ -1,0 +1,10 @@
+# 国内网络环境下使用 rsproxy 镜像加速 crates 下载。
+# 如在海外或企业内网，可删除此文件或替换为自有镜像。
+[source.crates-io]
+replace-with = "rsproxy-sparse"
+
+[source.rsproxy-sparse]
+registry = "sparse+https://rsproxy.cn/index/"
+
+[net]
+git-fetch-with-cli = true

@@ -1,0 +1,17 @@
+# 压测专用：用 IP 作为域名，这样 ab 不需要自定义 Host 头
+server:
+  listen: ["127.0.0.1:18080"]
+  admin:
+    listen: "127.0.0.1:19443"
+
+limits:
+  request_timeout: 10s
+
+applications:
+  - id: bench
+    name: "压测"
+    domains:
+      primary: "127.0.0.1"
+    upstreams:
+      - addr: 127.0.0.1
+        port: 18081

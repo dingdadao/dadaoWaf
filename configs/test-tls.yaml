@@ -1,0 +1,21 @@
+# TLS 测试配置：自签证书
+server:
+  listen: []
+  tls_listen: ["127.0.0.1:18443"]
+  admin:
+    listen: "127.0.0.1:19443"
+
+tls:
+  min_version: "1.2"
+  alpn: ["h2", "http/1.1"]
+  cert: "/tmp/hw.crt"
+  key: "/tmp/hw.key"
+
+applications:
+  - id: test
+    name: "TLS 测试"
+    domains:
+      primary: "nas.home.lan"
+    upstreams:
+      - addr: 127.0.0.1
+        port: 18081

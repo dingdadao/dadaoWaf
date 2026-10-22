@@ -1,0 +1,27 @@
+# 真实 IP 还原测试：把本机当作可信代理
+server:
+  listen: ["127.0.0.1:18090"]
+  admin:
+    listen: "127.0.0.1:19443"
+
+real_ip:
+  enabled: true
+  trusted_proxies:
+    - 127.0.0.1/32
+    - ::1/128
+  header_priority:
+    - CF-Connecting-IP
+    - X-Company-Real-IP
+    - X-Real-IP
+    - X-Forwarded-For
+  max_chain_depth: 3
+  log_both: true
+
+applications:
+  - id: test
+    name: "测试应用"
+    domains:
+      primary: "nas.home.lan"
+    upstreams:
+      - addr: 127.0.0.1
+        port: 18081

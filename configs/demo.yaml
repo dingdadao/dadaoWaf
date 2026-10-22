@@ -1,0 +1,51 @@
+# 完整演示配置：本地可跑，不涉及 80/443 与真实证书
+server:
+  listen: ["127.0.0.1:18080"]
+  admin:
+    listen: "127.0.0.1:19443"
+
+storage:
+  path: "/tmp/homewaf-demo.db"
+  events_retention_days: 7
+
+real_ip:
+  enabled: true
+  trusted_proxies: ["127.0.0.1/32", "::1/128"]
+
+protection:
+  observe_mode:
+    enabled: false
+  block_threshold: 50
+
+acl:
+  private_network:
+    action: normal        # 演示需要，否则 127.0.0.1 会被内网策略直接放行
+  ipv6_prefix_match: 64
+  auto_ban:
+    enabled: true
+    trigger_score: 50
+    durations: ["5m", "30m", "2h", "24h"]
+  rules:
+    - id: allow-monitor
+      cidr: 192.168.1.200/32
+      action: allow
+      note: "监控探针"
+
+applications:
+  - id: nas
+    name: "群晖 NAS"
+    domains:
+      primary: "nas.home.lan"
+      aliases: ["alias.home.lan"]
+    lb:
+      algorithm: round_robin
+    upstreams:
+      - addr: 127.0.0.1
+        port: 18081
+      - addr: 127.0.0.1
+        port: 18082
+    routes:
+      - path: /api
+        upstreams:
+          - addr: 127.0.0.1
+            port: 18081

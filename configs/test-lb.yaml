@@ -1,0 +1,26 @@
+# 负载均衡测试：两个上游轮询
+server:
+  listen: ["127.0.0.1:18080"]
+  admin:
+    listen: "127.0.0.1:19443"
+
+limits:
+  request_timeout: 5s
+
+applications:
+  - id: lb
+    name: "负载均衡测试"
+    domains:
+      primary: "nas.home.lan"
+    lb:
+      algorithm: round_robin
+    health_check:
+      passive:
+        fail_threshold: 2
+        recover_threshold: 1
+        window: 2s
+    upstreams:
+      - addr: 127.0.0.1
+        port: 18081
+      - addr: 127.0.0.1
+        port: 18082

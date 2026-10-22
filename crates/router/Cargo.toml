@@ -1,0 +1,13 @@
+[package]
+name = "homewaf-router"
+description = "HomeWAF 域名与路径匹配"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+homewaf-config = { path = "../config" }
+regex = "1"
+thiserror.workspace = true
+tracing = "0.1"

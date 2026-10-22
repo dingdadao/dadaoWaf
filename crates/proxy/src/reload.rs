@@ -1,0 +1,459 @@
+//! 配置热重载。
+//!
+//! 用**轮询 mtime** 而不是文件系统事件：编辑器保存普遍是"写临时文件 + rename"，
+//! 事件方案会触发多次并需要 debounce；轮询天然去抖，且不依赖平台特性。
+//!
+//! 重载失败的处置原则：**保留旧配置，绝不让服务进入半坏状态**。
+//! 一份写错配置不应该让正在运行的服务失去防护。
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
+
+use arc_swap::ArcSwap;
+use homewaf_acl::{Acl, FeedState};
+use homewaf_config::{Config, RealIpConfig, TlsConfig};
+use homewaf_detect::Engine;
+use homewaf_router::Router;
+use homewaf_store::Store;
+use ipnet::IpNet;
+
+use crate::upstream::UpstreamPool;
+
+/// 基于 SQLite 的订阅状态存储。
+///
+/// 没有它，护栏的"变更幅度"检查每次都按首次导入处理，形同虚设——
+/// 订阅源被投毒后一次性替换全部条目，也拦不住。
+pub struct SqliteFeedState<'a> {
+    store: &'a Store,
+}
+
+impl<'a> SqliteFeedState<'a> {
+    pub fn new(store: &'a Store) -> Self {
+        Self { store }
+    }
+}
+
+impl FeedState for SqliteFeedState<'_> {
+    fn previous(&self, group: &str) -> Vec<IpNet> {
+        match self.store.load_feed_state(group) {
+            Ok(Some(text)) => text
+                .lines()
+                .filter_map(|l| l.trim().parse::<IpNet>().ok())
+                .collect(),
+            Ok(None) => Vec::new(),
+            Err(e) => {
+                tracing::warn!(error = %e, group, "读取订阅状态失败，按首次导入处理");
+                Vec::new()
+            }
+        }
+    }
+
+    fn remember(&self, group: &str, entries: &[IpNet]) {
+        let text: Vec<String> = entries.iter().map(|n| n.to_string()).collect();
+        if let Err(e) = self
+            .store
+            .save_feed_state(group, &text.join("\n"), homewaf_acl::now_unix())
+        {
+            tracing::warn!(error = %e, group, "保存订阅状态失败");
+        }
+    }
+}
+
+/// 运行时可整体替换的状态。
+///
+/// 所有组件放在一个结构里一次性替换，避免出现"新路由配旧 ACL"的中间态。
+pub struct RuntimeState {
+    pub router: Router,
+    pub acl: Acl,
+    pub pool: UpstreamPool,
+    pub real_ip: RealIpConfig,
+    /// 检测引擎
+    pub engine: Engine,
+    /// 检测白名单（误报豁免）
+    pub whitelist: Vec<homewaf_detect::WhitelistRule>,
+    /// 自动封禁参数（热重载时同步给 BanTable）
+    pub auto_ban: homewaf_config::AutoBanConfig,
+    /// IPv6 封禁聚合前缀
+    pub ipv6_prefix: u8,
+    /// 服务器配置（监听地址等）。变更需要重启，不参与热重载
+    pub server: homewaf_config::ServerConfig,
+    /// 仅用于日志展示；TLS 监听器在启动时绑定，证书变更需要重启
+    pub tls: TlsConfig,
+    /// 订阅加载失败的组，用于状态展示
+    pub feed_failures: Vec<(String, String)>,
+}
+
+impl RuntimeState {
+    /// 从配置构建。
+    pub fn build(
+        config: Config,
+        allow_regex: bool,
+        feed_state: &dyn FeedState,
+    ) -> Result<Self, String> {
+        let (feed_rules, feed_failures) =
+            homewaf_acl::load_enabled_groups(&config.ip_groups, feed_state);
+
+        let mut rules = homewaf_acl::rules_from_config(&config.acl);
+        rules.extend(feed_rules);
+        let acl = Acl::build(&config.acl, &rules, homewaf_acl::now_unix());
+
+        // 上游池要在 applications 被移进 Router 之前构建
+        let pool = UpstreamPool::build(&config.applications);
+        let router =
+            Router::build(config.applications, allow_regex).map_err(|e| e.to_string())?;
+
+        let engine = Engine::new(
+            config.protection.observe_mode.enabled,
+            config.protection.block_threshold.unwrap_or(50),
+        );
+
+        Ok(Self {
+            router,
+            acl,
+            pool,
+            real_ip: config.real_ip,
+            engine,
+            whitelist: Vec::new(),
+            auto_ban: config.acl.auto_ban.clone(),
+            ipv6_prefix: config.acl.ipv6_prefix_match,
+            server: config.server,
+            tls: config.tls,
+            feed_failures,
+        })
+    }
+
+    pub fn rule_count(&self) -> usize {
+        self.acl.rule_count()
+    }
+
+    pub fn detection_rule_count(&self) -> usize {
+        self.engine.rule_count()
+    }
+
+    pub fn upstream_count(&self) -> usize {
+        self.pool.total_upstreams()
+    }
+}
+
+/// 共享的运行时状态句柄。
+pub type SharedState = Arc<ArcSwap<RuntimeState>>;
+
+/// 把状态包成可热替换的共享句柄。
+pub fn shared(state: RuntimeState) -> SharedState {
+    Arc::new(ArcSwap::from_pointee(state))
+}
+
+/// 从数据库构建运行时状态。
+///
+/// **这是唯一的配置来源**——进程启动后不再读任何配置文件。
+/// 引导参数（DB 路径、监听地址）来自命令行，其余全部在库里。
+pub fn load_state_from_db(store: &Store, allow_regex: bool) -> Result<RuntimeState, String> {
+    // 应用
+    let applications = store
+        .list_applications()
+        .map_err(|e| format!("读取应用失败：{e}"))?;
+
+    let mut config = Config {
+        applications,
+        ..Config::default()
+    };
+
+    // 全局设置。缺失时用 Config::default() 的值，不报错——
+    // 首次启动的库是空的，应该用默认策略跑起来。
+    macro_rules! load_setting {
+        ($key:literal, $field:expr) => {
+            if let Some(v) = store
+                .get_setting($key)
+                .map_err(|e| format!("读取设置 {} 失败：{e}", $key))?
+            {
+                $field = v;
+            }
+        };
+    }
+    load_setting!("server", config.server);
+    load_setting!("tls", config.tls);
+    load_setting!("protection", config.protection);
+    load_setting!("real_ip", config.real_ip);
+    load_setting!("acl", config.acl);
+    load_setting!("limits", config.limits);
+    load_setting!("ratelimit", config.ratelimit);
+    load_setting!("logging", config.logging);
+    load_setting!("storage", config.storage);
+
+    // ACL 静态规则
+    let rows = store
+        .list_acl_rules()
+        .map_err(|e| format!("读取 ACL 规则失败：{e}"))?;
+    let mut rules = Vec::with_capacity(rows.len());
+    for r in rows {
+        let cidr = r
+            .cidr
+            .parse()
+            .map_err(|e| format!("规则 {} 的网段 `{}` 非法：{e}", r.id, r.cidr))?;
+        let action = match r.action.as_str() {
+            "allow" => homewaf_config::AclRuleAction::Allow,
+            "deny" => homewaf_config::AclRuleAction::Deny,
+            other => return Err(format!("规则 {} 的动作 `{other}` 非法", r.id)),
+        };
+        rules.push(homewaf_config::AclRuleConfig {
+            id: Some(r.id),
+            cidr,
+            action,
+            scope: r.scope,
+            expires_at: r.expires_at,
+            note: r.note,
+        });
+    }
+    config.acl.rules = rules;
+
+    // IP 组订阅
+    let groups = store
+        .list_ip_groups()
+        .map_err(|e| format!("读取订阅失败：{e}"))?;
+    let mut ip_groups = Vec::with_capacity(groups.len());
+    for g in groups {
+        let mut group: homewaf_config::IpGroup = serde_json::from_str(&g.body)
+            .map_err(|e| format!("订阅 {} 的数据损坏：{e}", g.name))?;
+        group.enabled = g.enabled;
+        ip_groups.push(group);
+    }
+    config.ip_groups = ip_groups;
+
+    // 校验：库里存了非法配置时宁可启动失败，也不要带着坏配置跑
+    let report = config.validate();
+    if report.has_errors() {
+        let detail = report
+            .errors
+            .iter()
+            .map(|e| format!("{}: {}", e.path, e.message))
+            .collect::<Vec<_>>()
+            .join("；");
+        return Err(format!("数据库中的配置不合法：{detail}"));
+    }
+
+    let feed_state = SqliteFeedState::new(store);
+    let mut state = RuntimeState::build(config, allow_regex, &feed_state)?;
+
+    // 白名单不在 Config 里，直接从库里读
+    state.whitelist = store
+        .list_whitelist()
+        .map_err(|e| format!("读取白名单失败：{e}"))?
+        .into_iter()
+        .map(|w| homewaf_detect::WhitelistRule {
+            id: w.id,
+            app: w.app,
+            path: w.path,
+            rule_id: w.rule_id,
+            note: w.note,
+        })
+        .collect();
+
+    Ok(state)
+}
+
+/// 从文件加载并构建新状态。校验有错误时返回 Err，调用方应保留旧状态。
+pub fn load_state(
+    path: &Path,
+    allow_regex: bool,
+    feed_state: &dyn FeedState,
+) -> Result<RuntimeState, String> {
+    let config = homewaf_config::load(path).map_err(|e| format!("读取配置失败：{e}"))?;
+
+    let report = config.validate();
+    if report.has_errors() {
+        let detail = report
+            .errors
+            .iter()
+            .map(|e| format!("{}: {}", e.path, e.message))
+            .collect::<Vec<_>>()
+            .join("；");
+        return Err(format!("配置校验失败：{detail}"));
+    }
+
+    RuntimeState::build(config, allow_regex, feed_state)
+}
+
+/// 打开持久化层。失败时降级为纯内存模式，**不阻塞启动**。
+///
+/// WAF 的首要职责是转发流量，不能因为磁盘满了就起不来。
+pub fn open_store(config: &homewaf_config::StorageConfig) -> Option<Arc<Store>> {
+    if config.path.trim().is_empty() {
+        tracing::warn!("storage.path 为空，使用纯内存模式（重启后封禁与事件丢失）");
+        return None;
+    }
+
+    let path = Path::new(&config.path);
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+    }
+
+    match Store::open(path) {
+        Ok(s) => {
+            tracing::info!(path = %config.path, "数据库已打开");
+            Some(Arc::new(s))
+        }
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                path = %config.path,
+                "打开数据库失败，降级为纯内存模式"
+            );
+            None
+        }
+    }
+}
+
+/// 启动后台监视线程。
+///
+/// 重载成功后会同步更新 `bans` 的参数，但**保留已有封禁记录**——
+/// 改配置不应该把攻击者放出来。
+pub fn spawn_watcher(
+    state: SharedState,
+    bans: Arc<homewaf_acl::BanTable>,
+    store: Option<Arc<Store>>,
+    path: PathBuf,
+    allow_regex: bool,
+    interval: Duration,
+) {
+    std::thread::Builder::new()
+        .name("homewaf-config-watcher".to_string())
+        .spawn(move || {
+            let mut last = mtime(&path);
+            loop {
+                std::thread::sleep(interval);
+                let current = mtime(&path);
+                if current == last {
+                    continue;
+                }
+                last = current;
+
+                tracing::info!(path = %path.display(), "检测到配置变化，开始重载");
+
+                let no_state = homewaf_acl::NoFeedState;
+                let sqlite_state;
+                let feed_state: &dyn FeedState = match store.as_deref() {
+                    Some(s) => {
+                        sqlite_state = SqliteFeedState::new(s);
+                        &sqlite_state
+                    }
+                    None => &no_state,
+                };
+
+                match load_state(&path, allow_regex, feed_state) {
+                    Ok(new_state) => {
+                        let rules = new_state.rule_count();
+                        let upstreams = new_state.upstream_count();
+                        let apps = new_state.router.len();
+
+                        // 先同步封禁参数，再替换状态
+                        bans.update_settings(&new_state.auto_ban, new_state.ipv6_prefix);
+
+                        state.store(Arc::new(new_state));
+                        tracing::info!(
+                            apps,
+                            rules,
+                            upstreams,
+                            "配置重载成功，已生效"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            "配置重载失败，继续使用旧配置"
+                        );
+                    }
+                }
+            }
+        })
+        .expect("启动配置监视线程失败");
+}
+
+fn mtime(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).ok().and_then(|m| m.modified().ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mtime_missing_file_is_none() {
+        assert!(mtime(Path::new("/nonexistent/homewaf-test.yaml")).is_none());
+    }
+
+    #[test]
+    fn load_state_rejects_invalid_config() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("homewaf-reload-bad-{}.yaml", std::process::id()));
+        std::fs::write(
+            &path,
+            r#"
+applications:
+  - id: BadId
+    name: bad
+    domains: { primary: "bad domain" }
+    upstreams: [{ addr: 1.2.3.4, port: 80 }]
+"#,
+        )
+        .unwrap();
+
+        let result = load_state(&path, false, &homewaf_acl::NoFeedState);
+        assert!(result.is_err(), "非法配置必须拒绝");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_state_accepts_valid_config() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("homewaf-reload-ok-{}.yaml", std::process::id()));
+        std::fs::write(
+            &path,
+            r#"
+applications:
+  - id: ok
+    name: ok
+    domains: { primary: "ok.home.lan" }
+    upstreams: [{ addr: 192.168.1.5, port: 80 }]
+"#,
+        )
+        .unwrap();
+
+        let state = load_state(&path, false, &homewaf_acl::NoFeedState).expect("合法配置应通过");
+        assert_eq!(state.router.len(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn feed_state_roundtrip_through_sqlite() {
+        // 验证"上次条目"能真正跨进程持久化——这是变更幅度护栏的前提
+        let store = Store::open_memory().unwrap();
+        let state = SqliteFeedState::new(&store);
+
+        assert!(state.previous("g").is_empty(), "首次应为空");
+
+        let entries: Vec<IpNet> = vec![
+            "1.2.3.0/24".parse().unwrap(),
+            "10.0.0.0/8".parse().unwrap(),
+        ];
+        state.remember("g", &entries);
+
+        let loaded = state.previous("g");
+        assert_eq!(loaded, entries, "读回应与写入一致");
+    }
+
+    #[test]
+    fn feed_state_isolated_between_groups() {
+        let store = Store::open_memory().unwrap();
+        let state = SqliteFeedState::new(&store);
+
+        state.remember("a", &["1.1.1.0/24".parse().unwrap()]);
+        state.remember("b", &["2.2.2.0/24".parse().unwrap()]);
+
+        assert_eq!(state.previous("a").len(), 1);
+        assert_eq!(state.previous("a")[0], "1.1.1.0/24".parse::<IpNet>().unwrap());
+        assert_eq!(state.previous("b")[0], "2.2.2.0/24".parse::<IpNet>().unwrap());
+    }
+}

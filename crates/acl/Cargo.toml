@@ -1,0 +1,16 @@
+[package]
+name = "homewaf-acl"
+description = "HomeWAF IP 访问控制（前缀树）"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+homewaf-config = { path = "../config" }
+ipnet.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing = "0.1"
+# 订阅拉取。默认特性即 rustls + gzip，纯 Rust 不需要 C 工具链
+ureq = "3"
