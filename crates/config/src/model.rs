@@ -166,7 +166,8 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             workers: 0,
-            listen: vec!["[::]:80".to_string(), "0.0.0.0:80".to_string()],
+            // 只列 0.0.0.0：在 Linux 上 [::]:80 默认是双栈，与 0.0.0.0:80 同时监听会冲突
+            listen: vec!["0.0.0.0:80".to_string()],
             tls_listen: Vec::new(),
             admin: AdminConfig::default(),
         }
@@ -1272,10 +1273,9 @@ fn split_host_port(authority: &str) -> Result<(String, Option<u16>), String> {
         let host = rest[..end].to_string();
         let after = &rest[end + 1..];
         let port = match after.strip_prefix(':') {
-            Some(p) if !p.is_empty() => Some(
-                p.parse()
-                    .map_err(|_| format!("端口 `{p}` 不是合法数字"))?,
-            ),
+            Some(p) if !p.is_empty() => {
+                Some(p.parse().map_err(|_| format!("端口 `{p}` 不是合法数字"))?)
+            }
             Some(_) => return Err("`:` 后面缺少端口号".into()),
             None => None,
         };
@@ -1285,9 +1285,7 @@ fn split_host_port(authority: &str) -> Result<(String, Option<u16>), String> {
     // 普通 host:port —— 只在最后一段是纯数字时才当端口
     match authority.rsplit_once(':') {
         Some((h, p)) if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => {
-            let port = p
-                .parse()
-                .map_err(|_| format!("端口 `{p}` 超出范围"))?;
+            let port = p.parse().map_err(|_| format!("端口 `{p}` 超出范围"))?;
             Ok((h.to_string(), Some(port)))
         }
         // 冒号后面不是数字，说明是裸 IPv6（如 `::1`），整串当 host

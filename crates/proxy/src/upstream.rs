@@ -24,6 +24,10 @@ pub struct Selection {
     pub addr: String,
     /// 是否 TLS 回源
     pub tls: bool,
+    /// TLS 回源的 SNI（IP 上游直接用 IP 字符串）
+    pub sni: String,
+    /// TLS 回源是否校验证书
+    pub verify: bool,
     /// 在池内的下标，用于回写健康状态
     pub slot: usize,
     /// 是否来自备份池
@@ -35,6 +39,10 @@ pub struct Selection {
 struct Slot {
     addr: String,
     tls: bool,
+    /// TLS 回源的 SNI（IP 上游直接用 IP 字符串，否则握手会失败）
+    sni: String,
+    /// TLS 回源是否校验证书
+    verify: bool,
     weight: u32,
     backup: bool,
     state: AtomicU8,
@@ -57,12 +65,25 @@ impl Slot {
             }
         };
 
+        let tls = matches!(
+            target.scheme,
+            homewaf_config::Scheme::Https | homewaf_config::Scheme::Wss
+        );
+        // SNI 不能留空：rustls 解析空域名会直接握手失败；IP 上游用 IP 作 ServerName
+        let sni = u
+            .tls
+            .as_ref()
+            .and_then(|t| t.sni.clone())
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| target.host.clone());
+        // 未显式配置时沿用默认（校验），内网自签上游需要显式关闭
+        let verify = u.tls.as_ref().map(|t| t.verify).unwrap_or(true);
+
         Some(Self {
             addr: format!("{}:{}", target.host, target.port),
-            tls: matches!(
-                target.scheme,
-                homewaf_config::Scheme::Https | homewaf_config::Scheme::Wss
-            ),
+            tls,
+            sni: if tls { sni } else { String::new() },
+            verify,
             weight: u.weight.max(1) as u32,
             backup: u.backup,
             state: AtomicU8::new(HEALTHY),
@@ -156,11 +177,7 @@ impl UpstreamSet {
     }
 
     /// 在候选集中按算法挑一个。
-    fn pick(
-        &self,
-        candidates: &[usize],
-        client_ip: IpAddr,
-    ) -> Option<usize> {
+    fn pick(&self, candidates: &[usize], client_ip: IpAddr) -> Option<usize> {
         if candidates.is_empty() {
             return None;
         }
@@ -213,13 +230,19 @@ impl UpstreamSet {
             .copied()
             .filter(|&i| !self.slots[i].backup)
             .collect();
-        let pool = if primary.is_empty() { &available } else { &primary };
+        let pool = if primary.is_empty() {
+            &available
+        } else {
+            &primary
+        };
 
         let idx = self.pick(pool, client_ip)?;
         let slot = &self.slots[idx];
         Some(Selection {
             addr: slot.addr.clone(),
             tls: slot.tls,
+            sni: slot.sni.clone(),
+            verify: slot.verify,
             slot: idx,
             backup: slot.backup,
         })
@@ -249,11 +272,7 @@ impl UpstreamPool {
         let apps = apps
             .iter()
             .map(|app| {
-                let health = app
-                    .health_check
-                    .passive
-                    .clone()
-                    .unwrap_or_default();
+                let health = app.health_check.passive.clone().unwrap_or_default();
                 let default = UpstreamSet::new(&app.upstreams, app.lb.algorithm);
                 let routes = app
                     .routes
@@ -296,7 +315,13 @@ impl UpstreamPool {
     }
 
     /// 标记某次请求失败（连接失败或 5xx）。
-    pub fn mark_failure(&self, app_index: usize, route_index: Option<usize>, slot: usize, now_ms: u64) {
+    pub fn mark_failure(
+        &self,
+        app_index: usize,
+        route_index: Option<usize>,
+        slot: usize,
+        now_ms: u64,
+    ) {
         if let Some(s) = self.set_of(app_index, route_index) {
             if let Some(sl) = s.slots.get(slot) {
                 sl.mark_failure(now_ms, &self.apps[app_index].health);
@@ -391,6 +416,7 @@ impl UpstreamPool {
                     slot,
                     addr: s.addr.clone(),
                     tls: s.tls,
+                    verify: s.verify,
                     path: hc.path.clone(),
                     timeout_ms: hc.timeout.0.as_millis() as u64,
                     expect_status: hc.expect_status.clone(),
@@ -417,8 +443,7 @@ impl UpstreamPool {
             s.failures.store(0, Ordering::Relaxed);
         } else {
             s.state.store(DOWN, Ordering::Relaxed);
-            s.down_since_ms
-                .store(now_ms(), Ordering::Relaxed);
+            s.down_since_ms.store(now_ms(), Ordering::Relaxed);
         }
     }
 
@@ -467,6 +492,8 @@ pub struct ProbeTarget {
     pub slot: usize,
     pub addr: String,
     pub tls: bool,
+    /// TLS 探测是否校验证书（自签上游必须关闭，否则永远判为不健康）
+    pub verify: bool,
     pub path: String,
     pub timeout_ms: u64,
     pub expect_status: Vec<u16>,
@@ -484,12 +511,19 @@ pub fn probe(t: &ProbeTarget) -> bool {
     };
     let url = format!("{scheme}://{}{path}", t.addr);
 
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_global(Some(std::time::Duration::from_millis(
-            t.timeout_ms.max(100),
-        )))
-        .build()
-        .into();
+    let builder = ureq::Agent::config_builder().timeout_global(Some(
+        std::time::Duration::from_millis(t.timeout_ms.max(100)),
+    ));
+    let builder = if t.tls && !t.verify {
+        builder.tls_config(
+            ureq::tls::TlsConfig::builder()
+                .disable_verification(true)
+                .build(),
+        )
+    } else {
+        builder
+    };
+    let agent: ureq::Agent = builder.build().into();
 
     match agent.get(&url).call() {
         Ok(resp) => {
@@ -537,6 +571,34 @@ mod tests {
             max_conns: 128,
             tls: None,
         }
+    }
+
+    fn upstream_with_tls(addr: &str, port: u16, verify: bool) -> Upstream {
+        let mut u = upstream(addr, port);
+        u.tls = Some(homewaf_config::UpstreamTlsConfig {
+            verify,
+            ..Default::default()
+        });
+        u
+    }
+
+    #[test]
+    fn https_upstream_gets_sni_and_verify_flag() {
+        // IP 上游：SNI 用 IP 字符串，否则 rustls 解析空域名会握手失败
+        let ip = Slot::new(&upstream_with_tls("https://10.0.0.14:9443", 9443, false)).unwrap();
+        assert!(ip.tls);
+        assert_eq!(ip.sni, "10.0.0.14");
+        assert!(!ip.verify);
+
+        // 域名上游：默认用主机名做 SNI，并保持证书校验
+        let host = Slot::new(&upstream_with_tls("https://nas.home.lan", 443, true)).unwrap();
+        assert_eq!(host.sni, "nas.home.lan");
+        assert!(host.verify);
+
+        // 明文上游不带 SNI
+        let plain = Slot::new(&upstream("http://10.0.0.4:5666", 5666)).unwrap();
+        assert!(!plain.tls);
+        assert!(plain.sni.is_empty());
     }
 
     fn app_with(upstreams: Vec<Upstream>, algorithm: LbAlgorithm) -> Application {
@@ -861,7 +923,10 @@ mod tests {
         };
         let pool = UpstreamPool::build(&[app_with(vec![a, b], LbAlgorithm::RoundRobin)]);
         let snap = pool.health_snapshot();
-        assert!(snap.iter().any(|(addr, _)| addr == "10.0.0.1:80"), "实际: {snap:?}");
+        assert!(
+            snap.iter().any(|(addr, _)| addr == "10.0.0.1:80"),
+            "实际: {snap:?}"
+        );
         assert!(
             snap.iter().any(|(addr, _)| addr == "nas.lan:443"),
             "https 默认 443，实际: {snap:?}"

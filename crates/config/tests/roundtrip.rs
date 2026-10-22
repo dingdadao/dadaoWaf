@@ -15,7 +15,10 @@ fn example_config_loads() {
     assert!(warnings.is_empty(), "示例配置不应有警告: {warnings:?}");
     assert_eq!(config.applications.len(), 2);
     assert_eq!(config.applications[0].id, "nas");
-    assert_eq!(config.applications[1].domains.aliases, vec!["photo.home.lan"]);
+    assert_eq!(
+        config.applications[1].domains.aliases,
+        vec!["photo.home.lan"]
+    );
 }
 
 #[test]
@@ -24,7 +27,10 @@ fn full_config_roundtrip_is_stable() {
     let first = serde_yaml::to_string(&config).expect("序列化失败");
     let reparsed = from_str(&first).expect("往返后解析失败");
     let second = serde_yaml::to_string(&reparsed).expect("二次序列化失败");
-    assert_eq!(first, second, "序列化往返不稳定，说明某个字段的 serde 属性有问题");
+    assert_eq!(
+        first, second,
+        "序列化往返不稳定，说明某个字段的 serde 属性有问题"
+    );
 }
 
 #[test]
@@ -77,7 +83,9 @@ applications:
 
     // 服务器
     assert_eq!(config.server.workers, 0);
-    assert_eq!(config.server.listen.len(), 2);
+    // 只监听 IPv4：Linux 上 [::]:80 是双栈，与 0.0.0.0:80 同时监听会冲突
+    assert_eq!(config.server.listen.len(), 1);
+    assert_eq!(config.server.listen[0], "0.0.0.0:80");
     assert_eq!(config.server.admin.listen, "127.0.0.1:9443");
 
     // TLS
