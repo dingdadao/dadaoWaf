@@ -508,8 +508,12 @@ mod tests {
         let svc = ChallengeService::new();
         let issued = svc.issue(&cfg(), "nas", Some(ip("192.168.1.9")), "/", 1_000);
         let mut tampered = issued.token.clone();
-        let last = tampered.pop().unwrap();
-        tampered.push(if last == 'A' { 'B' } else { 'A' });
+        // 改 payload 中段而不是末位：base64url 末位含填充位，
+        // 换一个末位字符可能解码出相同字节，签名仍然有效。
+        let pos = tampered.len() / 2;
+        let ch = tampered.as_bytes()[pos] as char;
+        let repl = if ch == 'A' { 'B' } else { 'A' };
+        tampered.replace_range(pos..pos + 1, &repl.to_string());
         assert!(matches!(
             svc.verify(&tampered, "0", "nas", Some(ip("192.168.1.9")), 1_001),
             Err(ChallengeError::BadSignature) | Err(ChallengeError::Malformed)
