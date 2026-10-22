@@ -276,6 +276,40 @@
   3 条策略导入 2 条（`ja4` 条件 1 条跳过），9 个有数据的 IP 组展开成功（含 1000+ 条内置情报组），
   4 张证书均为托管证书跳过；预览不落库、正式同步后 `/api/apps` 与 `custom_rules` 均可见，热重载返回 `apps=9`。
 
+### 00:30 — 生产部署（10.0.0.31）与压测
+
+- 构建：Zig 0.14.1 + `cargo zigbuild --release --target x86_64-unknown-linux-gnu`，产物部署到
+  `/opt/homewaf/bin/homewaf`，systemd 单元 `homewaf`（`--db /opt/homewaf/data/homewaf.db
+  --listen 0.0.0.0:80 --tls-listen 0.0.0.0:443`，`Restart=always`）。替换顺序必须
+  「传 `homewaf.new` → `stop` + `pkill -9 -x homewaf` → `mv` → `start`」，否则 `Text file busy`。
+- 上线过程中修掉三个真实缺陷：
+  1. **HTTPS 上游一律 502**：`HttpPeer::new(addr, tls, String::new())` 传了空 SNI，rustls 抛
+     `Failed to parse domain:`。改为「显式 sni → 否则主机名/IP」，并按配置设置
+     `verify_cert` / `verify_hostname`（内网自签上游关闭）。
+  2. **自定义白名单只跳过封禁、仍会被检测 403**：白名单命中后改为整段跳过应用层检测（含 body 检测），
+     与雷池「白名单直接放行」语义一致；黑名单仍是直接 403 + 事件。
+  3. **80 端口反复 `is in use`**：Linux 上 `[::]:80` 是双栈，与 `0.0.0.0:80` 同时监听冲突。
+     默认 `server.listen` 改为只 `0.0.0.0:80`，单元文件也只传 IPv4。
+- 同步结果（对 `https://10.0.0.14:9443`）：应用 8/8（`fn` `pve` `waf` `cretd` `cf` `home` `ddoh` 启用，
+  `qh` 停用）、规则 2/3（`ja4` 条件跳过）、IP 组 9 个、证书 4 张托管跳过。
+- 压测（macOS 侧 `ab`，客户端 10.0.0.29，经 80 端口带 `Host` 头）：
+
+  | 场景 | 请求数 | 并发 | 吞吐 | 失败 |
+  |------|--------|------|------|------|
+  | 四应用并发（waf/fn/cretd/cf） | 4×2000 | 4×40 | 1250–1342 rps/应用 | 1 个 403 来自 fnOS 自身 |
+  | `waf.niao.fun` + `pve.niao.fun` 持续 | 2×20000 | 2×100 | 2615 / 720 rps | 0 |
+  | `fn.niao.fun`（对比直连上游 7276 rps） | 2000 | 40 | 5047 rps | 4 个 403 来自 fnOS 自身 |
+
+  压测期间进程无错误日志、无重启，RSS 48 MB → 58 MB（生产机总内存 512 MB），`/api/stats` 记录请求
+  5.3 万次、状态分布与并发一致。
+- 功能回归：SQLi / 路径穿越 / XSS 均 403 并记录事件，自动封禁按 300s → 1800s → 7200s 递增；
+  启用雷池同步来的「局域网」白名单后同样请求直接放行（符合白名单优先语义）；`/api/events` 多维筛选、
+  CSV 导出、`/api/stats`、`/api/attack/overview`、`/api/geoip`、`/api/system/info`、`/api/custom-rules/export`
+  与首页（`Cache-Control: no-store`）全部 200。
+- 已知限制：前端 443 无证书（雷池证书均为 ACME/托管，私钥不可导出），握手会失败，需在控制台上传
+  证书后启用；`home.niao.fun` 经 WAF 返回 400 是 Home Assistant 的 `trusted_proxies` 未包含
+  10.0.0.31，非本项目缺陷。
+
 ---
 
 ## 下一步开发任务
@@ -292,6 +326,7 @@
 | #17 | 网页防篡改 | 应用级基线（SHA-256）、静态请求实时拦截与事件记录、手动扫描修改/新增/删除、控制台页签 | ✅ |
 | #18 | 证书管理 | 证书库与 CRUD、SNI 多证书、应用绑定、默认证书、雷池兼容远程部署 API（`X-SLCE-API-Token`） | ✅ |
 | #19 | 雷池配置同步 | `leichi.rs` 拉取站点/策略/IP 组/证书并映射为本项目应用与自定义规则，控制台「雷池同步」页签，支持预览与热重载 | ✅ |
+| #20 | 生产部署与压测 | 交叉编译部署到 10.0.0.31，修复上游 SNI / 白名单语义 / 双栈监听三个缺陷，压测 4 万+ 请求零错误 | ✅ |
 
 ### 远期遗留（差距分析中未排期）
 
