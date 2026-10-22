@@ -134,24 +134,39 @@ ip_groups:
       max_response_bytes: 10MB
     on_failure: keep-last
 
-# 规则包订阅
+# 规则包订阅：Ed25519 验签 + 影子期 + 失败回退缓存
+# 自建规则包：homewaf rulepack keygen / sign / verify
 rule_feeds:
   - name: official-core
     url: "https://rules.example.com/core-v1.hwrule"
-    channel: stable
+    enabled: true
+    channel: stable                 # stable / beta / pinned
     auto_update: true
-    check_interval: 24h
-    update_window: "03:00-05:00"
+    check_interval: 24h             # 最小 60s
+    update_window: "03:00-05:00"    # UTC；留空不限，支持跨午夜
+    timeout: 20s
+    max_size: 4MB
+    headers: {}                     # 可加 Authorization 等请求头
     require_signature: true
-    public_key: "ed25519:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="  # 替换为官方公钥
-    shadow_period: 6h
+    public_key: "ed25519:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="  # 替换为签名者公钥
+    shadow_period: 6h               # 新规则先只记录不拦截；留空关闭
     rollback_on_error: true
+    # pinned_version: "2026.10.1"   # channel 为 pinned 时必填
 
+# CC 防护：默认关闭，避免影响内网下载/同步；开启后按 1 秒滑动窗口统计
 ratelimit:
+  enabled: false
   global_qps: 2000
   per_ip_qps: 100
   per_ip_conn: 64
   per_url_qps: 200
+  action: block               # block / challenge / log
+
+# 人机验证：HMAC token + JS 工作量证明
+challenge:
+  enabled: true
+  difficulty: 4               # 前导零十六进制位数，每 +1 计算量约 ×16
+  ttl: 30m                    # 通过后免验证时长
 
 logging:
   level: info
@@ -186,11 +201,16 @@ applications:
         policy:
           preset: strict
           require_auth: totp
+          require_challenge: true   # 管理后台一律先过人机验证
           allow_cidr:
             - 192.168.1.0/24
             - fd00::/8
           observe_mode:
             enabled: false
+          ratelimit:                # 路由级覆盖：整份替换全局限流配置
+            enabled: true
+            per_ip_qps: 20
+            action: challenge
     policy:
       preset: balanced
 

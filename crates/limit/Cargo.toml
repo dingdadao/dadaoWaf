@@ -1,0 +1,9 @@
+[package]
+name = "homewaf-limit"
+description = "HomeWAF CC 防护：滑动窗口限流与并发连接计数"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]

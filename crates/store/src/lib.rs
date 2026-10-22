@@ -51,6 +51,10 @@ pub enum EventKind {
     Ban,
     /// ACL 拒绝
     Acl,
+    /// CC 防护（限流 / 并发超限）
+    RateLimit,
+    /// 人机验证
+    Challenge,
 }
 
 impl EventKind {
@@ -59,6 +63,8 @@ impl EventKind {
             EventKind::Detect => "detect",
             EventKind::Ban => "ban",
             EventKind::Acl => "acl",
+            EventKind::RateLimit => "ratelimit",
+            EventKind::Challenge => "challenge",
         }
     }
 
@@ -66,6 +72,8 @@ impl EventKind {
         match s {
             "ban" => EventKind::Ban,
             "acl" => EventKind::Acl,
+            "ratelimit" => EventKind::RateLimit,
+            "challenge" => EventKind::Challenge,
             _ => EventKind::Detect,
         }
     }
@@ -134,14 +142,60 @@ impl Event {
 pub struct EventFilter {
     pub limit: usize,
     pub offset: usize,
-    /// detect / ban / acl
+    /// detect / ban / acl / ratelimit
     pub kind: Option<String>,
     /// 精确匹配来源 IP
     pub ip: Option<String>,
-    /// block / log / observe
+    /// block / log / observe / ban
     pub action: Option<String>,
     /// 起始时间（Unix 秒，含）
     pub since: Option<i64>,
+}
+
+/// 一条分钟级流量聚合。
+#[derive(Debug, Clone)]
+pub struct TrafficBucketRow {
+    pub minute: i64,
+    pub app: String,
+    pub requests: u64,
+    pub pv: u64,
+    pub blocked: u64,
+    pub status_4xx: u64,
+    pub status_5xx: u64,
+    pub unique_ips: u64,
+    pub unique_visitors: u64,
+    /// IP 的 u128 形式，用于日报按天去重。
+    pub ips: Vec<u128>,
+    /// (IP, UA) 哈希，用于日报独立访客。
+    pub visitors: Vec<u64>,
+}
+
+/// 一段时间的流量汇总。
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct TrafficTotals {
+    pub requests: u64,
+    pub pv: u64,
+    pub blocked: u64,
+    pub status_4xx: u64,
+    pub status_5xx: u64,
+    pub unique_ips: u64,
+    pub unique_visitors: u64,
+}
+
+/// 小时/天级趋势点。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TrafficPoint {
+    pub ts: i64,
+    pub requests: u64,
+    pub blocked: u64,
+}
+
+/// 报表列表中的一天。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TrafficDay {
+    pub day: i64,
+    pub requests: u64,
+    pub blocked: u64,
 }
 
 /// SQLite 存储。
@@ -262,6 +316,42 @@ impl Store {
                 note       TEXT,
                 created_at INTEGER NOT NULL
             );
+
+            -- 规则包缓存：保存已验签的原始载荷。
+            -- 拉取失败时回滚到这份数据，避免一次网络故障让防护退回内置规则。
+            CREATE TABLE IF NOT EXISTS rule_feed_packages (
+                feed         TEXT PRIMARY KEY,
+                payload      TEXT NOT NULL,
+                version      TEXT,
+                fetched_at   INTEGER NOT NULL,
+                shadow_until INTEGER NOT NULL DEFAULT 0,
+                signature_ok INTEGER NOT NULL DEFAULT 0,
+                rule_count   INTEGER NOT NULL DEFAULT 0
+            );
+
+            -- 流量分钟聚合。控制台的 24 小时视图读内存，历史报表读这里。
+            CREATE TABLE IF NOT EXISTS traffic_minutes (
+                minute          INTEGER NOT NULL,
+                app             TEXT NOT NULL,
+                requests        INTEGER NOT NULL,
+                pv              INTEGER NOT NULL,
+                blocked         INTEGER NOT NULL,
+                status_4xx      INTEGER NOT NULL,
+                status_5xx      INTEGER NOT NULL,
+                unique_ips      INTEGER NOT NULL,
+                unique_visitors INTEGER NOT NULL,
+                PRIMARY KEY (minute, app)
+            );
+            CREATE INDEX IF NOT EXISTS idx_traffic_minute ON traffic_minutes(minute);
+
+            -- 每天的去重集合。分钟独立 IP 相加会重复，日报/周报必须按天去重。
+            CREATE TABLE IF NOT EXISTS traffic_unique (
+                day   INTEGER NOT NULL,
+                app   TEXT NOT NULL,
+                kind  TEXT NOT NULL,
+                hash  TEXT NOT NULL,
+                PRIMARY KEY (day, app, kind, hash)
+            ) WITHOUT ROWID;
             "#,
         )?;
         Ok(())
@@ -444,6 +534,55 @@ impl Store {
         })
     }
 
+    /// 按小时聚合事件量，返回 `(小时起点, 总数, 拦截数)`，只含 `since` 之后。
+    pub fn hourly_event_counts(&self, since: i64) -> Result<Vec<(i64, usize, usize)>, StoreError> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT (ts / 3600) * 3600 AS bucket,
+                       COUNT(*),
+                       SUM(CASE WHEN action = 'block' THEN 1 ELSE 0 END)
+                FROM events
+                WHERE ts >= ?1
+                GROUP BY bucket
+                ORDER BY bucket
+                "#,
+            )?;
+            let rows = stmt.query_map(params![since], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)? as usize,
+                    r.get::<_, i64>(2)? as usize,
+                ))
+            })?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        })
+    }
+
+    /// 取一段时间内（检测 + 限流）事件命中的规则串，用于分类统计。
+    pub fn event_rule_strings(&self, since: i64, limit: usize) -> Result<Vec<String>, StoreError> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT rules FROM events
+                WHERE ts >= ?1 AND kind IN ('detect', 'ratelimit') AND rules <> ''
+                ORDER BY ts DESC
+                LIMIT ?2
+                "#,
+            )?;
+            let rows = stmt.query_map(params![since, limit as i64], |r| r.get(0))?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        })
+    }
+
     /// 事件总数。
     pub fn event_count(&self) -> Result<usize, StoreError> {
         let conn = self.conn.lock().map_err(|_| StoreError::Poisoned)?;
@@ -455,6 +594,214 @@ impl Store {
     pub fn prune_events(&self, before: i64) -> Result<usize, StoreError> {
         let conn = self.conn.lock().map_err(|_| StoreError::Poisoned)?;
         let n = conn.execute("DELETE FROM events WHERE ts < ?1", params![before])?;
+        Ok(n)
+    }
+
+    // ============================================================
+    // 流量统计
+    // ============================================================
+
+    /// 写入一批分钟聚合与去重集合。重复写入同一分钟会覆盖计数，
+    /// 去重集合用 `INSERT OR IGNORE`，因此重放安全。
+    pub fn save_traffic(&self, rows: &[TrafficBucketRow]) -> Result<(), StoreError> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock().map_err(|_| StoreError::Poisoned)?;
+        let tx = conn.transaction()?;
+        for row in rows {
+            tx.execute(
+                r#"
+                INSERT INTO traffic_minutes
+                    (minute, app, requests, pv, blocked, status_4xx, status_5xx,
+                     unique_ips, unique_visitors)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                ON CONFLICT(minute, app) DO UPDATE SET
+                    requests        = excluded.requests,
+                    pv              = excluded.pv,
+                    blocked         = excluded.blocked,
+                    status_4xx      = excluded.status_4xx,
+                    status_5xx      = excluded.status_5xx,
+                    unique_ips      = excluded.unique_ips,
+                    unique_visitors = excluded.unique_visitors
+                "#,
+                params![
+                    row.minute,
+                    row.app,
+                    row.requests as i64,
+                    row.pv as i64,
+                    row.blocked as i64,
+                    row.status_4xx as i64,
+                    row.status_5xx as i64,
+                    row.unique_ips as i64,
+                    row.unique_visitors as i64,
+                ],
+            )?;
+
+            let day = row.minute - row.minute.rem_euclid(86_400);
+            for ip in &row.ips {
+                tx.execute(
+                    "INSERT OR IGNORE INTO traffic_unique (day, app, kind, hash)
+                     VALUES (?1, ?2, 'ip', ?3)",
+                    params![day, row.app, format!("{ip:032x}")],
+                )?;
+            }
+            for v in &row.visitors {
+                tx.execute(
+                    "INSERT OR IGNORE INTO traffic_unique (day, app, kind, hash)
+                     VALUES (?1, ?2, 'visitor', ?3)",
+                    params![day, row.app, format!("{v:016x}")],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// 汇总一段时间。独立 IP / 访客按天去重，跨天范围也能得到正确值。
+    pub fn traffic_totals(
+        &self,
+        since: i64,
+        until: i64,
+        app: Option<&str>,
+    ) -> Result<TrafficTotals, StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::Poisoned)?;
+        let (requests, pv, blocked, status_4xx, status_5xx): (i64, i64, i64, i64, i64) = conn
+            .query_row(
+                r#"
+                SELECT COALESCE(SUM(requests), 0), COALESCE(SUM(pv), 0),
+                       COALESCE(SUM(blocked), 0), COALESCE(SUM(status_4xx), 0),
+                       COALESCE(SUM(status_5xx), 0)
+                FROM traffic_minutes
+                WHERE minute >= ?1 AND minute < ?2 AND (?3 IS NULL OR app = ?3)
+                "#,
+                params![since, until, app],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )?;
+
+        let day_start = since - since.rem_euclid(86_400);
+        let distinct = |kind: &str| -> Result<u64, StoreError> {
+            conn.query_row(
+                r#"
+                SELECT COUNT(DISTINCT hash) FROM traffic_unique
+                WHERE day >= ?1 AND day <= ?2 AND kind = ?3
+                  AND (?4 IS NULL OR app = ?4)
+                "#,
+                params![day_start, until, kind, app],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|n| n as u64)
+            .map_err(StoreError::from)
+        };
+
+        Ok(TrafficTotals {
+            requests: requests as u64,
+            pv: pv as u64,
+            blocked: blocked as u64,
+            status_4xx: status_4xx as u64,
+            status_5xx: status_5xx as u64,
+            unique_ips: distinct("ip")?,
+            unique_visitors: distinct("visitor")?,
+        })
+    }
+
+    /// 按固定宽度聚合趋势，供日报/大屏历史曲线使用。
+    pub fn traffic_series(
+        &self,
+        since: i64,
+        until: i64,
+        app: Option<&str>,
+        group_secs: i64,
+    ) -> Result<Vec<TrafficPoint>, StoreError> {
+        let group = group_secs.max(60);
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT (minute / ?4) * ?4 AS bucket,
+                       COALESCE(SUM(requests), 0),
+                       COALESCE(SUM(blocked), 0)
+                FROM traffic_minutes
+                WHERE minute >= ?1 AND minute < ?2 AND (?3 IS NULL OR app = ?3)
+                GROUP BY bucket ORDER BY bucket
+                "#,
+            )?;
+            let rows = stmt.query_map(params![since, until, app, group], |r| {
+                Ok(TrafficPoint {
+                    ts: r.get(0)?,
+                    requests: r.get::<_, i64>(1)? as u64,
+                    blocked: r.get::<_, i64>(2)? as u64,
+                })
+            })?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        })
+    }
+
+    /// 有流量数据的日期列表（按天聚合，倒序）。
+    pub fn traffic_days(&self, since: i64, limit: usize) -> Result<Vec<TrafficDay>, StoreError> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT (minute / 86400) * 86400 AS day,
+                       COALESCE(SUM(requests), 0),
+                       COALESCE(SUM(blocked), 0)
+                FROM traffic_minutes
+                WHERE minute >= ?1
+                GROUP BY day ORDER BY day DESC LIMIT ?2
+                "#,
+            )?;
+            let rows = stmt.query_map(params![since, limit as i64], |r| {
+                Ok(TrafficDay {
+                    day: r.get(0)?,
+                    requests: r.get::<_, i64>(1)? as u64,
+                    blocked: r.get::<_, i64>(2)? as u64,
+                })
+            })?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        })
+    }
+
+    /// 每天每类事件数，供报表列表与安全态势历史使用。
+    pub fn daily_event_counts(
+        &self,
+        since: i64,
+    ) -> Result<Vec<(i64, String, usize)>, StoreError> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT (ts / 86400) * 86400 AS day, kind, COUNT(*)
+                FROM events WHERE ts >= ?1
+                GROUP BY day, kind ORDER BY day DESC
+                "#,
+            )?;
+            let rows = stmt.query_map(params![since], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)? as usize,
+                ))
+            })?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        })
+    }
+
+    /// 删除早于 `before` 的流量聚合与去重集合。
+    pub fn prune_traffic(&self, before: i64) -> Result<usize, StoreError> {
+        let day = before - before.rem_euclid(86_400);
+        let conn = self.conn.lock().map_err(|_| StoreError::Poisoned)?;
+        let n = conn.execute("DELETE FROM traffic_minutes WHERE minute < ?1", params![before])?;
+        conn.execute("DELETE FROM traffic_unique WHERE day < ?1", params![day])?;
         Ok(n)
     }
 
@@ -487,6 +834,80 @@ impl Store {
             None => Ok(None),
         }
     }
+
+    // ============================================================
+    // 规则包缓存
+    // ============================================================
+
+    pub fn save_rule_feed_package(&self, pkg: &RuleFeedPackageRow) -> Result<(), StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::Poisoned)?;
+        conn.execute(
+            r#"
+            INSERT INTO rule_feed_packages
+                (feed, payload, version, fetched_at, shadow_until, signature_ok, rule_count)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            ON CONFLICT(feed) DO UPDATE SET
+                payload = excluded.payload,
+                version = excluded.version,
+                fetched_at = excluded.fetched_at,
+                shadow_until = excluded.shadow_until,
+                signature_ok = excluded.signature_ok,
+                rule_count = excluded.rule_count
+            "#,
+            params![
+                pkg.feed,
+                pkg.payload,
+                pkg.version,
+                pkg.fetched_at,
+                pkg.shadow_until,
+                pkg.signature_ok as i64,
+                pkg.rule_count as i64
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_rule_feed_package(
+        &self,
+        feed: &str,
+    ) -> Result<Option<RuleFeedPackageRow>, StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::Poisoned)?;
+        let mut stmt = conn.prepare(
+            "SELECT feed, payload, version, fetched_at, shadow_until, signature_ok, rule_count \
+             FROM rule_feed_packages WHERE feed = ?1",
+        )?;
+        let mut rows = stmt.query(params![feed])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(RuleFeedPackageRow {
+                feed: row.get(0)?,
+                payload: row.get(1)?,
+                version: row.get(2)?,
+                fetched_at: row.get(3)?,
+                shadow_until: row.get(4)?,
+                signature_ok: row.get::<_, i64>(5)? != 0,
+                rule_count: row.get::<_, i64>(6)? as usize,
+            })),
+            None => Ok(None),
+        }
+    }
+
+    pub fn delete_rule_feed_package(&self, feed: &str) -> Result<bool, StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::Poisoned)?;
+        let n = conn.execute("DELETE FROM rule_feed_packages WHERE feed = ?1", params![feed])?;
+        Ok(n > 0)
+    }
+}
+
+/// 缓存的规则包。`payload` 是验签通过的原始规则文档，不含签名头。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleFeedPackageRow {
+    pub feed: String,
+    pub payload: String,
+    pub version: Option<String>,
+    pub fetched_at: i64,
+    pub shadow_until: i64,
+    pub signature_ok: bool,
+    pub rule_count: usize,
 }
 
 #[cfg(test)]
@@ -973,5 +1394,192 @@ mod tests {
 
         let result = s.list_applications::<DemoApp>();
         assert!(result.is_err(), "损坏数据应报错而不是 panic");
+    }
+
+    #[test]
+    fn hourly_counts_group_by_bucket() {
+        let s = store();
+        let hour = 3_600;
+        for (ts, action) in [
+            (NOW, "block"),
+            (NOW + 10, "log"),
+            (NOW + hour, "block"),
+        ] {
+            s.insert_event(
+                &Event::new(ts, EventKind::Detect, "1.1.1.1").with_action(action),
+            )
+            .unwrap();
+        }
+
+        let buckets = s.hourly_event_counts(NOW).unwrap();
+        assert_eq!(buckets.len(), 2);
+        assert_eq!(buckets[0].1, 2);
+        assert_eq!(buckets[0].2, 1);
+        assert_eq!(buckets[1].1, 1);
+        assert_eq!(buckets[1].2, 1);
+    }
+
+    #[test]
+    fn rule_strings_include_detect_and_ratelimit_only() {
+        let s = store();
+        s.insert_event(
+            &Event::new(NOW, EventKind::Detect, "1.1.1.1").with_rules("xss-script-tag"),
+        )
+        .unwrap();
+        s.insert_event(
+            &Event::new(NOW + 1, EventKind::RateLimit, "1.1.1.1").with_rules("cc-ip"),
+        )
+        .unwrap();
+        s.insert_event(&Event::new(NOW + 2, EventKind::Acl, "1.1.1.1").with_rules("deny"))
+            .unwrap();
+
+        let rules = s.event_rule_strings(NOW, 100).unwrap();
+        assert_eq!(rules.len(), 2);
+        assert!(rules.iter().any(|r| r == "xss-script-tag"));
+        assert!(rules.iter().any(|r| r == "cc-ip"));
+    }
+
+    #[test]
+    fn rule_feed_package_roundtrip() {
+        let s = store();
+        assert!(s.load_rule_feed_package("official").unwrap().is_none());
+
+        let pkg = RuleFeedPackageRow {
+            feed: "official".to_string(),
+            payload: r#"{"rules":[]}"#.to_string(),
+            version: Some("2026.10.1".to_string()),
+            fetched_at: NOW,
+            shadow_until: NOW + 3_600,
+            signature_ok: true,
+            rule_count: 17,
+        };
+        s.save_rule_feed_package(&pkg).unwrap();
+
+        let loaded = s.load_rule_feed_package("official").unwrap().unwrap();
+        assert_eq!(loaded, pkg);
+    }
+
+    #[test]
+    fn rule_feed_package_overwrite_and_delete() {
+        let s = store();
+        let mut pkg = RuleFeedPackageRow {
+            feed: "feed".to_string(),
+            payload: "old".to_string(),
+            version: Some("1".to_string()),
+            fetched_at: NOW,
+            shadow_until: 0,
+            signature_ok: false,
+            rule_count: 1,
+        };
+        s.save_rule_feed_package(&pkg).unwrap();
+
+        pkg.payload = "new".to_string();
+        pkg.signature_ok = true;
+        pkg.rule_count = 2;
+        s.save_rule_feed_package(&pkg).unwrap();
+        let loaded = s.load_rule_feed_package("feed").unwrap().unwrap();
+        assert_eq!(loaded.payload, "new");
+        assert!(loaded.signature_ok);
+        assert_eq!(loaded.rule_count, 2);
+
+        assert!(s.delete_rule_feed_package("feed").unwrap());
+        assert!(s.load_rule_feed_package("feed").unwrap().is_none());
+        assert!(!s.delete_rule_feed_package("feed").unwrap());
+    }
+
+    fn traffic_row(minute: i64, app: &str, requests: u64) -> TrafficBucketRow {
+        TrafficBucketRow {
+            minute,
+            app: app.to_string(),
+            requests,
+            pv: requests.saturating_sub(1),
+            blocked: 1,
+            status_4xx: 2,
+            status_5xx: 0,
+            unique_ips: 2,
+            unique_visitors: 2,
+            ips: vec![1, 2],
+            visitors: vec![11, 12],
+        }
+    }
+
+    #[test]
+    fn traffic_totals_and_filters() {
+        let s = store();
+        let minute = NOW - NOW.rem_euclid(60);
+        s.save_traffic(&[
+            traffic_row(minute, "nas", 10),
+            traffic_row(minute, "blog", 5),
+            traffic_row(minute + 60, "nas", 3),
+        ])
+        .unwrap();
+
+        let all = s.traffic_totals(minute - 60, minute + 120, None).unwrap();
+        assert_eq!(all.requests, 18);
+        assert_eq!(all.blocked, 3);
+        assert_eq!(all.status_4xx, 6);
+        assert_eq!(all.unique_ips, 2, "同一 IP 跨分钟/应用按天去重");
+        assert_eq!(all.unique_visitors, 2);
+
+        let nas = s.traffic_totals(minute - 60, minute + 120, Some("nas")).unwrap();
+        assert_eq!(nas.requests, 13);
+        assert_eq!(nas.unique_ips, 2);
+    }
+
+    #[test]
+    fn traffic_series_groups_and_days() {
+        let s = store();
+        let minute = NOW - NOW.rem_euclid(60);
+        s.save_traffic(&[
+            traffic_row(minute, "nas", 4),
+            traffic_row(minute + 60, "nas", 6),
+            traffic_row(minute + 120, "blog", 8),
+        ])
+        .unwrap();
+
+        let points = s
+            .traffic_series(minute, minute + 180, None, 3_600)
+            .unwrap();
+        assert_eq!(points.len(), 1);
+        assert_eq!(points[0].ts, minute - minute.rem_euclid(3_600));
+        assert_eq!(points[0].requests, 18);
+
+        let days = s.traffic_days(minute - 86_400, 10).unwrap();
+        assert_eq!(days.len(), 1);
+        assert_eq!(days[0].requests, 18);
+    }
+
+    #[test]
+    fn traffic_replay_is_idempotent() {
+        let s = store();
+        let minute = NOW - NOW.rem_euclid(60);
+        let row = traffic_row(minute, "nas", 10);
+        s.save_traffic(std::slice::from_ref(&row)).unwrap();
+        s.save_traffic(&[row]).unwrap();
+
+        let totals = s.traffic_totals(minute, minute + 60, Some("nas")).unwrap();
+        assert_eq!(totals.requests, 10);
+        assert_eq!(totals.unique_ips, 2);
+    }
+
+    #[test]
+    fn prune_traffic_removes_old_rows() {
+        let s = store();
+        let minute = NOW - NOW.rem_euclid(60);
+        s.save_traffic(&[traffic_row(minute, "nas", 2)]).unwrap();
+        assert_eq!(s.prune_traffic(minute + 60).unwrap(), 1);
+        assert_eq!(
+            s.traffic_totals(minute, minute + 60, None)
+                .unwrap()
+                .requests,
+            0
+        );
+        // 去重集合按天保留，当天其余分钟的报表仍可正确去重
+        assert_eq!(
+            s.traffic_totals(minute, minute + 60, None)
+                .unwrap()
+                .unique_ips,
+            2
+        );
     }
 }

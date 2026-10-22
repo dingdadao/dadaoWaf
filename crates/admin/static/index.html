@@ -112,10 +112,11 @@
   form { padding: 16px; display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); align-items: end; border-bottom: 1px solid var(--border); }
   form .wide { grid-column: 1 / -1; }
   form .hint { grid-column: 1 / -1; font-size: 12px; color: var(--muted); margin-top: -4px; }
-  input, select {
+  input, select, textarea {
     font: inherit; font-size: 13px; padding: 6px 10px; border-radius: 6px;
     border: 1px solid var(--border); background: #fff; color: var(--text); width: 100%;
   }
+  textarea { resize: vertical; font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; }
   label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
 
   .msg { padding: 10px 16px; font-size: 13px; display: none; margin-bottom: 16px; border-radius: 8px; }
@@ -172,6 +173,24 @@
     color: #5f5e5a; white-space: pre-wrap; word-break: break-all;
   }
   .rawrow.hidden { display: none; }
+
+  /* ---------- 概览图表 ---------- */
+  .cols { display: grid; grid-template-columns: minmax(0, 2fr) minmax(240px, 1fr); gap: 16px; }
+  @media (max-width: 900px) { .cols { grid-template-columns: 1fr; } }
+  .trend { display: flex; align-items: flex-end; gap: 3px; height: 150px; padding: 16px 16px 8px; }
+  .trend .col { flex: 1; height: 100%; display: flex; align-items: flex-end; position: relative; }
+  .trend .bar { width: 100%; background: #b9cfe4; border-radius: 2px 2px 0 0; min-height: 0; position: relative; }
+  .trend .bar .blocked { position: absolute; left: 0; right: 0; bottom: 0; background: #c96a6a; border-radius: 2px 2px 0 0; }
+  .trend .col:hover .bar { background: var(--accent); }
+  .trend-axis { display: flex; justify-content: space-between; padding: 0 16px 12px; font-size: 11px; color: var(--muted); }
+  .catlist { padding: 8px 16px 16px; display: grid; gap: 9px; }
+  .catrow { display: grid; grid-template-columns: 90px 1fr 46px; gap: 10px; align-items: center; font-size: 12px; }
+  .catrow .name { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .catrow .track { height: 7px; background: #f0efec; border-radius: 4px; overflow: hidden; }
+  .catrow .fill { display: block; height: 100%; background: var(--accent); border-radius: 4px; }
+  .catrow .num { text-align: right; font-variant-numeric: tabular-nums; }
+  .legend { font-size: 11px; color: var(--muted); display: flex; gap: 14px; align-items: center; }
+  .legend i { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 4px; }
 </style>
 </head>
 <body>
@@ -185,6 +204,7 @@
       <a data-page="rules">访问控制</a>
       <a data-page="whitelist">检测白名单</a>
       <a data-page="feeds">IP 组订阅</a>
+      <a data-page="rule-feeds">规则订阅</a>
       <a data-page="bans">封禁<span class="badge" id="nav-bans">0</span></a>
       <a data-page="events">事件</a>
       <a data-page="logs">日志</a>
@@ -213,10 +233,26 @@
           <div class="stat"><div class="label">ACL 规则</div><div class="value" id="s-rules">–</div></div>
           <div class="stat danger"><div class="label">当前封禁</div><div class="value" id="s-bans">–</div></div>
           <div class="stat"><div class="label">事件总数</div><div class="value" id="s-events">–</div></div>
+          <div class="stat danger"><div class="label">累计拦截</div><div class="value" id="s-blocked">–</div></div>
+          <div class="stat"><div class="label">近 24 小时</div><div class="value" id="s-24h">–</div></div>
           <div class="stat"><div class="label">检测规则</div><div class="value" id="s-detect">–</div></div>
         </div>
+        <div class="cols">
+          <section class="card">
+            <header>
+              <h2>24 小时事件趋势</h2>
+              <span class="legend"><span><i style="background:#b9cfe4"></i>事件</span><span><i style="background:#c96a6a"></i>拦截</span></span>
+            </header>
+            <div class="trend" id="trend"></div>
+            <div class="trend-axis"><span id="trend-start">–</span><span>现在</span></div>
+          </section>
+          <section class="card">
+            <header><h2>攻击类型分布</h2></header>
+            <div class="catlist" id="categories"></div>
+          </section>
+        </div>
         <section class="card">
-          <header><h2>最近拦截</h2></header>
+          <header><h2>最近事件</h2></header>
           <div id="overview-events"></div>
         </section>
       </div>
@@ -233,8 +269,10 @@
             <div><label for="af-domain">对外域名</label><input id="af-domain" placeholder="nas.home.lan" required></div>
             <div><label for="af-ports">监听端口（逗号分隔）</label><input id="af-ports" placeholder="80, 443"></div>
             <div class="hint">留空接受任意端口；填了则只在该端口响应</div>
-            <div class="wide"><label for="af-addr">上游服务器</label><input id="af-addr" placeholder="http://192.168.1.5:8080" required></div>
-            <div class="hint">不写协议默认 http:80；写 https:// 默认 443；端口可省略</div>
+            <div class="wide"><label for="af-addr">上游服务器（每行一个）</label><textarea id="af-addr" rows="2" placeholder="http://192.168.1.5:8080&#10;http://192.168.1.6:8080" required></textarea></div>
+            <div class="hint">不写协议默认 http:80；写 https:// 默认 443；端口可省略。多个上游默认轮询。</div>
+            <div class="wide"><label for="af-policy">策略覆盖（JSON，留空跟随全局）</label><textarea id="af-policy" rows="4" placeholder='{ "preset": "strict", "require_challenge": true }'></textarea></div>
+            <div class="hint">支持 preset / protection / observe_mode / block_threshold / ratelimit / require_challenge / allow_cidr / deny_cidr / max_body_size / allow_methods。路由级策略需在数据库或 YAML 中配置。</div>
             <div style="display:flex;gap:8px;align-items:center">
               <button type="submit" class="primary" id="af-submit">保存</button>
               <button type="button" onclick="hideAppForm()">取消</button>
@@ -311,6 +349,46 @@
         </section>
       </div>
 
+      <!-- ========== 规则包订阅 ========== -->
+      <div class="page" data-page="rule-feeds">
+        <section class="card">
+          <header>
+            <h2>检测规则订阅</h2>
+            <button class="primary" onclick="showRuleFeedForm()">+ 添加订阅</button>
+          </header>
+          <form id="rule-feed-form" onsubmit="submitRuleFeed(event)" style="display:none">
+            <div><label for="rff-name">名称</label><input id="rff-name" placeholder="official" required></div>
+            <div class="wide"><label for="rff-url">规则包地址（必须 HTTPS）</label><input id="rff-url" placeholder="https://rules.example.com/core.hwrule" required></div>
+            <div><label for="rff-channel">通道</label>
+              <select id="rff-channel" onchange="syncRuleFeedChannel()">
+                <option value="stable">稳定（stable）</option>
+                <option value="beta">测试（beta）</option>
+                <option value="pinned">固定版本</option>
+              </select>
+            </div>
+            <div><label for="rff-version">固定版本号</label><input id="rff-version" placeholder="仅 pinned 通道需要"></div>
+            <div><label for="rff-interval">检查间隔</label><input id="rff-interval" value="6h" placeholder="6h"></div>
+            <div><label for="rff-window">更新窗口（UTC，留空不限）</label><input id="rff-window" placeholder="03:00-05:00"></div>
+            <div class="wide"><label for="rff-key">Ed25519 公钥</label><input id="rff-key" placeholder="ed25519:..."></div>
+            <div><label for="rff-shadow">影子期（留空关闭）</label><input id="rff-shadow" placeholder="24h"></div>
+            <div><label for="rff-timeout">拉取超时</label><input id="rff-timeout" value="20s" placeholder="20s"></div>
+            <div><label for="rff-maxsize">大小上限</label><input id="rff-maxsize" value="4MB" placeholder="4MB"></div>
+            <div class="wide" style="display:flex;gap:18px;flex-wrap:wrap;align-items:center;font-size:13px">
+              <label class="row" style="margin:0"><input type="checkbox" id="rff-enabled" checked> 启用</label>
+              <label class="row" style="margin:0"><input type="checkbox" id="rff-auto" checked> 自动更新</label>
+              <label class="row" style="margin:0"><input type="checkbox" id="rff-sig" checked> 强制验签</label>
+              <label class="row" style="margin:0"><input type="checkbox" id="rff-rollback" checked> 失败回退缓存</label>
+            </div>
+            <div class="hint">影子期内新规则只记录不拦截。更新窗口按 UTC 计算，支持跨午夜（如 23:00-01:00）。强制验签时必须提供公钥。</div>
+            <div style="display:flex;gap:8px;align-items:center">
+              <button type="submit" class="primary" id="rff-submit">保存并拉取</button>
+              <button type="button" onclick="hideRuleFeedForm()">取消</button>
+            </div>
+          </form>
+          <div id="rule-feeds"></div>
+        </section>
+      </div>
+
       <!-- ========== 封禁 ========== -->
       <div class="page" data-page="bans">
         <section class="card">
@@ -328,6 +406,7 @@
               <select id="ev-kind" onchange="eventPage=0;loadEvents()">
                 <option value="">全部类型</option><option value="detect">检测</option>
                 <option value="ban">封禁</option><option value="acl">ACL</option>
+                <option value="ratelimit">CC 限流</option>
               </select>
               <select id="ev-action" onchange="eventPage=0;loadEvents()">
                 <option value="">全部处置</option><option value="block">拦截</option>
@@ -335,6 +414,7 @@
               </select>
               <input id="ev-ip" placeholder="来源 IP" onkeydown="if(event.key==='Enter'){eventPage=0;loadEvents()}">
               <button onclick="eventPage=0;loadEvents()">查询</button>
+              <button onclick="exportEvents()">导出 CSV</button>
             </div>
           </header>
           <div id="events"></div>
@@ -406,14 +486,23 @@ const esc = (s) => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&l
 const fmtDuration = (secs) => secs >= 3600 ? Math.floor(secs/3600)+' 小时'
   : secs >= 60 ? Math.floor(secs/60)+' 分钟' : secs+' 秒';
 const fmtTime = (ts) => new Date(ts * 1000).toLocaleString('zh-CN', { hour12: false });
-const actionLabel = (a) => ({ block: '拒绝', challenge: '人机验证', log: '仅记录' }[a] || a);
+const actionLabel = (a) => ({ block: '拒绝', challenge: '人机验证', log: '仅记录', observe: '观察' }[a] || a);
+const kindLabel = (k) => ({ detect: '检测', ban: '封禁', acl: 'ACL', ratelimit: 'CC 限流' }[k] || k);
+/// 把后端返回的 "30m" / "2h" / "90s" 转成秒，供输入框编辑
+const durationToSecs = (d) => {
+  const m = String(d).trim().match(/^(\d+)(s|m|h|d)?$/);
+  if (!m) return 1800;
+  const n = parseInt(m[1], 10);
+  return n * ({ s: 1, m: 60, h: 3600, d: 86400 }[m[2] || 's'] || 1);
+};
 
 // ============================================================
 // 页面切换
 // ============================================================
 const PAGE_TITLES = {
   overview: '概览', apps: '应用', rules: '访问控制', whitelist: '检测白名单',
-  feeds: 'IP 组订阅', bans: '封禁', events: '事件', logs: '日志', settings: '设置',
+  feeds: 'IP 组订阅', 'rule-feeds': '规则订阅', bans: '封禁', events: '事件',
+  logs: '日志', settings: '设置',
 };
 
 document.getElementById('nav').addEventListener('click', (e) => {
@@ -427,6 +516,7 @@ document.getElementById('nav').addEventListener('click', (e) => {
 
   // 切换时按需加载
   ({ apps: loadApps, rules: loadRules, whitelist: loadWhitelist, feeds: loadFeeds,
+     'rule-feeds': loadRuleFeeds,
      bans: loadBans, events: loadEvents, logs: loadLogs, settings: loadSettings,
      overview: loadStats }[page] || (() => {}))();
 });
@@ -442,7 +532,13 @@ async function loadStats() {
     document.getElementById('s-rules').textContent = s.acl_rules;
     document.getElementById('s-bans').textContent = s.active_bans;
     document.getElementById('s-events').textContent = s.events_total;
+    document.getElementById('s-blocked').textContent = s.events_blocked;
     document.getElementById('s-detect').textContent = s.detect_rules;
+
+    const hourly = s.hourly || [];
+    document.getElementById('s-24h').textContent = hourly.reduce((n, h) => n + h.total, 0);
+    renderTrend(hourly);
+    renderCategories(s.categories || []);
 
     document.getElementById('top-rules').textContent = s.detect_rules;
     document.getElementById('top-bans').textContent = s.active_bans;
@@ -456,17 +552,53 @@ async function loadStats() {
   }
 }
 
+function renderTrend(hourly) {
+  const el = document.getElementById('trend');
+  if (!hourly.length) { el.innerHTML = '<div class="empty" style="width:100%">暂无数据</div>'; return; }
+  const max = Math.max(1, ...hourly.map(h => h.total));
+  el.innerHTML = hourly.map(h => {
+    const total = Math.round(h.total / max * 100);
+    const blocked = h.total ? Math.round(h.blocked / h.total * 100) : 0;
+    const t = new Date(h.ts * 1000).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', hour12: false });
+    return `<div class="col" title="${esc(t)} · 事件 ${h.total} · 拦截 ${h.blocked}">
+      <div class="bar" style="height:${total}%"><div class="blocked" style="height:${blocked}%"></div></div>
+    </div>`;
+  }).join('');
+  if (hourly.length) {
+    document.getElementById('trend-start').textContent =
+      new Date(hourly[0].ts * 1000).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', hour12: false });
+  }
+}
+
+const CAT_LABELS = {
+  sqli: 'SQL 注入', xss: 'XSS', cmdi: '命令注入', traversal: '路径穿越', ssrf: 'SSRF',
+  xxe: 'XXE', ssti: 'SSTI', nosql: 'NoSQL 注入', ldap: 'LDAP/XPath', webshell: 'WebShell',
+  scanner: '扫描器', deserialization: '反序列化', crlf: 'CRLF 注入', file_upload: '恶意上传',
+  bruteforce: '暴力破解', sensitive_leak: '敏感信息', custom: '自定义', cc: 'CC 限流', other: '其他',
+};
+
+function renderCategories(cats) {
+  const el = document.getElementById('categories');
+  if (!cats.length) { el.innerHTML = '<div class="empty" style="padding:8px 0">暂无命中记录</div>'; return; }
+  const max = Math.max(1, ...cats.map(c => c.count));
+  el.innerHTML = cats.map(c => `<div class="catrow">
+    <span class="name" title="${esc(c.name)}">${esc(CAT_LABELS[c.name] || c.name)}</span>
+    <span class="track"><span class="fill" style="width:${Math.round(c.count / max * 100)}%"></span></span>
+    <span class="num">${c.count}</span>
+  </div>`).join('');
+}
+
 async function loadOverviewEvents() {
   const el = document.getElementById('overview-events');
   try {
     const res = await api('/events?limit=5');
     if (!res.events.length) { el.innerHTML = '<div class="empty">还没有安全事件</div>'; return; }
     el.innerHTML = `<table>
-      <thead><tr><th>时间</th><th>来源</th><th>规则</th><th>处置</th></tr></thead>
+      <thead><tr><th>时间</th><th>类型</th><th>来源</th><th>规则</th><th>处置</th></tr></thead>
       <tbody>${res.events.map(e => `<tr>
-        <td>${fmtTime(e.ts)}</td><td><code>${esc(e.client_ip)}</code></td>
+        <td>${fmtTime(e.ts)}</td><td>${esc(kindLabel(e.kind))}</td><td><code>${esc(e.client_ip)}</code></td>
         <td><code>${esc(e.rules)}</code></td>
-        <td><span class="tag ${esc(e.action)}">${esc(e.action)}</span></td>
+        <td><span class="tag ${esc(e.action)}">${esc(actionLabel(e.action))}</span></td>
       </tr>`).join('')}</tbody></table>`;
   } catch { el.innerHTML = '<div class="empty">加载失败</div>'; }
 }
@@ -509,8 +641,13 @@ function showAppForm(app) {
   idEl.style.background = app ? '#f5f5f2' : '#fff';
   document.getElementById('af-domain').value = app?.domains?.primary || '';
   document.getElementById('af-ports').value = (app?.listen_ports || []).join(', ');
-  const u = app?.upstreams?.[0];
-  document.getElementById('af-addr').value = u ? (u.port ? `${u.addr}:${u.port}` : u.addr) : '';
+  document.getElementById('af-addr').value = (app?.upstreams || [])
+    .map(u => u.port ? `${u.addr}:${u.port}` : u.addr).join('\n');
+  const policy = Object.fromEntries(
+    Object.entries(app?.policy || {}).filter(([, v]) => v != null)
+  );
+  document.getElementById('af-policy').value = Object.keys(policy).length
+    ? JSON.stringify(policy, null, 2) : '';
   document.getElementById('af-submit').textContent = app ? '保存修改' : '创建';
   idEl.focus();
 }
@@ -530,16 +667,27 @@ async function submitApp(e) {
   const btn = document.getElementById('af-submit');
   const id = document.getElementById('af-id').value.trim();
   const domain = document.getElementById('af-domain').value.trim();
-  const addr = document.getElementById('af-addr').value.trim();
+  const addrLines = document.getElementById('af-addr').value
+    .split('\n').map(s => s.trim()).filter(Boolean);
   const portsRaw = document.getElementById('af-ports').value.trim();
+  const policyRaw = document.getElementById('af-policy').value.trim();
 
   if (!/^[a-z0-9][a-z0-9-]*$/.test(id)) return showMsg('ID 只能包含小写字母、数字和横线', 'error');
-  if (!addr) return showMsg('上游服务器不能为空', 'error');
+  if (!addrLines.length) return showMsg('至少需要一个上游服务器', 'error');
 
   const listenPorts = portsRaw
     ? portsRaw.split(',').map(s => parseInt(s.trim(), 10)).filter(p => p > 0 && p <= 65535)
     : [];
   if (portsRaw && !listenPorts.length) return showMsg('监听端口格式不对，应该是 80, 443 这样', 'error');
+
+  let policy = {};
+  if (policyRaw) {
+    try { policy = JSON.parse(policyRaw); }
+    catch { return showMsg('策略 JSON 格式不对', 'error'); }
+    if (!policy || Array.isArray(policy) || typeof policy !== 'object') {
+      return showMsg('策略必须是一个 JSON 对象', 'error');
+    }
+  }
 
   // 编辑时保留其他字段；别名域名不在表单里了，但要保留已有数据
   const app = {
@@ -551,7 +699,11 @@ async function submitApp(e) {
       aliases: editingApp?.domains?.aliases || [],
     },
     listen_ports: listenPorts,
-    upstreams: [{ addr }],
+    upstreams: addrLines.map(addr => {
+      const old = (editingApp?.upstreams || []).find(u => (u.port ? `${u.addr}:${u.port}` : u.addr) === addr);
+      return old ? { ...old } : { addr };
+    }),
+    policy,
     enabled: editingApp?.enabled ?? true,
   };
 
@@ -747,6 +899,164 @@ async function deleteFeed(name) {
 }
 
 // ============================================================
+// 规则包订阅
+// ============================================================
+let ruleFeedsCache = [];
+let editingRuleFeed = null;
+
+const RULE_SOURCE_LABEL = { remote: '远端', cache: '缓存', none: '不可用', disabled: '已停用' };
+const RULE_SOURCE_CLASS = { remote: 'allow', cache: 'log', none: 'deny', disabled: '' };
+
+async function loadRuleFeeds() {
+  const el = document.getElementById('rule-feeds');
+  try {
+    const data = await api('/rule-feeds');
+    ruleFeedsCache = data.feeds || [];
+    const statuses = Object.fromEntries((data.statuses || []).map(s => [s.name, s]));
+    if (!ruleFeedsCache.length) {
+      el.innerHTML = '<div class="empty">还没有规则订阅。接入签名规则包可以持续补充检测能力，不必等固件升级。</div>';
+      return;
+    }
+    el.innerHTML = `<table>
+      <thead><tr><th>名称 / 地址</th><th>通道 / 版本</th><th>规则数</th><th>状态</th>
+      <th>影子期</th><th>最近拉取</th><th>错误</th><th></th></tr></thead>
+      <tbody>${ruleFeedsCache.map(f => {
+        const s = statuses[f.name] || {};
+        const source = s.source || 'none';
+        const sig = s.signature_ok
+          ? '<span class="tag allow" title="Ed25519 验签通过">已验签</span>'
+          : (f.require_signature ? '<span class="tag deny">未验签</span>' : '<span class="tag log">未签名</span>');
+        return `<tr>
+          <td><code>${esc(f.name)}</code>
+            <div class="sub" style="margin:2px 0 0;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(f.url)}">${esc(f.url)}</div></td>
+          <td>${esc(f.channel)}${s.version ? `<br><code>${esc(s.version)}</code>` : ''}
+            ${f.channel === 'pinned' && f.pinned_version ? `<br><span class="sub" style="margin:0">固定 ${esc(f.pinned_version)}</span>` : ''}</td>
+          <td>${s.rule_count ?? 0}</td>
+          <td><span class="tag ${RULE_SOURCE_CLASS[source] || ''}">${esc(RULE_SOURCE_LABEL[source] || source)}</span>
+            ${sig}${f.enabled ? '' : ' <span class="tag">停用</span>'}</td>
+          <td>${s.shadow_until ? fmtTime(s.shadow_until) : '<span class="sub" style="margin:0">—</span>'}</td>
+          <td>${s.fetched_at ? fmtTime(s.fetched_at) : '<span class="sub" style="margin:0">—</span>'}
+            ${s.next_check_at ? `<div class="sub" style="margin:2px 0 0">下次 ${fmtTime(s.next_check_at)}</div>` : ''}</td>
+          <td style="max-width:240px;color:var(--danger);font-size:12px">${esc(s.error || '')}</td>
+          <td style="white-space:nowrap">
+            <button onclick="editRuleFeed('${esc(f.name)}')">编辑</button>
+            <button onclick="refreshRuleFeed('${esc(f.name)}')">刷新</button>
+            <button class="danger" onclick="deleteRuleFeed('${esc(f.name)}')">删除</button>
+          </td>
+        </tr>`;
+      }).join('')}</tbody></table>`;
+  } catch (e) { el.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`; }
+}
+
+function syncRuleFeedChannel() {
+  const pinned = document.getElementById('rff-channel').value === 'pinned';
+  document.getElementById('rff-version').disabled = !pinned;
+}
+
+function showRuleFeedForm(feed) {
+  editingRuleFeed = feed || null;
+  document.getElementById('rule-feed-form').style.display = 'grid';
+  const set = (id, v) => document.getElementById(id).value = v ?? '';
+  set('rff-name', feed?.name);
+  set('rff-url', feed?.url);
+  set('rff-channel', feed?.channel || 'stable');
+  set('rff-version', feed?.pinned_version);
+  set('rff-interval', feed?.check_interval ?? '6h');
+  set('rff-window', feed?.update_window);
+  set('rff-key', feed?.public_key);
+  set('rff-shadow', feed?.shadow_period);
+  set('rff-timeout', feed?.timeout ?? '20s');
+  set('rff-maxsize', feed?.max_size ?? '4MB');
+  document.getElementById('rff-enabled').checked = feed ? feed.enabled : true;
+  document.getElementById('rff-auto').checked = feed ? feed.auto_update : true;
+  document.getElementById('rff-sig').checked = feed ? feed.require_signature : true;
+  document.getElementById('rff-rollback').checked = feed ? feed.rollback_on_error : true;
+
+  const nameEl = document.getElementById('rff-name');
+  nameEl.readOnly = !!feed;
+  nameEl.style.background = feed ? '#f5f5f2' : '#fff';
+  document.getElementById('rff-submit').textContent = feed ? '保存并拉取' : '添加并拉取';
+  syncRuleFeedChannel();
+  nameEl.focus();
+}
+
+function hideRuleFeedForm() {
+  document.getElementById('rule-feed-form').style.display = 'none';
+  editingRuleFeed = null;
+}
+
+function editRuleFeed(name) {
+  const feed = ruleFeedsCache.find(f => f.name === name);
+  if (feed) showRuleFeedForm(feed);
+}
+
+async function submitRuleFeed(e) {
+  e.preventDefault();
+  const btn = document.getElementById('rff-submit');
+  const name = document.getElementById('rff-name').value.trim();
+  const url = document.getElementById('rff-url').value.trim();
+  const channel = document.getElementById('rff-channel').value;
+  const version = document.getElementById('rff-version').value.trim();
+  const interval = document.getElementById('rff-interval').value.trim();
+  const window = document.getElementById('rff-window').value.trim();
+  const key = document.getElementById('rff-key').value.trim();
+  const shadow = document.getElementById('rff-shadow').value.trim();
+  const timeout = document.getElementById('rff-timeout').value.trim();
+  const maxsize = document.getElementById('rff-maxsize').value.trim();
+  const sig = document.getElementById('rff-sig').checked;
+
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(name)) return showMsg('名称只能包含字母、数字、横线和下划线（最多 64 字符）', 'error');
+  if (!url.startsWith('https://')) return showMsg('规则包地址必须是 HTTPS（明文 HTTP 可能被中间人投毒）', 'error');
+  if (channel === 'pinned' && !version) return showMsg('固定版本通道必须填写版本号', 'error');
+  if (sig && !key) return showMsg('强制验签时必须填写 Ed25519 公钥', 'error');
+
+  const feed = {
+    ...(editingRuleFeed || {}),
+    name, url,
+    enabled: document.getElementById('rff-enabled').checked,
+    channel,
+    auto_update: document.getElementById('rff-auto').checked,
+    check_interval: interval || '6h',
+    update_window: window || null,
+    timeout: timeout || '20s',
+    max_size: maxsize || '4MB',
+    headers: editingRuleFeed?.headers || {},
+    require_signature: sig,
+    public_key: key || null,
+    shadow_period: shadow || null,
+    rollback_on_error: document.getElementById('rff-rollback').checked,
+    pinned_version: channel === 'pinned' ? version : null,
+  };
+
+  btn.disabled = true; btn.textContent = '拉取中…';
+  try {
+    const res = await api('/rule-feeds', { method: 'POST', body: JSON.stringify(feed) });
+    if (res && res.warning) showMsg(res.warning, 'error');
+    else showMsg(`规则订阅 ${name} 已保存并拉取成功`);
+    hideRuleFeedForm(); loadRuleFeeds(); loadStats();
+  } catch (err) { showMsg('保存失败：' + err.message, 'error'); }
+  finally { btn.disabled = false; btn.textContent = '保存并拉取'; }
+}
+
+async function refreshRuleFeed(name) {
+  showMsg(`正在重新拉取 ${name}…`);
+  try {
+    const res = await api('/rule-feeds/' + encodeURIComponent(name) + '/refresh', { method: 'POST' });
+    if (res && res.warning) showMsg(res.warning, 'error');
+    else showMsg(`${name} 已刷新`);
+    loadRuleFeeds(); loadStats();
+  } catch (e) { showMsg('刷新失败：' + e.message, 'error'); }
+}
+
+async function deleteRuleFeed(name) {
+  if (!confirm(`删除规则订阅 ${name}？该订阅提供的检测规则会立即失效。`)) return;
+  try {
+    await api('/rule-feeds/' + encodeURIComponent(name), { method: 'DELETE' });
+    showMsg('已删除'); loadRuleFeeds(); loadStats();
+  } catch (e) { showMsg('删除失败：' + e.message, 'error'); }
+}
+
+// ============================================================
 // 封禁
 // ============================================================
 async function loadBans() {
@@ -799,10 +1109,10 @@ async function loadEvents() {
     el.innerHTML = `<table>
       <thead><tr><th>时间</th><th>类型</th><th>来源 IP</th><th>应用</th><th>规则</th><th>分数</th><th>处置</th></tr></thead>
       <tbody>${events.map(e => `<tr>
-        <td>${fmtTime(e.ts)}</td><td>${esc(e.kind)}</td>
+        <td>${fmtTime(e.ts)}</td><td>${esc(kindLabel(e.kind))}</td>
         <td><code>${esc(e.client_ip)}</code></td><td>${esc(e.app)}</td>
         <td><code>${esc(e.rules)}</code></td><td>${e.score}</td>
-        <td><span class="tag ${esc(e.action)}">${esc(e.action)}</span></td>
+        <td><span class="tag ${esc(e.action)}">${esc(actionLabel(e.action))}</span></td>
       </tr>`).join('')}</tbody></table>`;
 
     const pages = Math.max(1, Math.ceil(total / EVENT_PAGE_SIZE));
@@ -814,6 +1124,17 @@ async function loadEvents() {
     el.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`;
     pager.innerHTML = '';
   }
+}
+
+function exportEvents() {
+  const params = new URLSearchParams();
+  const kind = document.getElementById('ev-kind').value;
+  const action = document.getElementById('ev-action').value;
+  const ip = document.getElementById('ev-ip').value.trim();
+  if (kind) params.set('kind', kind);
+  if (action) params.set('action', action);
+  if (ip) params.set('ip', ip);
+  window.location.href = '/api/events/export?' + params.toString();
 }
 
 // ============================================================
@@ -985,6 +1306,7 @@ function renderSettings(s) {
   const pn = acl.private_network || {};
   const ri = s.real_ip || {};
   const rl = s.ratelimit || {};
+  const ch = s.challenge || {};
 
   document.getElementById('settings').innerHTML = `
     <div class="fieldset">
@@ -1024,9 +1346,30 @@ function renderSettings(s) {
       <div class="hint">只有来自可信代理的请求才会解析这些头，其余一律用直连 IP。</div>
     </div>
     <div class="fieldset">
-      <h3>限流</h3>
-      <div><label for="set-gqps">全局 QPS</label><input type="number" id="set-gqps" min="0" value="${rl.global_qps ?? 2000}"></div>
-      <div><label for="set-iqps">单 IP QPS</label><input type="number" id="set-iqps" min="0" value="${rl.per_ip_qps ?? 100}"></div>
+      <h3>CC 防护（限流）</h3>
+      <label class="row"><input type="checkbox" id="set-rl-enabled" ${rl.enabled ? 'checked' : ''}>
+        启用限流（默认关闭，避免影响内网大流量下载 / 同步）</label>
+      <div><label for="set-rl-action">超限处置</label>
+        <select id="set-rl-action">
+          <option value="block" ${rl.action === 'block' ? 'selected' : ''}>直接拒绝（429）</option>
+          <option value="challenge" ${rl.action === 'challenge' ? 'selected' : ''}>人机验证后放行</option>
+          <option value="log" ${rl.action === 'log' ? 'selected' : ''}>仅记录</option>
+        </select></div>
+      <div><label for="set-gqps">全局 QPS（0 为不限）</label><input type="number" id="set-gqps" min="0" value="${rl.global_qps ?? 2000}"></div>
+      <div><label for="set-iqps">单 IP QPS（0 为不限）</label><input type="number" id="set-iqps" min="0" value="${rl.per_ip_qps ?? 100}"></div>
+      <div><label for="set-urlqps">单 URL QPS（0 为不限）</label><input type="number" id="set-urlqps" min="0" value="${rl.per_url_qps ?? 200}"></div>
+      <div><label for="set-conn">单 IP 并发连接（0 为不限）</label><input type="number" id="set-conn" min="0" value="${rl.per_ip_conn ?? 64}"></div>
+      <div class="hint">按 1 秒滑动窗口统计。人机验证需先在上方开启“人机验证”。</div>
+    </div>
+    <div class="fieldset">
+      <h3>人机验证</h3>
+      <label class="row"><input type="checkbox" id="set-ch-enabled" ${ch.enabled ? 'checked' : ''}>
+        启用 JS 工作量证明挑战</label>
+      <div><label for="set-ch-difficulty">难度（1–8，前导零位数）</label>
+        <input type="number" id="set-ch-difficulty" min="1" max="8" value="${ch.difficulty ?? 4}"></div>
+      <div><label for="set-ch-ttl">通过后免验证时长（秒）</label>
+        <input type="number" id="set-ch-ttl" min="30" value="${durationToSecs(ch.ttl ?? '30m')}"></div>
+      <div class="hint">难度每加 1 计算量约翻 16 倍。浏览器用纯 JS 计算，家用设备建议 4–5；纯 HTTP 环境也可用（不依赖 crypto.subtle）。</div>
     </div>`;
 }
 
@@ -1052,12 +1395,23 @@ async function saveSettings() {
     ri.header_priority = listVal('set-headers');
 
     const rl = { ...settingsCache.ratelimit };
-    rl.global_qps = numVal('set-gqps'); rl.per_ip_qps = numVal('set-iqps');
+    rl.enabled = document.getElementById('set-rl-enabled').checked;
+    rl.action = document.getElementById('set-rl-action').value;
+    rl.global_qps = numVal('set-gqps');
+    rl.per_ip_qps = numVal('set-iqps');
+    rl.per_url_qps = numVal('set-urlqps');
+    rl.per_ip_conn = numVal('set-conn');
+
+    const ch = { ...settingsCache.challenge };
+    ch.enabled = document.getElementById('set-ch-enabled').checked;
+    ch.difficulty = Math.min(8, Math.max(1, numVal('set-ch-difficulty')));
+    ch.ttl = Math.max(30, numVal('set-ch-ttl')) + 's';
 
     await api('/settings/protection', { method: 'PUT', body: JSON.stringify(p) });
     await api('/settings/acl', { method: 'PUT', body: JSON.stringify(acl) });
     await api('/settings/real_ip', { method: 'PUT', body: JSON.stringify(ri) });
     await api('/settings/ratelimit', { method: 'PUT', body: JSON.stringify(rl) });
+    await api('/settings/challenge', { method: 'PUT', body: JSON.stringify(ch) });
 
     showMsg('设置已保存并立即生效');
     loadSettings(); loadStats();

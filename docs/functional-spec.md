@@ -1012,15 +1012,14 @@ global.protection  →  application.policy.protection  →  route.policy.protect
 
 ## 7. 规则管理与订阅更新
 
-### 7.1 规则集分层
+### 7.1 规则集分层（当前实现）
 
 | 层 | 来源 | 更新方式 | 用户可否修改 |
 |---|---|---|---|
-| `builtin-core` | 随二进制内置 | 跟随版本升级 | 仅可开关、调分值 |
-| `builtin-extended` | 首次启动下载 | 规则订阅 | 仅可开关、调分值 |
-| `imported` | 用户从 CRS 等转换导入 | 手动 | 可编辑 |
-| `user` | 用户手写 | 手动 | 完全可控 |
-| `feed` | 外部订阅（IP 组） | 自动 | 仅可开关 |
+| `builtin` | 随二进制内置 41 条 | 跟随版本升级 | 仅可开关、调阈值 |
+| `feed` | 外部签名规则包 | 定时自动更新 + 手动刷新 | 仅可启用/停用订阅 |
+
+`imported` / `user` 分层与单条规则覆盖尚未实现，当前自定义规则通过自建签名订阅包完成。
 
 ### 7.2 规则订阅配置
 
@@ -1028,54 +1027,75 @@ global.protection  →  application.policy.protection  →  route.policy.protect
 rule_feeds:
   - name: official-core
     url: "https://rules.example.com/core-v1.hwrule"
+    enabled: true                      # 停用后不加载、不拉取
     channel: stable                    # stable | beta | pinned
     auto_update: true
-    check_interval: 24h
-    update_window: "03:00-05:00"       # 仅在此时间段内应用
+    check_interval: 24h                # 最小 60s
+    update_window: "03:00-05:00"       # UTC；支持跨午夜，留空不限
+    timeout: 20s                       # 1s-300s
+    max_size: 4MB                      # 1KB-64MB
+    headers: {}                        # 附加请求头（如 Authorization）
     require_signature: true            # 强制验签
-    public_key: "ed25519:..."
-    shadow_period: 6h                  # 应用后先影子运行
-    rollback_on_error: true            # 出错自动回滚
-    pinned_version: null               # channel=pinned 时指定
+    public_key: "ed25519:..."          # 32 字节 Ed25519 公钥
+    shadow_period: 6h                  # 新载荷先只记录不拦截
+    rollback_on_error: true            # 失败时沿用上次验签通过的缓存
+    pinned_version: null               # channel=pinned 时必填
 ```
 
-### 7.3 更新流程（状态机）
+### 7.3 更新流程（实际实现）
 
 ```
-idle
-  │ 到达检查时间
-  ▼
-checking ──无更新──► idle
-  │ 有新版本
-  ▼
-downloading ──失败──► failed（保留旧版本，退避重试）
+到达检查时间（且处于 update_window）
   │
   ▼
-verifying ──验签失败──► rejected（告警，不应用）
+拉取 ──失败──► 有缓存且 rollback_on_error ──► 使用缓存（状态 cache，记录错误）
+  │                                            └─ 无缓存 ──► 不加载（状态 none）
+  ▼
+拆签名头 → 验签（require_signature 时必须通过）
+  │ 失败 ──► 同上回退/拒绝
+  ▼
+解析 + 校验（格式、规则数、正则、id 冲突、内置规则冲突）
+  │ 失败 ──► 同上回退/拒绝
+  ▼
+通道/固定版本检查（stable 不接受 beta 文档）
+  │ 失败 ──► 同上回退/拒绝
+  ▼
+写入 SQLite 缓存 → 合并进检测引擎
   │
-  ▼
-validating ──不兼容──► rejected（引擎版本不匹配等）
-  │
-  ▼
-staged（已加载但未生效）
-  │ 进入 update_window
-  ▼
-shadow（影子运行 shadow_period）
-  │ 误报率超阈值
-  ├──► rolled_back（自动回滚 + 告警）
-  │ 正常
-  ▼
-active
+  ├─ 新载荷且配置了影子期 ──► 规则在 shadow_until 前只记录不拦截
+  └─ 与上次载荷相同 ──► 保留原影子期（不会因定时拉取无限续期）
 ```
 
-### 7.4 版本与回滚
+- 每个订阅整包接受或整包拒绝；跨订阅 id 冲突时后加载的整包跳过。
+- 检查由控制台所在进程每 60 秒调度一次，仅重建状态时拉取到期订阅。
+- 手动刷新忽略检查间隔与更新窗口，强制拉取全部启用订阅。
 
-- 保留最近 10 个规则包版本
-- 支持 `homewaf rules rollback <version>`
-- 回滚是原子操作（ArcSwap 替换）
-- 每次变更写审计日志
+### 7.4 规则包格式与签名
 
-### 7.5 单条规则操作
+```text
+# homewaf-signature: ed25519:<base64 签名>
+{"format":"homewaf-rules","version":"2026.10.1","channel":"stable","rules":[...]}
+```
+
+- 签名覆盖签名行之后的**原始字节**，任何改动都会导致验签失败。
+- 文档支持 JSON 或 YAML；版本号可为字符串或数字；未知字段忽略。
+- 单包最多 2000 条规则；id 不得与内置规则或其他订阅重复。
+- 离线工具：
+
+```bash
+homewaf rulepack keygen --out signing.pkcs8   # 生成私钥（0600）与公钥
+homewaf rulepack sign --key signing.pkcs8 rules.json -o core.hwrule
+homewaf rulepack verify --key ed25519:... core.hwrule
+```
+
+### 7.5 版本与回滚
+
+- SQLite 只保留每个订阅**最后一次验签通过**的载荷（`rule_feed_packages`）。
+- 拉取/验签/解析失败时按 `rollback_on_error` 回退到该载荷；重启后同样可用。
+- 状态替换走 `ArcSwap`，不会出现"新规则配旧连接池"的中间态。
+- 多版本历史与一键回滚到任意版本尚未实现。
+
+### 7.6 单条规则操作（规划）
 
 ```yaml
 rule_overrides:

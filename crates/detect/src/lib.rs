@@ -8,16 +8,72 @@
 //! 上层只需要构造 [`InspectionInput`] 并调用 [`Engine::inspect`]。
 
 pub mod body;
+pub mod feed;
 pub mod matcher;
 pub mod normalize;
 pub mod rule;
 pub mod whitelist;
 
+use std::sync::Arc;
+
 pub use body::{should_inspect_content_type, BodyBuffer, DEFAULT_MAX_INSPECT_BYTES};
-pub use matcher::Matcher;
+pub use matcher::{Matcher, MatcherError};
 pub use normalize::{normalize, Normalized, MAX_DECODE_ROUNDS};
-pub use rule::{Action, Category, Rule, Severity, Target, BUILTIN_RULES};
+pub use rule::{
+    Action, Category, Rule, RuleMeta, RuleSource, Severity, Target, BUILTIN_RULES,
+};
 pub use whitelist::{Exemption, WhitelistRule};
+
+/// 单个攻击分类的处置模式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CategoryMode {
+    /// 关闭该分类的检测
+    Off,
+    /// 照常检测并记录，但不计入拦截分
+    Monitor,
+    /// 检测并按阈值拦截
+    Block,
+}
+
+/// 检测策略：分类开关 + 观察模式 + 阻断阈值。
+///
+/// 按应用/路由解析后传给引擎。正则只编译一次，所有策略共享同一个
+/// [`Matcher`]，策略差异不产生额外内存与启动成本。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanPolicy {
+    modes: [CategoryMode; Category::COUNT],
+    pub observe: bool,
+    pub block_threshold: u32,
+}
+
+impl Default for ScanPolicy {
+    fn default() -> Self {
+        Self::all_block(50)
+    }
+}
+
+impl ScanPolicy {
+    pub fn all_block(block_threshold: u32) -> Self {
+        Self {
+            modes: [CategoryMode::Block; Category::COUNT],
+            observe: false,
+            block_threshold,
+        }
+    }
+
+    pub fn set(&mut self, category: Category, mode: CategoryMode) {
+        self.modes[category.index()] = mode;
+    }
+
+    pub fn mode(&self, category: Category) -> CategoryMode {
+        self.modes[category.index()]
+    }
+
+    /// 全部关闭，用于应用级"不检测"的快速路径。
+    pub fn all_off(&self) -> bool {
+        self.modes.iter().all(|m| *m == CategoryMode::Off)
+    }
+}
 
 /// 待检测的请求内容。
 #[derive(Debug, Default, Clone)]
@@ -34,11 +90,12 @@ pub struct InspectionInput {
 /// 单条命中。
 #[derive(Debug, Clone)]
 pub struct Finding {
-    pub rule_id: &'static str,
-    pub rule_name: &'static str,
+    pub rule_id: String,
+    pub rule_name: String,
     pub category: Category,
     pub severity: Severity,
     pub target: Target,
+    /// 实际处置。影子期内的订阅规则固定为 [`Action::Log`]。
     pub action: Action,
     /// 归一化后的命中片段，截断后用于日志
     pub evidence: String,
@@ -67,14 +124,16 @@ impl Verdict {
     }
 
     /// 命中的规则 id 列表，便于日志与测试断言。
-    pub fn rule_ids(&self) -> Vec<&'static str> {
-        self.findings.iter().map(|f| f.rule_id).collect()
+    pub fn rule_ids(&self) -> Vec<&str> {
+        self.findings.iter().map(|f| f.rule_id.as_str()).collect()
     }
 }
 
 /// 检测引擎。
+#[derive(Clone)]
 pub struct Engine {
-    matcher: Matcher,
+    /// 规则只编译一次，所有应用/路由共享
+    matcher: Arc<Matcher>,
     observe_mode: bool,
     /// 可拦截的分数达到该值才拦
     block_threshold: u32,
@@ -84,10 +143,37 @@ impl Engine {
     /// `observe_mode` 为 true 时只记录不拦截，用于上线前评估误报。
     pub fn new(observe_mode: bool, block_threshold: u32) -> Self {
         Self {
-            matcher: Matcher::new(BUILTIN_RULES),
+            matcher: Arc::new(Matcher::new(BUILTIN_RULES)),
             observe_mode,
             block_threshold,
         }
+    }
+
+    /// 用共享的规则匹配器构建，多个引擎实例之间不重复编译正则。
+    pub fn with_matcher(matcher: Arc<Matcher>, observe_mode: bool, block_threshold: u32) -> Self {
+        Self {
+            matcher,
+            observe_mode,
+            block_threshold,
+        }
+    }
+
+    /// 内置规则 + 订阅规则。规则包非法时返回错误，调用方应保留旧状态。
+    pub fn with_extra_rules(
+        extra: Vec<RuleMeta>,
+        observe_mode: bool,
+        block_threshold: u32,
+    ) -> Result<Self, MatcherError> {
+        let matcher = Matcher::with_extra(extra)?;
+        Ok(Self::with_matcher(
+            Arc::new(matcher),
+            observe_mode,
+            block_threshold,
+        ))
+    }
+
+    pub fn matcher(&self) -> Arc<Matcher> {
+        Arc::clone(&self.matcher)
     }
 
     pub fn rule_count(&self) -> usize {
@@ -105,10 +191,25 @@ impl Engine {
 
     /// 检测一个请求，按白名单豁免部分或全部规则。
     pub fn inspect_with(&self, input: &InspectionInput, exemption: &Exemption) -> Verdict {
+        let policy = ScanPolicy {
+            observe: self.observe_mode,
+            block_threshold: self.block_threshold,
+            ..ScanPolicy::default()
+        };
+        self.inspect_with_policy(input, exemption, &policy)
+    }
+
+    /// 用指定策略检测。策略决定分类开关、观察模式与阈值。
+    pub fn inspect_with_policy(
+        &self,
+        input: &InspectionInput,
+        exemption: &Exemption,
+        policy: &ScanPolicy,
+    ) -> Verdict {
         // 完全豁免：直接返回干净结果，连归一化都省了
-        if exemption.skip_all {
+        if exemption.skip_all || policy.all_off() {
             return Verdict {
-                observe: self.observe_mode,
+                observe: policy.observe,
                 ..Default::default()
             };
         }
@@ -125,24 +226,25 @@ impl Engine {
 
         for (target, value) in targets {
             let Some(value) = value else { continue };
-            self.scan_target(value, target, exemption, &mut findings);
+            self.scan_target(value, target, exemption, policy, &mut findings);
         }
 
         for (_, value) in &input.headers {
-            self.scan_target(value, Target::Header, exemption, &mut findings);
+            self.scan_target(value, Target::Header, exemption, policy, &mut findings);
         }
 
         let score: u32 = findings.iter().map(|f| f.severity.score()).sum();
-        // 只有 Block 类规则参与拦截判定，Log 类（如扫描器 UA）只记分数
+        // 只有 Block 类规则、且分类未被降级为 Monitor/Off 时才参与拦截判定
         let blocking_score: u32 = findings
             .iter()
             .filter(|f| f.action == Action::Block)
+            .filter(|f| policy.mode(f.category) == CategoryMode::Block)
             .map(|f| f.severity.score())
             .sum();
 
         Verdict {
-            blocked: !self.observe_mode && blocking_score >= self.block_threshold,
-            observe: self.observe_mode,
+            blocked: !policy.observe && blocking_score >= policy.block_threshold,
+            observe: policy.observe,
             score,
             blocking_score,
             findings,
@@ -154,6 +256,7 @@ impl Engine {
         value: &str,
         target: Target,
         exemption: &Exemption,
+        policy: &ScanPolicy,
         out: &mut Vec<Finding>,
     ) {
         if value.is_empty() {
@@ -169,21 +272,30 @@ impl Engine {
             let Some(rule) = self.matcher.rule(idx) else {
                 continue;
             };
+            // 关闭的分类连记录都不需要
+            if policy.mode(rule.category) == CategoryMode::Off {
+                continue;
+            }
             // 规则可能只针对特定目标，关键词命中不代表适用
             if !rule.targets.contains(&target) {
                 continue;
             }
             // 白名单豁免了这条规则
-            if exemption.exempts(rule.id) {
+            if exemption.exempts(&rule.id) {
                 continue;
             }
             out.push(Finding {
-                rule_id: rule.id,
-                rule_name: rule.name,
+                rule_id: rule.id.clone(),
+                rule_name: rule.name.clone(),
                 category: rule.category,
                 severity: rule.severity,
                 target,
-                action: rule.action,
+                // 影子期规则只记录：降级成 Log 后自然不计入 blocking_score
+                action: if rule.shadow {
+                    Action::Log
+                } else {
+                    rule.action
+                },
                 evidence: truncate(&normalized.canonical, 120),
             });
         }
@@ -364,5 +476,113 @@ mod tests {
         let v = engine().inspect_with(&query("<script>alert(1)</script> union select 1"), &e);
         assert!(v.rule_ids().contains(&"sqli-union-select"));
         assert!(!v.rule_ids().contains(&"xss-script-tag"));
+    }
+
+    // ============================================================
+    // 应用级策略
+    // ============================================================
+
+    #[test]
+    fn category_off_skips_rule_entirely() {
+        let mut policy = ScanPolicy::default();
+        policy.set(Category::Sqli, CategoryMode::Off);
+
+        let v = engine().inspect_with_policy(&query("id=1 union select 1"), &Exemption::default(), &policy);
+        assert!(v.is_clean(), "关闭分类后不应记录: {:?}", v.rule_ids());
+        assert!(!v.blocked);
+    }
+
+    #[test]
+    fn category_monitor_records_but_never_blocks() {
+        let mut policy = ScanPolicy::default();
+        policy.set(Category::Sqli, CategoryMode::Monitor);
+
+        let v = engine().inspect_with_policy(&query("id=1 union select 1"), &Exemption::default(), &policy);
+        assert!(!v.is_clean(), "监控模式仍要记录");
+        assert!(v.score > 0);
+        assert_eq!(v.blocking_score, 0, "监控模式不计入拦截分");
+        assert!(!v.blocked);
+    }
+
+    #[test]
+    fn category_off_does_not_affect_other_categories() {
+        let mut policy = ScanPolicy::default();
+        policy.set(Category::Xss, CategoryMode::Off);
+
+        let v = engine().inspect_with_policy(&query("id=1 union select 1"), &Exemption::default(), &policy);
+        assert!(v.blocked, "关闭 XSS 不应影响 SQL 注入检测");
+    }
+
+    #[test]
+    fn policy_observe_mode_beats_engine_setting() {
+        let policy = ScanPolicy {
+            observe: true,
+            ..Default::default()
+        };
+
+        let v = engine().inspect_with_policy(&query("id=1 union select 1"), &Exemption::default(), &policy);
+        assert!(!v.blocked);
+        assert!(v.observe);
+    }
+
+    #[test]
+    fn policy_threshold_controls_blocking() {
+        let mut policy = ScanPolicy::all_block(200);
+        policy.observe = false;
+
+        let v = engine().inspect_with_policy(&query("id=1 union select 1"), &Exemption::default(), &policy);
+        assert!(!v.blocked, "阈值 200 时单条 High 不拦");
+    }
+
+    #[test]
+    fn all_off_policy_short_circuits() {
+        let mut policy = ScanPolicy::default();
+        for c in Category::ALL {
+            policy.set(c, CategoryMode::Off);
+        }
+        assert!(policy.all_off());
+        let v = engine().inspect_with_policy(&query("id=1 union select 1"), &Exemption::default(), &policy);
+        assert!(v.is_clean());
+    }
+
+    // ============================================================
+    // 订阅规则与影子期
+    // ============================================================
+
+    fn feed_rule(shadow: bool) -> RuleMeta {
+        RuleMeta {
+            id: "feed-shadow-test".to_string(),
+            name: "订阅测试规则".to_string(),
+            category: Category::Custom,
+            severity: Severity::Critical,
+            pattern: r"shadow-marker".to_string(),
+            targets: vec![Target::Query],
+            keywords: vec!["shadow-marker".to_string()],
+            action: Action::Block,
+            shadow,
+            source: RuleSource::Feed("test".to_string()),
+        }
+    }
+
+    #[test]
+    fn shadow_feed_rule_logs_but_never_blocks() {
+        let engine = Engine::with_extra_rules(vec![feed_rule(true)], false, 50).unwrap();
+        let v = engine.inspect(&query("shadow-marker"));
+
+        assert!(!v.is_clean(), "影子期规则仍然要记录");
+        assert_eq!(v.findings[0].action, Action::Log);
+        assert_eq!(v.score, Severity::Critical.score());
+        assert_eq!(v.blocking_score, 0, "影子期不计入拦截分");
+        assert!(!v.blocked);
+        assert!(v.rule_ids().contains(&"feed-shadow-test"));
+    }
+
+    #[test]
+    fn active_feed_rule_blocks_by_default() {
+        let engine = Engine::with_extra_rules(vec![feed_rule(false)], false, 50).unwrap();
+        let v = engine.inspect(&query("shadow-marker"));
+        assert!(v.blocked);
+        assert_eq!(v.blocking_score, Severity::Critical.score());
+        assert_eq!(v.findings[0].action, Action::Block);
     }
 }

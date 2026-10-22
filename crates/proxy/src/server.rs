@@ -12,9 +12,13 @@ use pingora::prelude::*;
 use pingora::proxy::Session;
 
 use homewaf_acl::{BanTable, Decision as AclDecision};
+use homewaf_config::RateLimitAction;
+use homewaf_limit::{ConnGuard, LimitParams};
 use homewaf_store::{BanRecord, Event, EventKind, Store};
 
+use crate::challenge::{self, ChallengeService, CHALLENGE_PATH, COOKIE_NAME};
 use crate::headers::{self, ForwardedCtx};
+use crate::metrics::{TrafficMetrics, TrafficSample};
 use crate::realip;
 use crate::reload::{RuntimeState, SharedState};
 use crate::upstream;
@@ -68,6 +72,10 @@ pub struct RequestCtx {
     pub ip_source: Option<crate::realip::IpSource>,
     /// 直连来源是否属于可信代理
     pub trusted_proxy: bool,
+    /// 命中的应用 ID（未匹配路由时为空）
+    pub app_id: String,
+    /// 本请求是否被 WAF 主动拦截，供流量统计区分“上游 4xx”和“WAF 拦截”
+    pub blocked: bool,
     /// 原始 Host（不含端口）
     pub original_host: String,
     /// `http` 或 `https`
@@ -87,6 +95,14 @@ pub struct RequestCtx {
     pub body_buffer: Option<homewaf_detect::BodyBuffer>,
     /// body 检测是否已判定拦截
     pub body_blocked: bool,
+    /// 本请求生效的检测策略（body 阶段继续使用）
+    pub scan_policy: homewaf_detect::ScanPolicy,
+    /// 本请求的白名单豁免（body 阶段继续使用）
+    pub exemption: Option<homewaf_detect::Exemption>,
+    /// 并发连接槽位，请求结束自动释放
+    pub conn_guard: Option<ConnGuard>,
+    /// 本请求是否已通过人机验证
+    pub challenge_passed: bool,
     /// 请求开始时间，用于统计
     pub start: Option<Instant>,
 }
@@ -97,16 +113,191 @@ pub struct WafProxy {
     bans: Arc<BanTable>,
     /// 持久化层。`None` 表示纯内存运行
     store: Option<Arc<Store>>,
+    /// 流量指标。与控制台共享同一个实例
+    metrics: Arc<TrafficMetrics>,
+    /// 人机验证签名服务（密钥进程内唯一，重启后旧凭据失效）
+    challenges: Arc<ChallengeService>,
 }
 
 impl WafProxy {
-    pub fn new(state: SharedState, bans: Arc<BanTable>, store: Option<Arc<Store>>) -> Self {
-        Self { state, bans, store }
+    pub fn new(
+        state: SharedState,
+        bans: Arc<BanTable>,
+        store: Option<Arc<Store>>,
+        metrics: Arc<TrafficMetrics>,
+    ) -> Self {
+        Self {
+            state,
+            bans,
+            store,
+            metrics,
+            challenges: Arc::new(ChallengeService::new()),
+        }
     }
 
     /// 当前状态快照（供测试与调试）。
     pub fn snapshot(&self) -> Arc<RuntimeState> {
         self.state.load_full()
+    }
+
+    /// 校验挑战回调，成功后下发 Cookie 并跳回原地址。
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_challenge_callback(
+        &self,
+        session: &mut Session,
+        state: &RuntimeState,
+        app: &str,
+        ip: Option<IpAddr>,
+        query: Option<&str>,
+        secure: bool,
+        request_id: &str,
+    ) -> Result<bool> {
+        let token = query.and_then(|q| query_param(q, "token"));
+        let nonce = query.and_then(|q| query_param(q, "nonce"));
+        let (Some(token), Some(nonce)) = (token, nonce) else {
+            return write_text(session, 400, "验证参数缺失").await;
+        };
+
+        let now = homewaf_acl::now_unix().max(0) as u64;
+        match self.challenges.verify(&token, &nonce, app, ip, now) {
+            Ok(payload) => {
+                let cookie = self.challenges.issue_cookie(&state.challenge, app, ip, now);
+                let ttl = state.challenge.ttl.as_secs();
+                let next = safe_next(payload.next());
+
+                let mut resp = ResponseHeader::build(303, None)?;
+                resp.insert_header("location", next)?;
+                resp.insert_header(
+                    "set-cookie",
+                    self.challenges.cookie_header(&cookie, ttl, secure),
+                )?;
+                resp.insert_header("content-length", "0")?;
+                resp.insert_header("cache-control", "no-store")?;
+                session.write_response_header(Box::new(resp), true).await?;
+
+                tracing::info!(
+                    target: "homewaf.security",
+
+                    req = %request_id,
+                    app,
+                    client_ip = ?ip,
+                    next,
+                    "人机验证通过"
+                );
+                Ok(true)
+            }
+            Err(e) => {
+                tracing::debug!(
+                    target: "homewaf.security",
+
+                    req = %request_id,
+                    app,
+                    client_ip = ?ip,
+                    error = %e,
+                    "人机验证失败"
+                );
+                write_text(session, 400, "验证失败，请刷新重试").await
+            }
+        }
+    }
+
+    /// 下发挑战页。状态码区分"普通要求验证"（403）与"CC 限流"（429）。
+    #[allow(clippy::too_many_arguments)]
+    async fn issue_challenge(
+        &self,
+        session: &mut Session,
+        state: &RuntimeState,
+        app: &str,
+        ip: Option<IpAddr>,
+        next: &str,
+        status: u16,
+    ) -> Result<bool> {
+        let now = homewaf_acl::now_unix().max(0) as u64;
+        let issued = self
+            .challenges
+            .issue(&state.challenge, app, ip, next, now);
+
+        tracing::info!(
+            target: "homewaf.security",
+
+            app,
+            client_ip = ?ip,
+            difficulty = issued.difficulty,
+            status,
+            "下发人机验证"
+        );
+
+        let mut resp = ResponseHeader::build(status, None)?;
+        resp.insert_header("content-type", "text/html; charset=utf-8")?;
+        resp.insert_header("content-length", issued.page.len().to_string())?;
+        resp.insert_header("cache-control", "no-store")?;
+        resp.insert_header("x-homewaf-challenge", issued.difficulty.to_string())?;
+
+        session
+            .write_response_header(Box::new(resp), false)
+            .await?;
+        session
+            .write_response_body(Some(Bytes::from(issued.page)), true)
+            .await?;
+        Ok(true)
+    }
+
+    /// 记录 CC 事件。`scope` 只用于把三层限流区分开。
+    #[allow(clippy::too_many_arguments)]
+    fn record_security_event(
+        &self,
+        ctx: &RequestCtx,
+        kind: EventKind,
+        app: &str,
+        path: &str,
+        rules: &str,
+        score: u32,
+        action: &str,
+    ) {
+        let Some(store) = &self.store else {
+            return;
+        };
+        let event = Event::new(
+            homewaf_acl::now_unix(),
+            kind,
+            ctx.client_ip.map(|i| i.to_string()).unwrap_or_default(),
+        )
+        .with_app(app.to_string())
+        .with_path(path.to_string())
+        .with_rules(rules.to_string())
+        .with_score(score)
+        .with_action(action.to_string());
+        if let Err(e) = store.insert_event(&event) {
+            tracing::warn!(error = %e, "写入安全事件失败");
+        }
+    }
+
+    fn record_rate_event(
+        &self,
+        ctx: &RequestCtx,
+        app: &str,
+        path: &str,
+        scope: homewaf_limit::Scope,
+        action: &str,
+        observed: u32,
+    ) {
+        let Some(store) = &self.store else {
+            return;
+        };
+        let now = homewaf_acl::now_unix();
+        let event = Event::new(
+            now,
+            EventKind::RateLimit,
+            ctx.client_ip.map(|i| i.to_string()).unwrap_or_default(),
+        )
+        .with_app(app.to_string())
+        .with_path(path.to_string())
+        .with_rules(format!("cc-{}", scope.as_str()))
+        .with_score(observed)
+        .with_action(action.to_string());
+        if let Err(e) = store.insert_event(&event) {
+            tracing::warn!(error = %e, "写入 CC 事件失败");
+        }
     }
 }
 
@@ -141,11 +332,39 @@ impl ProxyHttp for WafProxy {
             .map(|d| d.ssl_digest.is_some())
             .unwrap_or(false);
 
-        let req = session.req_header();
-        let raw_host = extract_host(req);
+        // 一次性把请求信息取成拥有型数据，后面要跨 await 使用
+        let (raw_host, method, path, uri_path, query, user_agent, cookie_header, content_type, content_length) = {
+            let req = session.req_header();
+            (
+                extract_host(req),
+                req.method.as_str().to_string(),
+                req.uri
+                    .path_and_query()
+                    .map(|pq| pq.as_str().to_string())
+                    .unwrap_or_else(|| "/".to_string()),
+                req.uri.path().to_string(),
+                req.uri.query().map(|q| q.to_string()),
+                req.headers
+                    .get("user-agent")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_string()),
+                req.headers
+                    .get("cookie")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_string()),
+                req.headers
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_string()),
+                req.headers
+                    .get("content-length")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<u64>().ok()),
+            )
+        };
 
         // 真实 IP 还原
-        let client = realip::resolve(direct.as_ref(), &req.headers, &state.real_ip);
+        let client = realip::resolve(direct.as_ref(), &session.req_header().headers, &state.real_ip);
         if let Some(c) = client {
             ctx.client_ip = Some(c.real);
             ctx.direct_ip = Some(c.direct);
@@ -161,24 +380,20 @@ impl ProxyHttp for WafProxy {
         ctx.port = port;
         ctx.scheme = scheme;
 
-        let path = req
-            .uri
-            .path_and_query()
-            .map(|pq| pq.as_str())
-            .unwrap_or("/");
-
-        let Some(hit) = state.router.resolve(&host, port, path) else {
+        let Some(hit) = state.router.resolve(&host, port, &path) else {
             // 未配置的域名：返回 404，不泄露任何后端指纹
-            let mut resp = ResponseHeader::build(404, None)?;
-            resp.insert_header("content-length", "0")?;
-            session.write_response_header(Box::new(resp), true).await?;
-            return Ok(true);
+            return write_empty(session, 404).await;
         };
 
         let app = state
             .router
             .app(hit.app_index)
             .expect("路由返回的应用索引必然有效");
+        let Some(policy) = state.policies.resolve(hit.app_index, hit.route_index) else {
+            tracing::error!(app = %app.id, "应用策略缺失，拒绝请求");
+            return write_empty(session, 500).await;
+        };
+        ctx.app_id = app.id.clone();
 
         // ACL：用还原后的真实 IP 判定，而不是直连 IP
         if let Some(ip) = ctx.client_ip {
@@ -194,11 +409,18 @@ impl ProxyHttp for WafProxy {
                         reason = %desc,
                         "拒绝"
                     );
+                    self.record_security_event(
+                        ctx,
+                        EventKind::Acl,
+                        &app.id,
+                        &hit.normalized_path,
+                        &desc,
+                        0,
+                        "block",
+                    );
                     ctx.acl_reason = Some(desc);
-                    let mut resp = ResponseHeader::build(403, None)?;
-                    resp.insert_header("content-length", "0")?;
-                    session.write_response_header(Box::new(resp), true).await?;
-                    return Ok(true);
+                    ctx.blocked = true;
+                    return write_empty(session, 403).await;
                 }
                 AclDecision::Allow(reason) => {
                     ctx.acl_reason = Some(reason.describe());
@@ -222,40 +444,314 @@ impl ProxyHttp for WafProxy {
                     offenses = status.offenses,
                     "处于自动封禁中，拒绝"
                 );
+                self.record_security_event(
+                    ctx,
+                    EventKind::Ban,
+                    &app.id,
+                    &hit.normalized_path,
+                    "自动封禁",
+                    status.offenses,
+                    "block",
+                );
                 ctx.acl_reason = Some("自动封禁".to_string());
-                let mut resp = ResponseHeader::build(403, None)?;
+                ctx.blocked = true;
+                return write_empty(session, 403).await;
+            }
+        }
+
+        // CIDR 策略：deny 优先，allow 非空时只允许列表内地址
+        if let Some(ip) = ctx.client_ip {
+            let denied = policy.deny_cidr.iter().any(|net| net.contains(&ip));
+            let outside_allow =
+                !policy.allow_cidr.is_empty() && !policy.allow_cidr.iter().any(|net| net.contains(&ip));
+            if denied || outside_allow {
+                tracing::info!(
+                    target: "homewaf.security",
+
+                    req = %ctx.request_id,
+                    client_ip = %ip,
+                    app = %app.id,
+                    denied,
+                    outside_allow,
+                    "被应用 CIDR 策略拒绝"
+                );
+                let reason = if denied {
+                    "命中 deny_cidr"
+                } else {
+                    "不在 allow_cidr 内"
+                };
+                self.record_security_event(
+                    ctx,
+                    EventKind::Acl,
+                    &app.id,
+                    &hit.normalized_path,
+                    reason,
+                    0,
+                    "block",
+                );
+                ctx.acl_reason = Some(reason.to_string());
+                ctx.blocked = true;
+                return write_empty(session, 403).await;
+            }
+        }
+
+        // 人机验证回调：校验令牌 + 工作量证明，通过后下发 Cookie 并跳回原地址
+        if uri_path == CHALLENGE_PATH {
+            return self
+                .handle_challenge_callback(
+                    session,
+                    &state,
+                    &app.id,
+                    ctx.client_ip,
+                    query.as_deref(),
+                    scheme == "https",
+                    &ctx.request_id,
+                )
+                .await;
+        }
+
+        // 路由级方法限制
+        if let Some(methods) = &policy.allow_methods {
+            let method_allowed = methods.iter().any(|m| m == &method)
+                || (method == "HEAD" && methods.iter().any(|m| m == "GET"));
+            if !method_allowed {
+                tracing::info!(
+                    target: "homewaf.security",
+
+                    req = %ctx.request_id,
+                    method = %method,
+                    allowed = ?methods,
+                    app = %app.id,
+                    "方法不被允许"
+                );
+                self.record_security_event(
+                    ctx,
+                    EventKind::Acl,
+                    &app.id,
+                    &hit.normalized_path,
+                    "method-not-allowed",
+                    0,
+                    "block",
+                );
+                ctx.blocked = true;
+                let mut resp = ResponseHeader::build(405, None)?;
+                resp.insert_header("allow", methods.join(", "))?;
                 resp.insert_header("content-length", "0")?;
                 session.write_response_header(Box::new(resp), true).await?;
                 return Ok(true);
             }
         }
 
+        // 请求体上限（明确的策略声明，超过直接 413）
+        if let Some(len) = content_length {
+            if len > policy.max_body_size {
+                tracing::info!(
+                    target: "homewaf.security",
+
+                    req = %ctx.request_id,
+                    content_length = len,
+                    max_body_size = policy.max_body_size,
+                    app = %app.id,
+                    "请求体超过应用策略上限"
+                );
+                self.record_security_event(
+                    ctx,
+                    EventKind::Acl,
+                    &app.id,
+                    &hit.normalized_path,
+                    "body-too-large",
+                    0,
+                    "block",
+                );
+                ctx.blocked = true;
+                return write_text(session, 413, "请求体过大").await;
+            }
+        }
+
+        // 已通过的人机验证凭据
+        let now_secs = homewaf_acl::now_unix().max(0) as u64;
+        let challenge_passed = cookie_header
+            .as_deref()
+            .and_then(|h| challenge::cookie_value(Some(h), COOKIE_NAME))
+            .map(|v| self.challenges.verify_cookie(v, &app.id, ctx.client_ip, now_secs))
+            .unwrap_or(false);
+        ctx.challenge_passed = challenge_passed;
+
+        // 应用/路由要求人机验证
+        if policy.require_challenge && !challenge_passed && !ctx.acl_allowed {
+            self.record_security_event(
+                ctx,
+                EventKind::Challenge,
+                &app.id,
+                &hit.normalized_path,
+                "challenge",
+                0,
+                "block",
+            );
+            ctx.blocked = true;
+            if state.challenge.enabled {
+                return self
+                    .issue_challenge(
+                        session,
+                        &state,
+                        &app.id,
+                        ctx.client_ip,
+                        &path,
+                        403,
+                    )
+                    .await;
+            }
+            // 要求挑战但挑战功能被关闭：保守拦截，而不是静默放行
+            tracing::warn!(
+                target: "homewaf.security",
+
+                req = %ctx.request_id,
+                app = %app.id,
+                "require_challenge 已开启但 challenge.enabled=false，按拦截处理"
+            );
+            return write_text(session, 403, "人机验证未启用").await;
+        }
+
+        // CC 防护：ACL 明确放行的地址不参与限流
+        if !ctx.acl_allowed {
+            if let Some(action) = policy.limit_action() {
+                let params = LimitParams {
+                    global_qps: policy.ratelimit.global_qps,
+                    per_ip_qps: policy.ratelimit.per_ip_qps,
+                    per_url_qps: policy.ratelimit.per_url_qps,
+                };
+
+                // 只有开了单 URL 限流才拼 key，避免每个请求都分配字符串
+                let url_key = (params.per_url_qps > 0)
+                    .then(|| format!("{}\0{}", app.id, hit.normalized_path));
+                let qps_hit = state
+                    .limiter
+                    .check(ctx.client_ip, url_key.as_deref(), params);
+
+                if let Some(hit_limit) = qps_hit {
+                    let blocked = match action {
+                        RateLimitAction::Log => false,
+                        RateLimitAction::Block => true,
+                        RateLimitAction::Challenge => {
+                            if !state.challenge.enabled || challenge_passed {
+                                true
+                            } else {
+                                ctx.conn_guard.take();
+                                self.record_rate_event(
+                                    ctx,
+                                    &app.id,
+                                    &hit.normalized_path,
+                                    hit_limit.scope,
+                                    "block",
+                                    hit_limit.observed,
+                                );
+                                self.record_security_event(
+                                    ctx,
+                                    EventKind::Challenge,
+                                    &app.id,
+                                    &hit.normalized_path,
+                                    "cc-challenge",
+                                    hit_limit.observed,
+                                    "block",
+                                );
+                                ctx.blocked = true;
+                                return self
+                                    .issue_challenge(
+                                        session,
+                                        &state,
+                                        &app.id,
+                                        ctx.client_ip,
+                                        &path,
+                                        429,
+                                    )
+                                    .await;
+                            }
+                        }
+                    };
+
+                    tracing::warn!(
+                        target: "homewaf.security",
+
+                        req = %ctx.request_id,
+                        client_ip = ?ctx.client_ip,
+                        app = %app.id,
+                        scope = hit_limit.scope.as_str(),
+                        limit = hit_limit.limit,
+                        observed = hit_limit.observed,
+                        action = ?action,
+                        blocked,
+                        "CC 防护触发"
+                    );
+                    self.record_rate_event(
+                        ctx,
+                        &app.id,
+                        &hit.normalized_path,
+                        hit_limit.scope,
+                        if blocked { "block" } else { "log" },
+                        hit_limit.observed,
+                    );
+
+                    if blocked {
+                        ctx.blocked = true;
+                        let body = "请求过于频繁，请稍后再试";
+                        let mut resp = ResponseHeader::build(429, None)?;
+                        resp.insert_header("content-type", "text/plain; charset=utf-8")?;
+                        resp.insert_header("content-length", body.len().to_string())?;
+                        resp.insert_header("retry-after", "1")?;
+                        resp.insert_header("cache-control", "no-store")?;
+                        session.write_response_header(Box::new(resp), false).await?;
+                        session
+                            .write_response_body(Some(Bytes::from_static(body.as_bytes())), true)
+                            .await?;
+                        return Ok(true);
+                    }
+                }
+
+                // 并发连接数单独限制；Log 模式不拒绝连接
+                if action != RateLimitAction::Log {
+                    if let Some(ip) = ctx.client_ip {
+                        match state
+                            .limiter
+                            .try_acquire_conn(ip, policy.ratelimit.per_ip_conn)
+                        {
+                            Some(guard) => ctx.conn_guard = Some(guard),
+                            None => {
+                                tracing::warn!(
+                                    target: "homewaf.security",
+
+                                    req = %ctx.request_id,
+                                    client_ip = %ip,
+                                    app = %app.id,
+                                    limit = policy.ratelimit.per_ip_conn,
+                                    "并发连接数超限"
+                                );
+                                self.record_rate_event(
+                                    ctx,
+                                    &app.id,
+                                    &hit.normalized_path,
+                                    homewaf_limit::Scope::Ip,
+                                    "block",
+                                    policy.ratelimit.per_ip_conn,
+                                );
+                                ctx.blocked = true;
+                                return write_text(session, 429, "并发连接数过多").await;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // 应用层攻击检测。
         // 用规范化后的路径——检测与转发必须看到同一个路径，否则又是一条绕过。
-        let query = req.uri.query().map(|q| q.to_string());
-        let user_agent = req
-            .headers
-            .get("user-agent")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-        let cookie = req
-            .headers
-            .get("cookie")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-
-        // 决定是否需要检测请求体。二进制与上传类跳过，避免误报与无谓开销
-        let method = req.method.as_str();
-        let content_type = req
-            .headers
-            .get("content-type")
-            .and_then(|v| v.to_str().ok());
-        if method != "GET"
-            && method != "HEAD"
-            && homewaf_detect::should_inspect_content_type(content_type)
+        let method_is_bodyless = method == "GET" || method == "HEAD";
+        if !method_is_bodyless && homewaf_detect::should_inspect_content_type(content_type.as_deref())
         {
-            ctx.body_buffer =
-                Some(homewaf_detect::BodyBuffer::new(homewaf_detect::DEFAULT_MAX_INSPECT_BYTES));
+            let cap = policy
+                .max_body_size
+                .min(homewaf_detect::DEFAULT_MAX_INSPECT_BYTES as u64)
+                .max(1) as usize;
+            ctx.body_buffer = Some(homewaf_detect::BodyBuffer::new(cap));
         }
 
         // 先算白名单豁免：命中的路径/规则不再检测
@@ -265,16 +761,21 @@ impl ProxyHttp for WafProxy {
             &hit.normalized_path,
         );
 
-        let verdict = state.engine.inspect_with(
+        let verdict = state.engine.inspect_with_policy(
             &homewaf_detect::InspectionInput {
                 path: hit.normalized_path.clone(),
                 query: query.clone(),
                 user_agent,
-                cookie,
+                cookie: cookie_header,
                 ..Default::default()
             },
             &exemption,
+            &policy.scan,
         );
+
+        // body 阶段继续使用同一份策略与豁免
+        ctx.scan_policy = policy.scan;
+        ctx.exemption = Some(exemption.clone());
 
         if !verdict.is_clean() {
             tracing::warn!(
@@ -291,8 +792,6 @@ impl ProxyHttp for WafProxy {
                 path = %hit.normalized_path,
                 "检测命中"
             );
-
-            let now_secs = homewaf_acl::now_unix().max(0) as u64;
 
             // 记录事件（控制台与事后溯源的数据来源）
             if let Some(store) = &self.store {
@@ -323,6 +822,15 @@ impl ProxyHttp for WafProxy {
             if !verdict.observe {
                 if let Some(ip) = ctx.client_ip {
                     if let Some(outcome) = self.bans.record(ip, verdict.blocking_score, now_secs) {
+                        self.record_security_event(
+                            ctx,
+                            EventKind::Ban,
+                            &app.id,
+                            &hit.normalized_path,
+                            &verdict.rule_ids().join(","),
+                            verdict.score,
+                            "ban",
+                        );
                         tracing::warn!(
                             target: "homewaf.security",
 
@@ -354,10 +862,8 @@ impl ProxyHttp for WafProxy {
         }
 
         if verdict.blocked {
-            let mut resp = ResponseHeader::build(403, None)?;
-            resp.insert_header("content-length", "0")?;
-            session.write_response_header(Box::new(resp), true).await?;
-            return Ok(true);
+            ctx.blocked = true;
+            return write_empty(session, 403).await;
         }
 
         let upstreams = state
@@ -367,10 +873,7 @@ impl ProxyHttp for WafProxy {
             .unwrap_or(&app.upstreams);
 
         if upstreams.is_empty() {
-            let mut resp = ResponseHeader::build(502, None)?;
-            resp.insert_header("content-length", "0")?;
-            session.write_response_header(Box::new(resp), true).await?;
-            return Ok(true);
+            return write_empty(session, 502).await;
         }
 
         // 从上游池里按负载均衡算法选一个
@@ -469,6 +972,7 @@ impl ProxyHttp for WafProxy {
         end_of_stream: bool,
         ctx: &mut Self::CTX,
     ) -> Result<()> {
+        let policy = ctx.scan_policy;
         let (Some(buffer), Some(state)) = (ctx.body_buffer.as_mut(), ctx.state.as_ref()) else {
             return Ok(());
         };
@@ -486,10 +990,16 @@ impl ProxyHttp for WafProxy {
             return Ok(());
         }
 
-        let verdict = state.engine.inspect(&homewaf_detect::InspectionInput {
-            body: Some(text.to_string()),
-            ..Default::default()
-        });
+        let empty = homewaf_detect::Exemption::default();
+        let exemption = ctx.exemption.as_ref().unwrap_or(&empty);
+        let verdict = state.engine.inspect_with_policy(
+            &homewaf_detect::InspectionInput {
+                body: Some(text.to_string()),
+                ..Default::default()
+            },
+            exemption,
+            &policy,
+        );
 
         if verdict.is_clean() {
             return Ok(());
@@ -511,6 +1021,7 @@ impl ProxyHttp for WafProxy {
 
         if verdict.blocked {
             ctx.body_blocked = true;
+            ctx.blocked = true;
             let mut resp = ResponseHeader::build(403, None)?;
             resp.insert_header("content-length", "0")?;
             session.write_response_header(Box::new(resp), true).await?;
@@ -609,6 +1120,38 @@ impl ProxyHttp for WafProxy {
             );
         }
 
+        // 流量指标：记录在日志之前，避免日志 IO 抖动影响统计归属。
+        {
+            let req = session.req_header();
+            let ua = req
+                .headers
+                .get("user-agent")
+                .and_then(|v| v.to_str().ok());
+            let referer = req.headers.get("referer").and_then(|v| v.to_str().ok());
+            let host = if ctx.original_host.is_empty() {
+                strip_port(&extract_host(req))
+            } else {
+                ctx.original_host.clone()
+            };
+            let path = if ctx.normalized_path.is_empty() {
+                req.uri.path()
+            } else {
+                ctx.normalized_path.as_str()
+            };
+            self.metrics.record(TrafficSample {
+                ts: homewaf_acl::now_unix(),
+                app: &ctx.app_id,
+                host: &host,
+                path,
+                method: method.as_str(),
+                status,
+                ip: ctx.client_ip,
+                user_agent: ua,
+                referer,
+                blocked: ctx.blocked,
+            });
+        }
+
         tracing::info!(
             target: "homewaf.access",
 
@@ -694,6 +1237,93 @@ async fn service_unavailable(session: &mut Session) -> Result<bool> {
     Ok(true)
 }
 
+/// 写一个空响应体的状态码。
+async fn write_empty(session: &mut Session, status: u16) -> Result<bool> {
+    let mut resp = ResponseHeader::build(status, None)?;
+    resp.insert_header("content-length", "0")?;
+    session.write_response_header(Box::new(resp), true).await?;
+    Ok(true)
+}
+
+/// 写一个纯文本响应。内容固定，不回显任何用户输入。
+async fn write_text(session: &mut Session, status: u16, body: &str) -> Result<bool> {
+    let mut resp = ResponseHeader::build(status, None)?;
+    resp.insert_header("content-type", "text/plain; charset=utf-8")?;
+    resp.insert_header("content-length", body.len().to_string())?;
+    resp.insert_header("cache-control", "no-store")?;
+    session
+        .write_response_header(Box::new(resp), false)
+        .await?;
+    session
+        .write_response_body(Some(Bytes::copy_from_slice(body.as_bytes())), true)
+        .await?;
+    Ok(true)
+}
+
+/// 只接受站内绝对路径，防止验证后被重定向到外部站点。
+fn safe_next(next: &str) -> &str {
+    if next.starts_with('/')
+        && !next.starts_with("//")
+        && !next.contains('\r')
+        && !next.contains('\n')
+    {
+        next
+    } else {
+        "/"
+    }
+}
+
+/// 取查询参数并做百分号解码。
+fn query_param(query: &str, key: &str) -> Option<String> {
+    for pair in query.split('&') {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        if percent_decode(k) == key {
+            return Some(percent_decode(v));
+        }
+    }
+    None
+}
+
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                match (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                    (Some(hi), Some(lo)) => {
+                        out.push(hi * 16 + lo);
+                        i += 3;
+                    }
+                    _ => {
+                        out.push(bytes[i]);
+                        i += 1;
+                    }
+                }
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
 /// 从请求中提取 Host：优先 URI authority（HTTP/2 的 `:authority`），其次 `Host` 头。
 fn extract_host(req: &pingora::http::RequestHeader) -> String {
     if let Some(authority) = req.uri.authority() {
@@ -750,6 +1380,8 @@ pub struct ProxySettings {
     pub store: Option<Arc<Store>>,
     /// 封禁表。由调用方创建，因为控制台也要读写它
     pub bans: Arc<BanTable>,
+    /// 流量指标。由调用方创建，因为控制台要读同一份数据
+    pub metrics: Arc<TrafficMetrics>,
     /// 配置文件路径。`Some` 时启用热重载
     pub watch_path: Option<std::path::PathBuf>,
     /// 热重载是否允许正则路由
@@ -840,10 +1472,52 @@ pub fn run(state: SharedState, settings: ProxySettings) -> anyhow::Result<()> {
                     Ok(_) => {}
                     Err(e) => tracing::warn!(error = %e, "清理封禁失败"),
                 }
+                let traffic_cutoff = now - retention_days.max(30) * 86_400;
+                match store.prune_traffic(traffic_cutoff) {
+                    Ok(n) if n > 0 => tracing::info!(removed = n, "清理过期流量聚合"),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(error = %e, "清理流量聚合失败"),
+                }
 
                 std::thread::sleep(std::time::Duration::from_secs(3_600));
             })
             .expect("启动清理线程失败");
+    }
+
+    // 流量聚合落库：每分钟重写最近 5 分钟，既幂等又能补上晚到的日志。
+    if let Some(store) = store.clone() {
+        let metrics = settings.metrics.clone();
+        std::thread::Builder::new()
+            .name("homewaf-traffic-flusher".to_string())
+            .spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_secs(60));
+                let now = homewaf_acl::now_unix();
+                let minute = now - now.rem_euclid(60);
+                let buckets = metrics.completed_buckets(minute - 300, minute);
+                if buckets.is_empty() {
+                    continue;
+                }
+                let rows: Vec<homewaf_store::TrafficBucketRow> = buckets
+                    .into_iter()
+                    .map(|b| homewaf_store::TrafficBucketRow {
+                        minute: b.minute,
+                        app: b.app,
+                        requests: b.requests,
+                        pv: b.pv,
+                        blocked: b.blocked,
+                        status_4xx: b.status_4xx,
+                        status_5xx: b.status_5xx,
+                        unique_ips: b.unique_ips,
+                        unique_visitors: b.unique_visitors,
+                        ips: b.ips,
+                        visitors: b.visitors,
+                    })
+                    .collect();
+                if let Err(e) = store.save_traffic(&rows) {
+                    tracing::warn!(error = %e, "写入流量聚合失败");
+                }
+            })
+            .expect("启动流量持久化线程失败");
     }
 
     if let Some(path) = settings.watch_path.clone() {
@@ -861,7 +1535,12 @@ pub fn run(state: SharedState, settings: ProxySettings) -> anyhow::Result<()> {
         );
     }
 
-    let proxy = WafProxy::new(state.clone(), bans, store);
+    let proxy = WafProxy::new(
+        state.clone(),
+        bans,
+        store,
+        settings.metrics.clone(),
+    );
 
     // 有应用启用主动健康检查时才起线程
     let hc_interval = state.load_full().pool.probe_interval();

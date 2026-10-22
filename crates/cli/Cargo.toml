@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 homewaf-config = { path = "../config" }
+homewaf-detect = { path = "../detect" }
 homewaf-router = { path = "../router" }
 homewaf-acl = { path = "../acl" }
 homewaf-store = { path = "../store" }

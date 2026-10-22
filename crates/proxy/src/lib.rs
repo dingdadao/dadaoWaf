@@ -6,17 +6,31 @@
 //! - 还原真实客户端 IP 并注入转发头
 //! - 请求/响应生命周期钩子（后续接入检测引擎）
 
+pub mod challenge;
 pub mod headers;
+pub mod metrics;
+pub mod policy;
 pub mod realip;
 pub mod reload;
+pub mod rulefeed;
 mod server;
 pub mod upstream;
 
+pub use challenge::{ChallengeService, CHALLENGE_PATH, COOKIE_NAME};
 pub use headers::ForwardedCtx;
+pub use metrics::{
+    BucketSnapshot, Count as TrafficCount, DashboardData as TrafficDashboard, Point as TrafficPoint,
+    TrafficMetrics, TrafficSample,
+};
+pub use policy::{EffectivePolicy, PolicySet};
 pub use realip::{ClientIp, IpSource};
 pub use reload::{
-    load_state, load_state_from_db, open_store, shared, spawn_watcher, RuntimeState, SharedState,
-    SqliteFeedState,
+    load_state, load_state_from_db, load_state_from_db_with, open_store, shared, spawn_watcher,
+    RuntimeState, SharedState, SqliteFeedState,
+};
+pub use rulefeed::{
+    load_rule_feed_configs, rule_feeds_due, HttpRuleFeedFetcher, NoRuleFeedCache, RuleFeedCache,
+    RuleFeedLoad, RuleFeedStatus, StoreRuleFeedCache, RULE_FEEDS_SETTING,
 };
 pub use server::{run, ProxySettings, WafProxy};
 pub use upstream::{Selection, UpstreamPool};

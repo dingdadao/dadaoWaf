@@ -11,5 +11,9 @@ homewaf-config = { path = "../config" }
 regex = "1"
 aho-corasick = "1"
 serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
 thiserror.workspace = true
 tracing = "0.1"
+# 规则包 Ed25519 验签。rustls 已依赖 ring，不新增下载
+ring = "0.17"

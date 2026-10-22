@@ -12,6 +12,7 @@ homewaf-store = { path = "../store" }
 homewaf-acl = { path = "../acl" }
 homewaf-router = { path = "../router" }
 homewaf-detect = { path = "../detect" }
+homewaf-limit = { path = "../limit" }
 homewaf-proxy = { path = "../proxy" }
 ipnet.workspace = true
 axum = "0.8"
@@ -20,3 +21,4 @@ tokio = { workspace = true, features = ["rt-multi-thread", "net", "macros", "tim
 serde.workspace = true
 serde_json.workspace = true
 tracing = "0.1"
+maxminddb = "0.32.0"

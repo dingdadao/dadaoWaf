@@ -14,10 +14,12 @@ use arc_swap::ArcSwap;
 use homewaf_acl::{Acl, FeedState};
 use homewaf_config::{Config, RealIpConfig, TlsConfig};
 use homewaf_detect::Engine;
+use homewaf_limit::RateLimiter;
 use homewaf_router::Router;
 use homewaf_store::Store;
 use ipnet::IpNet;
 
+use crate::policy::PolicySet;
 use crate::upstream::UpstreamPool;
 
 /// 基于 SQLite 的订阅状态存储。
@@ -70,6 +72,12 @@ pub struct RuntimeState {
     pub real_ip: RealIpConfig,
     /// 检测引擎
     pub engine: Engine,
+    /// 应用/路由级策略（检测开关、限流、CIDR、方法限制等）
+    pub policies: PolicySet,
+    /// CC 防护运行时。热重载会重建，窗口计数随之清零
+    pub limiter: Arc<RateLimiter>,
+    /// 人机验证参数
+    pub challenge: homewaf_config::ChallengeConfig,
     /// 检测白名单（误报豁免）
     pub whitelist: Vec<homewaf_detect::WhitelistRule>,
     /// 自动封禁参数（热重载时同步给 BanTable）
@@ -82,6 +90,8 @@ pub struct RuntimeState {
     pub tls: TlsConfig,
     /// 订阅加载失败的组，用于状态展示
     pub feed_failures: Vec<(String, String)>,
+    /// 规则包订阅状态，用于控制台展示
+    pub rule_feeds: Vec<crate::rulefeed::RuleFeedStatus>,
 }
 
 impl RuntimeState {
@@ -90,6 +100,8 @@ impl RuntimeState {
         config: Config,
         allow_regex: bool,
         feed_state: &dyn FeedState,
+        rule_cache: &dyn crate::rulefeed::RuleFeedCache,
+        force_rule_feeds: bool,
     ) -> Result<Self, String> {
         let (feed_rules, feed_failures) =
             homewaf_acl::load_enabled_groups(&config.ip_groups, feed_state);
@@ -98,15 +110,32 @@ impl RuntimeState {
         rules.extend(feed_rules);
         let acl = Acl::build(&config.acl, &rules, homewaf_acl::now_unix());
 
+        // 规则包要先于 Router 加载：applications 会被移进 Router。
+        let rule_feeds = crate::rulefeed::load_rule_feeds(
+            &config.rule_feeds,
+            rule_cache,
+            &crate::rulefeed::HttpRuleFeedFetcher,
+            force_rule_feeds,
+            homewaf_acl::now_unix(),
+        );
+
         // 上游池要在 applications 被移进 Router 之前构建
         let pool = UpstreamPool::build(&config.applications);
+        let policies = PolicySet::build(
+            &config.applications,
+            &config.protection,
+            config.ratelimit,
+            &config.limits,
+        );
         let router =
             Router::build(config.applications, allow_regex).map_err(|e| e.to_string())?;
 
-        let engine = Engine::new(
+        let engine = Engine::with_extra_rules(
+            rule_feeds.rules,
             config.protection.observe_mode.enabled,
             config.protection.block_threshold.unwrap_or(50),
-        );
+        )
+        .map_err(|e| format!("规则包加载失败：{e}"))?;
 
         Ok(Self {
             router,
@@ -114,12 +143,16 @@ impl RuntimeState {
             pool,
             real_ip: config.real_ip,
             engine,
+            policies,
+            limiter: Arc::new(RateLimiter::new()),
+            challenge: config.challenge,
             whitelist: Vec::new(),
             auto_ban: config.acl.auto_ban.clone(),
             ipv6_prefix: config.acl.ipv6_prefix_match,
             server: config.server,
             tls: config.tls,
             feed_failures,
+            rule_feeds: rule_feeds.statuses,
         })
     }
 
@@ -149,6 +182,15 @@ pub fn shared(state: RuntimeState) -> SharedState {
 /// **这是唯一的配置来源**——进程启动后不再读任何配置文件。
 /// 引导参数（DB 路径、监听地址）来自命令行，其余全部在库里。
 pub fn load_state_from_db(store: &Store, allow_regex: bool) -> Result<RuntimeState, String> {
+    load_state_from_db_with(store, allow_regex, false)
+}
+
+/// 同上，但可以强制重新拉取全部规则包（控制台手动刷新）。
+pub fn load_state_from_db_with(
+    store: &Store,
+    allow_regex: bool,
+    force_rule_feeds: bool,
+) -> Result<RuntimeState, String> {
     // 应用
     let applications = store
         .list_applications()
@@ -178,8 +220,10 @@ pub fn load_state_from_db(store: &Store, allow_regex: bool) -> Result<RuntimeSta
     load_setting!("acl", config.acl);
     load_setting!("limits", config.limits);
     load_setting!("ratelimit", config.ratelimit);
+    load_setting!("challenge", config.challenge);
     load_setting!("logging", config.logging);
     load_setting!("storage", config.storage);
+    load_setting!("rule_feeds", config.rule_feeds);
 
     // ACL 静态规则
     let rows = store
@@ -233,7 +277,14 @@ pub fn load_state_from_db(store: &Store, allow_regex: bool) -> Result<RuntimeSta
     }
 
     let feed_state = SqliteFeedState::new(store);
-    let mut state = RuntimeState::build(config, allow_regex, &feed_state)?;
+    let rule_cache = crate::rulefeed::StoreRuleFeedCache::new(store);
+    let mut state = RuntimeState::build(
+        config,
+        allow_regex,
+        &feed_state,
+        &rule_cache,
+        force_rule_feeds,
+    )?;
 
     // 白名单不在 Config 里，直接从库里读
     state.whitelist = store
@@ -271,7 +322,14 @@ pub fn load_state(
         return Err(format!("配置校验失败：{detail}"));
     }
 
-    RuntimeState::build(config, allow_regex, feed_state)
+    // 文件模式没有缓存，每次重载都重新拉取；否则改配置后订阅规则不会更新
+    RuntimeState::build(
+        config,
+        allow_regex,
+        feed_state,
+        &crate::rulefeed::NoRuleFeedCache,
+        true,
+    )
 }
 
 /// 打开持久化层。失败时降级为纯内存模式，**不阻塞启动**。

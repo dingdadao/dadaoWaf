@@ -68,6 +68,8 @@ pub fn validate(config: &Config) -> ValidationReport {
     validate_real_ip(&config.real_ip, &mut ctx);
     validate_limits(&config.limits, &mut ctx);
     validate_protection(&config.protection, "protection", &mut ctx);
+    validate_ratelimit(&config.ratelimit, "ratelimit", &mut ctx);
+    validate_challenge(&config.challenge, &mut ctx);
     validate_acl(&config.acl, &config.applications, &mut ctx);
     validate_ip_groups(&config.ip_groups, &config.applications, &mut ctx);
     validate_rule_feeds(&config.rule_feeds, &mut ctx);
@@ -328,6 +330,34 @@ fn validate_protection(p: &ProtectionConfig, base: &str, ctx: &mut Ctx) {
     }
 }
 
+fn validate_ratelimit(r: &RateLimitConfig, base: &str, ctx: &mut Ctx) {
+    if r.enabled && r.global_qps == 0 && r.per_ip_qps == 0 && r.per_ip_conn == 0 && r.per_url_qps == 0
+    {
+        ctx.warn(
+            base,
+            "CC 防护已启用但四层阈值全为 0，等于不限制",
+        );
+    }
+}
+
+fn validate_challenge(c: &ChallengeConfig, ctx: &mut Ctx) {
+    if c.difficulty == 0 || c.difficulty > 8 {
+        ctx.error(
+            "challenge.difficulty",
+            "难度需在 1-8 之间（前导零的十六进制位数）",
+        );
+    }
+    if c.ttl.as_secs() == 0 {
+        ctx.error("challenge.ttl", "挑战有效期不能为 0");
+    }
+    if c.enabled && c.difficulty > 5 {
+        ctx.warn(
+            "challenge.difficulty",
+            "难度超过 5 会让性能较弱的手机/平板验证耗时超过数秒",
+        );
+    }
+}
+
 // ============================================================
 // ACL
 // ============================================================
@@ -492,14 +522,77 @@ fn validate_rule_feeds(feeds: &[RuleFeed], ctx: &mut Ctx) {
         if !f.url.starts_with("https://") {
             ctx.error(format!("{base}.url"), "规则包地址必须使用 HTTPS");
         }
+        if f.name.chars().count() > 64 {
+            ctx.error(format!("{base}.name"), "订阅名称不能超过 64 个字符");
+        }
+        if !f
+            .name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            ctx.error(
+                format!("{base}.name"),
+                "订阅名称只能包含字母、数字、横线和下划线",
+            );
+        }
         if f.require_signature && f.public_key.is_none() {
             ctx.error(format!("{base}.public_key"), "要求验签时必须提供公钥");
         }
-        if f.channel == FeedChannel::Pinned && f.pinned_version.is_none() {
+        if let Some(key) = &f.public_key {
+            if !is_valid_ed25519_key(key) {
+                ctx.error(
+                    format!("{base}.public_key"),
+                    "公钥格式应为 `ed25519:<base64>`（32 字节）",
+                );
+            }
+        }
+        if f.channel == FeedChannel::Pinned && f.pinned_version.as_deref().unwrap_or("").is_empty()
+        {
             ctx.error(
                 format!("{base}.pinned_version"),
                 "channel 为 pinned 时必须指定版本号",
             );
+        }
+        if f.check_interval.as_secs() < 60 {
+            ctx.error(
+                format!("{base}.check_interval"),
+                "检查间隔不能小于 60s，避免频繁拉取",
+            );
+        }
+        if f.timeout.as_secs() == 0 || f.timeout.as_secs() > 300 {
+            ctx.error(
+                format!("{base}.timeout"),
+                "拉取超时应在 1s-300s 之间",
+            );
+        }
+        let max_size = f.max_size.as_bytes();
+        if !(1024..=64 * 1024 * 1024).contains(&max_size) {
+            ctx.error(
+                format!("{base}.max_size"),
+                "规则包大小上限应在 1KB-64MB 之间",
+            );
+        }
+        if let Some(shadow) = f.shadow_period {
+            if shadow.as_secs() > 30 * 86_400 {
+                ctx.warn(
+                    format!("{base}.shadow_period"),
+                    "影子期超过 30 天，新规则将长期只记录不拦截",
+                );
+            }
+        }
+        for (name, value) in &f.headers {
+            if !is_valid_header_name(name) {
+                ctx.error(
+                    format!("{base}.headers"),
+                    format!("请求头名称 `{name}` 非法"),
+                );
+            }
+            if value.contains(['\r', '\n']) || value.len() > 1024 {
+                ctx.error(
+                    format!("{base}.headers"),
+                    format!("请求头 `{name}` 的值含换行或超过 1024 字节"),
+                );
+            }
         }
         if let Some(w) = &f.update_window {
             if !is_valid_window(w) {
@@ -510,6 +603,18 @@ fn validate_rule_feeds(feeds: &[RuleFeed], ctx: &mut Ctx) {
             }
         }
     }
+}
+
+fn is_valid_ed25519_key(key: &str) -> bool {
+    let Some(encoded) = key.strip_prefix("ed25519:") else {
+        return false;
+    };
+    let encoded = encoded.trim();
+    // 32 字节 base64 为 44 字符（含一个 `=`）；宽松接受无填充的 43 字符
+    (40..=64).contains(&encoded.len())
+        && encoded
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '='))
 }
 
 fn is_valid_window(w: &str) -> bool {
@@ -618,6 +723,9 @@ fn validate_applications(apps: &[Application], ctx: &mut Ctx) {
         // 策略
         if let Some(p) = &app.policy.protection {
             validate_protection(p, &format!("{base}.policy.protection"), ctx);
+        }
+        if let Some(r) = app.policy.ratelimit {
+            validate_ratelimit(&r, &format!("{base}.policy.ratelimit"), ctx);
         }
         validate_policy_cidrs(&app.policy, &format!("{base}.policy"), ctx);
 
@@ -757,6 +865,9 @@ fn validate_route(route: &Route, base: &str, ctx: &mut Ctx) {
     if let Some(p) = &route.policy {
         if let Some(prot) = &p.protection {
             validate_protection(prot, &format!("{base}.policy.protection"), ctx);
+        }
+        if let Some(r) = p.ratelimit {
+            validate_ratelimit(&r, &format!("{base}.policy.ratelimit"), ctx);
         }
         validate_policy_cidrs(p, &format!("{base}.policy"), ctx);
     }
@@ -916,6 +1027,7 @@ fn is_valid_header_name(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::units::{Duration, Size};
 
     fn app(id: &str, domain: &str) -> Application {
         Application {
@@ -1087,5 +1199,186 @@ mod tests {
         let report = validate(&config);
         assert!(!report.has_errors());
         assert!(report.warnings.iter().any(|w| w.path == "applications"));
+    }
+
+    #[test]
+    fn app_ratelimit_with_all_zero_thresholds_warns() {
+        let mut a = app("a", "a.home.lan");
+        a.policy.ratelimit = Some(RateLimitConfig {
+            enabled: true,
+            global_qps: 0,
+            per_ip_qps: 0,
+            per_ip_conn: 0,
+            per_url_qps: 0,
+            ..Default::default()
+        });
+        let report = validate(&Config {
+            applications: vec![a],
+            ..Default::default()
+        });
+        assert!(report
+            .warnings
+            .iter()
+            .any(|w| w.path == "applications[0].policy.ratelimit"));
+    }
+
+    #[test]
+    fn challenge_difficulty_out_of_range_is_error() {
+        let report = validate(&Config {
+            challenge: ChallengeConfig {
+                difficulty: 9,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        assert!(report
+            .errors
+            .iter()
+            .any(|e| e.path == "challenge.difficulty"));
+    }
+
+    // ============================================================
+    // 规则包订阅
+    // ============================================================
+
+    fn rule_feed() -> RuleFeed {
+        RuleFeed {
+            name: "official".to_string(),
+            url: "https://rules.example.com/core.hwrule".to_string(),
+            enabled: true,
+            channel: FeedChannel::Stable,
+            auto_update: true,
+            check_interval: Duration::from_secs(3_600),
+            update_window: None,
+            timeout: Duration::from_secs(20),
+            max_size: Size::from_bytes(4 * 1024 * 1024),
+            headers: std::collections::BTreeMap::new(),
+            require_signature: true,
+            public_key: Some(
+                "ed25519:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string(),
+            ),
+            shadow_period: None,
+            rollback_on_error: true,
+            pinned_version: None,
+        }
+    }
+
+    fn validate_feed(f: RuleFeed) -> ValidationReport {
+        validate(&Config {
+            rule_feeds: vec![f],
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn valid_rule_feed_passes() {
+        let report = validate_feed(rule_feed());
+        assert!(!report.has_errors(), "{:?}", report.errors);
+    }
+
+    #[test]
+    fn rule_feed_requires_https() {
+        let mut f = rule_feed();
+        f.url = "http://rules.example.com/core.hwrule".to_string();
+        assert!(validate_feed(f)
+            .errors
+            .iter()
+            .any(|e| e.path == "rule_feeds[0].url"));
+    }
+
+    #[test]
+    fn rule_feed_signature_requires_key() {
+        let mut f = rule_feed();
+        f.public_key = None;
+        assert!(validate_feed(f)
+            .errors
+            .iter()
+            .any(|e| e.path == "rule_feeds[0].public_key"));
+    }
+
+    #[test]
+    fn rule_feed_rejects_malformed_key() {
+        for key in ["rsa:AAAA", "ed25519:short", "ed25519:!!!!"] {
+            let mut f = rule_feed();
+            f.public_key = Some(key.to_string());
+            assert!(
+                validate_feed(f)
+                    .errors
+                    .iter()
+                    .any(|e| e.path == "rule_feeds[0].public_key"),
+                "应拒绝 {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn rule_feed_rejects_bad_name() {
+        let mut f = rule_feed();
+        f.name = "a b".to_string();
+        assert!(validate_feed(f)
+            .errors
+            .iter()
+            .any(|e| e.path == "rule_feeds[0].name"));
+    }
+
+    #[test]
+    fn rule_feed_rejects_too_frequent_check() {
+        let mut f = rule_feed();
+        f.check_interval = Duration::from_secs(5);
+        assert!(validate_feed(f)
+            .errors
+            .iter()
+            .any(|e| e.path == "rule_feeds[0].check_interval"));
+    }
+
+    #[test]
+    fn rule_feed_rejects_header_injection() {
+        let mut f = rule_feed();
+        f.headers.insert(
+            "authorization".to_string(),
+            "token\r\nx-evil: 1".to_string(),
+        );
+        assert!(validate_feed(f)
+            .errors
+            .iter()
+            .any(|e| e.path == "rule_feeds[0].headers"));
+    }
+
+    #[test]
+    fn rule_feed_long_shadow_is_warning_only() {
+        let mut f = rule_feed();
+        f.shadow_period = Some(Duration::from_secs(31 * 86_400));
+        let report = validate_feed(f);
+        assert!(!report.has_errors());
+        assert!(report
+            .warnings
+            .iter()
+            .any(|w| w.path == "rule_feeds[0].shadow_period"));
+    }
+
+    #[test]
+    fn pinned_rule_feed_requires_version() {
+        let mut f = rule_feed();
+        f.channel = FeedChannel::Pinned;
+        assert!(validate_feed(f)
+            .errors
+            .iter()
+            .any(|e| e.path == "rule_feeds[0].pinned_version"));
+    }
+
+    #[test]
+    fn rule_feed_rejects_bad_limits() {
+        let mut f = rule_feed();
+        f.timeout = Duration::from_secs(0);
+        f.max_size = Size::from_bytes(10);
+        let report = validate_feed(f);
+        assert!(report
+            .errors
+            .iter()
+            .any(|e| e.path == "rule_feeds[0].timeout"));
+        assert!(report
+            .errors
+            .iter()
+            .any(|e| e.path == "rule_feeds[0].max_size"));
     }
 }

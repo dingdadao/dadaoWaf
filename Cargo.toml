@@ -5,6 +5,7 @@ members = [
     "crates/router",
     "crates/acl",
     "crates/detect",
+    "crates/limit",
     "crates/store",
     "crates/admin",
     "crates/proxy",

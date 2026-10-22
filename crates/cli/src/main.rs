@@ -7,6 +7,7 @@
 
 use std::process::ExitCode;
 
+use anyhow::Context;
 use clap::{Parser, Subcommand};
 use homewaf_config::{ConfigError, Severity};
 
@@ -109,6 +110,40 @@ enum Command {
         #[arg(long, default_value_t = 5)]
         sample: usize,
     },
+    /// 规则包签名工具
+    Rulepack {
+        #[command(subcommand)]
+        command: RulepackCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum RulepackCommand {
+    /// 生成 Ed25519 签名密钥
+    Keygen {
+        /// 私钥输出路径（PKCS#8 DER，权限 0600）
+        #[arg(long, default_value = "rulepack-signing.pkcs8")]
+        out: String,
+    },
+    /// 给规则文档签名，生成可被订阅的 .hwrule 文件
+    Sign {
+        /// 私钥路径
+        #[arg(long)]
+        key: String,
+        /// 规则文档（JSON 或 YAML）
+        input: String,
+        /// 输出路径；省略则写到标准输出
+        #[arg(long, short)]
+        out: Option<String>,
+    },
+    /// 校验签名并解析规则包（订阅端的完整检查）
+    Verify {
+        /// 公钥，格式 ed25519:<base64>
+        #[arg(long)]
+        key: String,
+        /// 规则包路径
+        path: String,
+    },
 }
 
 fn main() -> ExitCode {
@@ -145,6 +180,13 @@ fn main() -> ExitCode {
             timeout,
             sample,
         } => cmd_feed(&url, &format, &max_bytes, &timeout, sample),
+        Command::Rulepack { command } => match command {
+            RulepackCommand::Keygen { out } => cmd_rulepack_keygen(&out),
+            RulepackCommand::Sign { key, input, out } => {
+                cmd_rulepack_sign(&key, &input, out.as_deref())
+            }
+            RulepackCommand::Verify { key, path } => cmd_rulepack_verify(&key, &path),
+        },
     };
 
     match result {
@@ -386,6 +428,9 @@ fn cmd_serve(
         shared.load_full().ipv6_prefix,
     ));
 
+    // 流量指标由代理写入、控制台读取，必须共享同一个实例
+    let metrics = std::sync::Arc::new(homewaf_proxy::TrafficMetrics::new());
+
     // 启动控制台（独立线程，不阻塞代理）
     let admin_listen = shared.load_full().server.admin.listen.clone();
     if !admin_listen.is_empty() {
@@ -394,6 +439,7 @@ fn cmd_serve(
             store: store.clone(),
             shared: shared.clone(),
             bans: bans.clone(),
+            metrics: metrics.clone(),
             allow_regex,
             token,
             log_dir: std::path::PathBuf::from(&logging_cfg.dir),
@@ -410,6 +456,7 @@ fn cmd_serve(
         tls,
         store: Some(store),
         bans,
+        metrics,
         // DB 模式下没有配置文件可监视。改配置后由控制台显式触发重载
         watch_path: None,
         allow_regex,
@@ -494,7 +541,10 @@ fn cmd_import(path: &str, db: &str, overwrite: bool) -> anyhow::Result<ExitCode>
     save_setting!("acl", config.acl);
     save_setting!("limits", config.limits);
     save_setting!("ratelimit", config.ratelimit);
+    save_setting!("challenge", config.challenge);
     save_setting!("logging", config.logging);
+    let rule_feed_count = config.rule_feeds.len();
+    save_setting!("rule_feeds", config.rule_feeds);
     // 存实际 DB 路径，而不是 YAML 里写的（可能不一致）
     let mut storage_cfg = config.storage.clone();
     storage_cfg.path = db.to_string();
@@ -535,7 +585,8 @@ fn cmd_import(path: &str, db: &str, overwrite: bool) -> anyhow::Result<ExitCode>
     println!("  应用 {imported} 个（跳过 {skipped} 个已存在）");
     println!("  ACL 规则 {rule_count} 条");
     println!("  IP 组订阅 {group_count} 个");
-    println!("  全局设置 9 项");
+    println!("  规则包订阅 {rule_feed_count} 个");
+    println!("  全局设置 10 项");
 
     Ok(ExitCode::SUCCESS)
 }
@@ -669,6 +720,74 @@ fn cmd_feed(
     }
 
     println!("dry-run 完成，未修改任何状态");
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_rulepack_keygen(out: &str) -> anyhow::Result<ExitCode> {
+    let (key, public) =
+        homewaf_detect::feed::generate_signing_key().map_err(|e| anyhow::anyhow!(e))?;
+
+    if let Some(parent) = std::path::Path::new(out).parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("创建目录 {} 失败", parent.display()))?;
+        }
+    }
+    std::fs::write(out, &key).with_context(|| format!("写入私钥 {out} 失败"))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(out, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("设置私钥权限失败：{out}"))?;
+    }
+
+    println!("私钥已写入 {out}（权限 0600，请离线保管）");
+    println!("公钥（填到订阅的 public_key）：");
+    println!("{public}");
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_rulepack_sign(key: &str, input: &str, out: Option<&str>) -> anyhow::Result<ExitCode> {
+    let key_bytes = std::fs::read(key).with_context(|| format!("读取私钥 {key} 失败"))?;
+    let payload =
+        std::fs::read_to_string(input).with_context(|| format!("读取规则文档 {input} 失败"))?;
+
+    // 先按订阅端的同一套规则校验，别签出一个自己都加载不了的文件
+    homewaf_detect::feed::parse_rules(&payload, "local")
+        .map_err(|e| anyhow::anyhow!("规则文档校验失败：{e}"))?;
+
+    let signed =
+        homewaf_detect::feed::sign_payload(&key_bytes, &payload).map_err(|e| anyhow::anyhow!(e))?;
+
+    match out {
+        Some(path) => {
+            std::fs::write(path, signed).with_context(|| format!("写入 {path} 失败"))?;
+            println!("已签名并写入 {path}");
+        }
+        None => print!("{signed}"),
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_rulepack_verify(key: &str, path: &str) -> anyhow::Result<ExitCode> {
+    let body = std::fs::read_to_string(path).with_context(|| format!("读取 {path} 失败"))?;
+    let (signature, payload) = homewaf_detect::feed::split_signature(&body)
+        .map_err(|e| anyhow::anyhow!("解析签名头失败：{e}"))?;
+    let signature = signature.ok_or_else(|| anyhow::anyhow!("规则包没有签名"))?;
+
+    homewaf_detect::feed::verify_signature(key, payload.as_bytes(), &signature)
+        .map_err(|e| anyhow::anyhow!("验签失败：{e}"))?;
+
+    let parsed = homewaf_detect::feed::parse_rules(payload, "verify")
+        .map_err(|e| anyhow::anyhow!("规则包解析失败：{e}"))?;
+
+    println!(
+        "签名有效 · {} 条规则 · 版本 {} · 通道 {}",
+        parsed.rules.len(),
+        parsed.version.as_deref().unwrap_or("未声明"),
+        parsed.channel.as_deref().unwrap_or("未声明"),
+    );
     Ok(ExitCode::SUCCESS)
 }
 

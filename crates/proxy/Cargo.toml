@@ -11,8 +11,10 @@ homewaf-config = { path = "../config" }
 homewaf-router = { path = "../router" }
 homewaf-acl = { path = "../acl" }
 homewaf-detect = { path = "../detect" }
+homewaf-limit = { path = "../limit" }
 homewaf-store = { path = "../store" }
 ipnet.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 # 主动健康检查探测
 ureq = "3"
@@ -28,3 +30,5 @@ thiserror.workspace = true
 tracing = "0.1"
 # 热重载：无锁原子替换运行时状态
 arc-swap = "1"
+# 人机验证的 HMAC 签名（rustls 已依赖，不新增下载）
+ring = "0.17"

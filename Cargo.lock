@@ -925,6 +925,7 @@ dependencies = [
  "homewaf-acl",
  "homewaf-admin",
  "homewaf-config",
+ "homewaf-detect",
  "homewaf-proxy",
  "homewaf-router",
  "homewaf-store",
@@ -955,10 +956,12 @@ dependencies = [
  "homewaf-acl",
  "homewaf-config",
  "homewaf-detect",
+ "homewaf-limit",
  "homewaf-proxy",
  "homewaf-router",
  "homewaf-store",
  "ipnet",
+ "maxminddb",
  "serde",
  "serde_json",
  "tokio",
@@ -983,10 +986,17 @@ dependencies = [
  "aho-corasick",
  "homewaf-config",
  "regex",
+ "ring",
  "serde",
+ "serde_json",
+ "serde_yaml",
  "thiserror 2.0.21",
  "tracing",
 ]
+
+[[package]]
+name = "homewaf-limit"
+version = "0.1.0"
 
 [[package]]
 name = "homewaf-proxy"
@@ -999,11 +1009,14 @@ dependencies = [
  "homewaf-acl",
  "homewaf-config",
  "homewaf-detect",
+ "homewaf-limit",
  "homewaf-router",
  "homewaf-store",
  "http",
  "ipnet",
  "pingora",
+ "ring",
+ "serde",
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
@@ -1141,6 +1154,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "ipnetwork"
+version = "0.21.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf370abdafd54d13e54a620e8c3e1145f28e46cc9d704bc6d94414559df41763"
+
+[[package]]
 name = "is_terminal_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1242,6 +1261,18 @@ name = "matchit"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
+
+[[package]]
+name = "maxminddb"
+version = "0.32.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9b43d2458d977b610b04a3858e6504f06133663d303a1a0606601b530bfc9bc6"
+dependencies = [
+ "ipnetwork",
+ "memchr",
+ "serde",
+ "thiserror 2.0.21",
+]
 
 [[package]]
 name = "memchr"

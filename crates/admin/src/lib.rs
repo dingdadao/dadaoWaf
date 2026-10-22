@@ -17,7 +17,7 @@ use axum::{
 };
 use homewaf_acl::BanTable;
 use homewaf_config::Application;
-use homewaf_proxy::{RuntimeState, SharedState};
+use homewaf_proxy::{RuntimeState, SharedState, TrafficMetrics};
 use homewaf_store::{AclRuleRow, Store};
 use serde::{Deserialize, Serialize};
 
@@ -26,6 +26,7 @@ pub struct AdminState {
     pub store: Arc<Store>,
     pub shared: SharedState,
     pub bans: Arc<BanTable>,
+    pub metrics: Arc<TrafficMetrics>,
     pub allow_regex: bool,
     /// 认证 token。`None` 时只允许回环访问
     pub token: Option<String>,
@@ -75,10 +76,20 @@ pub fn router(state: Ctx) -> Router {
         .route("/api/bans", get(list_bans))
         .route("/api/bans/{ip}", delete(unban))
         .route("/api/events", get(list_events))
+        .route("/api/events/export", get(export_events))
         .route("/api/logs", get(list_logs))
         .route("/api/feeds", get(list_feeds).post(upsert_feed))
         .route("/api/feeds/{name}", delete(delete_feed))
         .route("/api/feeds/{name}/refresh", post(refresh_feed))
+        .route(
+            "/api/rule-feeds",
+            get(list_rule_feeds).post(upsert_rule_feed),
+        )
+        .route("/api/rule-feeds/{name}", delete(delete_rule_feed))
+        .route(
+            "/api/rule-feeds/{name}/refresh",
+            post(refresh_rule_feed),
+        )
         .route("/api/whitelist", get(list_whitelist).post(upsert_whitelist))
         .route("/api/whitelist/{id}", delete(delete_whitelist))
         .route("/api/settings", get(get_all_settings))
@@ -119,6 +130,8 @@ pub fn spawn(state: AdminState, listen: String) -> anyhow::Result<()> {
             };
 
             rt.block_on(async move {
+                spawn_rule_feed_scheduler(ctx.clone());
+
                 let listener = match tokio::net::TcpListener::bind(&listen).await {
                     Ok(l) => l,
                     Err(e) => {
@@ -158,6 +171,23 @@ struct Stats {
     events_blocked: usize,
     detect_rules: usize,
     observe_mode: bool,
+    /// 最近 24 小时按小时聚合：时间戳、总数、拦截数
+    hourly: Vec<HourBucket>,
+    /// 最近 24 小时的攻击类型分布
+    categories: Vec<CategoryCount>,
+}
+
+#[derive(Serialize)]
+struct HourBucket {
+    ts: i64,
+    total: usize,
+    blocked: usize,
+}
+
+#[derive(Serialize)]
+struct CategoryCount {
+    name: String,
+    count: usize,
 }
 
 async fn stats(State(ctx): State<Ctx>, headers: HeaderMap) -> Response {
@@ -168,8 +198,65 @@ async fn stats(State(ctx): State<Ctx>, headers: HeaderMap) -> Response {
     let state = ctx.shared.load_full();
     let now = homewaf_acl::now_unix();
 
-    let events = ctx.store.recent_events(1000).unwrap_or_default();
-    let blocked = events.iter().filter(|e| e.action == "block").count();
+    let events_blocked = ctx
+        .store
+        .query_events(&homewaf_store::EventFilter {
+            limit: 0,
+            action: Some("block".to_string()),
+            ..Default::default()
+        })
+        .map(|(_, total)| total)
+        .unwrap_or(0);
+
+    let now_hour = now - now.rem_euclid(3_600);
+    let start = now_hour - 23 * 3_600;
+    let mut hourly: Vec<HourBucket> = (0..24)
+        .map(|i| HourBucket {
+            ts: start + i * 3_600,
+            total: 0,
+            blocked: 0,
+        })
+        .collect();
+
+    // 分桶统计交给 SQLite，避免每 5 秒轮询都把上万条事件搬进内存。
+    for (ts, total, blocked) in ctx.store.hourly_event_counts(start).unwrap_or_default() {
+        let idx = ((ts - start) / 3_600).clamp(0, 23) as usize;
+        hourly[idx].total += total;
+        hourly[idx].blocked += blocked;
+    }
+
+    // 分类映射必须读取当前生效规则集，否则订阅规则会全部落进 other
+    let matcher = state.engine.matcher();
+    let mut category_counts: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::new();
+    let rule_categories: std::collections::HashMap<&str, &str> = matcher
+        .metas()
+        .map(|r| (r.id.as_str(), r.category.as_str()))
+        .collect();
+
+    for rules in ctx
+        .store
+        .event_rule_strings(start, 50_000)
+        .unwrap_or_default()
+    {
+        for rule in rules.split(',').filter(|s| !s.is_empty()) {
+            let category = rule_categories
+                .get(rule)
+                .copied()
+                .unwrap_or_else(|| if rule.starts_with("cc-") { "cc" } else { "other" });
+            *category_counts.entry(category).or_insert(0) += 1;
+        }
+    }
+
+    let mut categories: Vec<CategoryCount> = category_counts
+        .into_iter()
+        .map(|(name, count)| CategoryCount {
+            name: name.to_string(),
+            count,
+        })
+        .collect();
+    categories.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.name.cmp(&b.name)));
+    categories.truncate(8);
 
     Json(Stats {
         apps: state.router.len(),
@@ -177,9 +264,11 @@ async fn stats(State(ctx): State<Ctx>, headers: HeaderMap) -> Response {
         acl_rules: state.rule_count(),
         active_bans: ctx.bans.active_count(now.max(0) as u64),
         events_total: ctx.store.event_count().unwrap_or(0),
-        events_blocked: blocked,
+        events_blocked,
         detect_rules: state.detection_rule_count(),
         observe_mode: state.engine.is_observe_mode(),
+        hourly,
+        categories,
     })
     .into_response()
 }
@@ -528,6 +617,111 @@ async fn list_events(
     }
 }
 
+/// 事件导出为 CSV。带 UTF-8 BOM，Excel 直接打开不乱码。
+async fn export_events(
+    State(ctx): State<Ctx>,
+    headers: HeaderMap,
+    Query(q): Query<EventQuery>,
+) -> Response {
+    if !authorized(&ctx, &headers) {
+        return unauthorized();
+    }
+
+    let filter = homewaf_store::EventFilter {
+        limit: if q.limit == default_limit() {
+            50_000
+        } else {
+            q.limit.min(50_000)
+        },
+        offset: q.offset,
+        kind: q.kind,
+        ip: q.ip,
+        action: q.action,
+        since: q.since,
+    };
+
+    let Ok((events, _)) = ctx.store.query_events(&filter) else {
+        return internal("查询事件失败").into_response();
+    };
+
+    let mut out = String::with_capacity(64 + events.len() * 120);
+    out.push('\u{feff}');
+    out.push_str("id,时间,类型,来源 IP,应用,路径,命中规则,评分,动作\r\n");
+    for e in &events {
+        out.push_str(&format!(
+            "{},{},{},{},{},{},{},{},{}\r\n",
+            e.id,
+            csv_field(&format_utc(e.ts)),
+            e.kind.as_str(),
+            csv_field(&e.client_ip),
+            csv_field(&e.app),
+            csv_field(&e.path),
+            csv_field(&e.rules),
+            e.score,
+            csv_field(&e.action),
+        ));
+    }
+
+    let filename = format!("homewaf-events-{}.csv", homewaf_acl::now_unix());
+    (
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "text/csv; charset=utf-8".to_string(),
+            ),
+            (
+                axum::http::header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{filename}\""),
+            ),
+            (
+                axum::http::header::CACHE_CONTROL,
+                "no-store".to_string(),
+            ),
+        ],
+        out,
+    )
+        .into_response()
+}
+
+fn csv_field(s: &str) -> String {
+    // 防 CSV 公式注入：以这些字符开头的单元格会被 Excel 当公式执行
+    let guarded = matches!(s.chars().next(), Some('=' | '+' | '-' | '@' | '\t' | '\r'));
+    let mut out = if guarded {
+        format!("'{s}")
+    } else {
+        s.to_string()
+    };
+    if out.contains([',', '"', '\n', '\r']) {
+        out = format!("\"{}\"", out.replace('"', "\"\""));
+    }
+    out
+}
+
+/// Unix 秒转 UTC `YYYY-MM-DD HH:MM:SS`。
+fn format_utc(ts: i64) -> String {
+    let days = ts.div_euclid(86_400);
+    let secs = ts.rem_euclid(86_400);
+    // Howard Hinnant 的 civil_from_days
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let mut year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    if month <= 2 {
+        year += 1;
+    }
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02}:{:02}",
+        secs / 3_600,
+        secs % 3_600 / 60,
+        secs % 60
+    )
+}
+
 // ============================================================
 // 日志查看
 // ============================================================
@@ -666,11 +860,19 @@ async fn get_all_settings(State(ctx): State<Ctx>, headers: HeaderMap) -> Respons
         ),
         (
             "ratelimit",
-            serde_json::to_value(&defaults.ratelimit).unwrap_or_default(),
+            serde_json::to_value(defaults.ratelimit).unwrap_or_default(),
+        ),
+        (
+            "challenge",
+            serde_json::to_value(defaults.challenge).unwrap_or_default(),
         ),
         (
             "logging",
             serde_json::to_value(&defaults.logging).unwrap_or_default(),
+        ),
+        (
+            "rule_feeds",
+            serde_json::to_value(&defaults.rule_feeds).unwrap_or_default(),
         ),
     ] {
         out.insert(key.to_string(), load(key, value));
@@ -759,6 +961,9 @@ fn check_setting_type(key: &str, value: &serde_json::Value) -> Result<(), String
         "ratelimit" => serde_json::from_value::<RateLimitConfig>(value.clone())
             .map(|_| ())
             .map_err(|e| format!("ratelimit 结构不合法：{e}")),
+        "challenge" => serde_json::from_value::<ChallengeConfig>(value.clone())
+            .map(|_| ())
+            .map_err(|e| format!("challenge 结构不合法：{e}")),
         "logging" => serde_json::from_value::<LoggingConfig>(value.clone())
             .map(|_| ())
             .map_err(|e| format!("logging 结构不合法：{e}")),
@@ -768,6 +973,9 @@ fn check_setting_type(key: &str, value: &serde_json::Value) -> Result<(), String
         "limits" => serde_json::from_value::<LimitsConfig>(value.clone())
             .map(|_| ())
             .map_err(|e| format!("limits 结构不合法：{e}")),
+        "rule_feeds" => serde_json::from_value::<Vec<RuleFeed>>(value.clone())
+            .map(|_| ())
+            .map_err(|e| format!("rule_feeds 结构不合法：{e}")),
         // 未知 key 直接拒绝，避免往库里塞垃圾
         other => Err(format!("未知的设置项 `{other}`")),
     }
@@ -955,6 +1163,228 @@ async fn refresh_feed(
 }
 
 // ============================================================
+// 规则包订阅
+// ============================================================
+
+#[derive(Serialize)]
+struct RuleFeedsView {
+    feeds: Vec<homewaf_config::RuleFeed>,
+    statuses: Vec<homewaf_proxy::RuleFeedStatus>,
+}
+
+async fn list_rule_feeds(State(ctx): State<Ctx>, headers: HeaderMap) -> Response {
+    if !authorized(&ctx, &headers) {
+        return unauthorized();
+    }
+
+    let feeds = match homewaf_proxy::load_rule_feed_configs(&ctx.store) {
+        Ok(f) => f,
+        Err(e) => return internal(e).into_response(),
+    };
+    let statuses = ctx.shared.load_full().rule_feeds.clone();
+    Json(RuleFeedsView { feeds, statuses }).into_response()
+}
+
+/// 复用完整配置校验：规则包订阅的约束和 YAML 模式完全一致。
+fn validate_rule_feed(feed: &homewaf_config::RuleFeed) -> Result<(), String> {
+    let probe = homewaf_config::Config {
+        rule_feeds: vec![feed.clone()],
+        ..Default::default()
+    };
+    let report = probe.validate();
+    if report.has_errors() {
+        return Err(report
+            .errors
+            .iter()
+            .map(|e| format!("{}: {}", e.path, e.message))
+            .collect::<Vec<_>>()
+            .join("；"));
+    }
+    Ok(())
+}
+
+/// 把订阅配置写回设置项，返回修改前的值供回滚。
+fn save_rule_feed_configs(
+    ctx: &AdminState,
+    feeds: &[homewaf_config::RuleFeed],
+) -> Result<Vec<homewaf_config::RuleFeed>, String> {
+    let old = homewaf_proxy::load_rule_feed_configs(&ctx.store)?;
+    let value = serde_json::to_value(feeds).map_err(|e| format!("序列化订阅配置失败：{e}"))?;
+    let now = homewaf_acl::now_unix();
+    ctx.store
+        .set_setting(homewaf_proxy::RULE_FEEDS_SETTING, &value, now)
+        .map_err(|e| format!("写入订阅配置失败：{e}"))?;
+    Ok(old)
+}
+
+async fn upsert_rule_feed(
+    State(ctx): State<Ctx>,
+    headers: HeaderMap,
+    Json(feed): Json<homewaf_config::RuleFeed>,
+) -> Response {
+    if !authorized(&ctx, &headers) {
+        return unauthorized();
+    }
+
+    if let Err(e) = validate_rule_feed(&feed) {
+        return (StatusCode::BAD_REQUEST, e).into_response();
+    }
+
+    let mut feeds = match homewaf_proxy::load_rule_feed_configs(&ctx.store) {
+        Ok(f) => f,
+        Err(e) => return internal(e).into_response(),
+    };
+    match feeds.iter_mut().find(|f| f.name == feed.name) {
+        Some(existing) => *existing = feed.clone(),
+        None => feeds.push(feed.clone()),
+    }
+
+    let old = match save_rule_feed_configs(&ctx, &feeds) {
+        Ok(old) => old,
+        Err(e) => return internal(e).into_response(),
+    };
+
+    // 保存后强制拉取一次，让用户立刻看到版本与验签结果
+    match reload_state_with(&ctx, true) {
+        Ok(()) => {
+            let snapshot = ctx.shared.load_full();
+            if let Some(status) = snapshot.rule_feeds.iter().find(|s| s.name == feed.name) {
+                if let Some(err) = &status.error {
+                    return Json(serde_json::json!({
+                        "ok": true,
+                        "warning": format!("订阅已保存，但首次拉取失败：{err}"),
+                    }))
+                    .into_response();
+                }
+            }
+            Json(serde_json::json!({"ok": true, "name": feed.name})).into_response()
+        }
+        Err(e) => {
+            // 重载失败（比如规则与内置规则冲突）时回滚，避免留下一个起不来的配置
+            let _ = save_rule_feed_configs(&ctx, &old);
+            (StatusCode::BAD_REQUEST, format!("已保存，但加载失败：{e}")).into_response()
+        }
+    }
+}
+
+async fn delete_rule_feed(
+    State(ctx): State<Ctx>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Response {
+    if !authorized(&ctx, &headers) {
+        return unauthorized();
+    }
+
+    let mut feeds = match homewaf_proxy::load_rule_feed_configs(&ctx.store) {
+        Ok(f) => f,
+        Err(e) => return internal(e).into_response(),
+    };
+    let before = feeds.len();
+    feeds.retain(|f| f.name != name);
+    if feeds.len() == before {
+        return (StatusCode::NOT_FOUND, "规则包订阅不存在").into_response();
+    }
+
+    let old = match save_rule_feed_configs(&ctx, &feeds) {
+        Ok(old) => old,
+        Err(e) => return internal(e).into_response(),
+    };
+    // 缓存也要清掉，否则重新添加同名订阅时会先载入旧规则
+    let _ = ctx.store.delete_rule_feed_package(&name);
+
+    match reload_state(&ctx) {
+        Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
+        Err(e) => {
+            let _ = save_rule_feed_configs(&ctx, &old);
+            (
+                StatusCode::BAD_REQUEST,
+                format!("已删除，但重载失败：{e}"),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn refresh_rule_feed(
+    State(ctx): State<Ctx>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Response {
+    if !authorized(&ctx, &headers) {
+        return unauthorized();
+    }
+
+    let feeds = match homewaf_proxy::load_rule_feed_configs(&ctx.store) {
+        Ok(f) => f,
+        Err(e) => return internal(e).into_response(),
+    };
+    if !feeds.iter().any(|f| f.name == name) {
+        return (StatusCode::NOT_FOUND, "规则包订阅不存在").into_response();
+    }
+
+    match reload_state_with(&ctx, true) {
+        Ok(()) => {
+            let snapshot = ctx.shared.load_full();
+            match snapshot.rule_feeds.iter().find(|s| s.name == name) {
+                Some(status) if !status.enabled => {
+                    Json(serde_json::json!({"ok": true, "warning": "订阅已停用，未拉取"}))
+                        .into_response()
+                }
+                Some(status) if status.error.is_some() => Json(serde_json::json!({
+                    "ok": true,
+                    "warning": format!("刷新失败：{}", status.error.as_deref().unwrap_or("")),
+                }))
+                .into_response(),
+                Some(_) => Json(serde_json::json!({"ok": true})).into_response(),
+                None => (StatusCode::NOT_FOUND, "订阅未生效").into_response(),
+            }
+        }
+        Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+    }
+}
+
+/// 定期检查订阅是否需要更新。到点后重建运行时状态，`load_rule_feeds`
+/// 会按各自的检查间隔只拉取到期的那几个。
+fn spawn_rule_feed_scheduler(ctx: Ctx) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+
+            let store = ctx.store.clone();
+            let due = tokio::task::spawn_blocking(move || {
+                let feeds = homewaf_proxy::load_rule_feed_configs(&store)?;
+                let cache = homewaf_proxy::StoreRuleFeedCache::new(&store);
+                Ok::<bool, String>(homewaf_proxy::rule_feeds_due(
+                    &feeds,
+                    &cache,
+                    homewaf_acl::now_unix(),
+                ))
+            })
+            .await;
+
+            match due {
+                Ok(Ok(true)) => {
+                    let reload_ctx = ctx.clone();
+                    let result =
+                        tokio::task::spawn_blocking(move || reload_state(&reload_ctx)).await;
+                    match result {
+                        Ok(Ok(())) => tracing::info!("规则包订阅检查完成"),
+                        Ok(Err(e)) => tracing::warn!(error = %e, "规则包自动更新失败"),
+                        Err(e) => tracing::warn!(error = %e, "规则包更新任务异常退出"),
+                    }
+                }
+                Ok(Ok(false)) => {}
+                Ok(Err(e)) => tracing::warn!(error = %e, "读取规则包订阅配置失败"),
+                Err(e) => tracing::warn!(error = %e, "规则包检查任务异常退出"),
+            }
+        }
+    });
+}
+
+// ============================================================
 // 检测白名单
 // ============================================================
 
@@ -1085,8 +1515,16 @@ async fn reload(State(ctx): State<Ctx>, headers: HeaderMap) -> Response {
 ///
 /// 这是 DB 模式下的"热重载"：没有文件可监视，只能由写操作显式触发。
 fn reload_state(ctx: &AdminState) -> Result<(), String> {
-    let new_state: RuntimeState =
-        homewaf_proxy::load_state_from_db(&ctx.store, ctx.allow_regex)?;
+    reload_state_with(ctx, false)
+}
+
+/// `force` 为 true 时忽略检查间隔与更新窗口，立即拉取全部规则包。
+fn reload_state_with(ctx: &AdminState, force_rule_feeds: bool) -> Result<(), String> {
+    let mut new_state: RuntimeState =
+        homewaf_proxy::load_state_from_db_with(&ctx.store, ctx.allow_regex, force_rule_feeds)?;
+
+    // CC 计数属于运行时状态，不能因为改了一条 ACL 就被清零
+    new_state.limiter = ctx.shared.load().limiter.clone();
 
     // 封禁参数同步，但保留已有封禁记录
     ctx.bans
@@ -1106,8 +1544,8 @@ fn reload_state(ctx: &AdminState) -> Result<(), String> {
 mod tests {
     use super::*;
     use homewaf_config::{
-        AclConfig, AutoBanConfig, Application, Domains, RealIpConfig, Scheme, TlsModeConfig,
-        Upstream,
+        AclConfig, AutoBanConfig, Application, Domains, Duration, FeedChannel, RealIpConfig,
+        RuleFeed, Scheme, Size, TlsModeConfig, Upstream,
     };
 
     fn empty_runtime() -> RuntimeState {
@@ -1117,12 +1555,21 @@ mod tests {
             pool: homewaf_proxy::UpstreamPool::build(&[]),
             real_ip: RealIpConfig::default(),
             engine: homewaf_detect::Engine::new(true, 50),
+            policies: homewaf_proxy::PolicySet::build(
+                &[],
+                &Default::default(),
+                Default::default(),
+                &Default::default(),
+            ),
+            limiter: Arc::new(homewaf_limit::RateLimiter::new()),
+            challenge: Default::default(),
             whitelist: Vec::new(),
             auto_ban: AutoBanConfig::default(),
             ipv6_prefix: 64,
             server: Default::default(),
             tls: Default::default(),
             feed_failures: Vec::new(),
+            rule_feeds: Vec::new(),
         }
     }
 
@@ -1131,6 +1578,7 @@ mod tests {
             store: Arc::new(Store::open_memory().unwrap()),
             shared: homewaf_proxy::shared(empty_runtime()),
             bans: Arc::new(BanTable::new(&AutoBanConfig::default(), 64)),
+            metrics: Arc::new(TrafficMetrics::new()),
             allow_regex: false,
             token: None,
             log_dir: std::env::temp_dir(),
@@ -1305,8 +1753,64 @@ mod tests {
         assert!(check_setting_type("protection", &serde_json::json!("oops")).is_err());
     }
 
+    #[test]
+    fn setting_type_accepts_rule_feeds() {
+        assert!(check_setting_type("rule_feeds", &serde_json::json!([])).is_ok());
+        assert!(check_setting_type("rule_feeds", &serde_json::json!({})).is_err());
+    }
+
     // ============================================================
-    // 订阅构造
+    // 规则包订阅
+    // ============================================================
+
+    fn rule_feed(name: &str) -> RuleFeed {
+        RuleFeed {
+            name: name.to_string(),
+            url: "https://rules.example.com/core.hwrule".to_string(),
+            enabled: true,
+            channel: FeedChannel::Stable,
+            auto_update: true,
+            check_interval: Duration::from_secs(3_600),
+            update_window: None,
+            timeout: Duration::from_secs(20),
+            max_size: Size::from_bytes(4 * 1024 * 1024),
+            headers: std::collections::BTreeMap::new(),
+            require_signature: true,
+            public_key: Some(
+                "ed25519:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string(),
+            ),
+            shadow_period: None,
+            rollback_on_error: true,
+            pinned_version: None,
+        }
+    }
+
+    #[test]
+    fn valid_rule_feed_passes_admin_validation() {
+        assert!(validate_rule_feed(&rule_feed("official")).is_ok());
+    }
+
+    #[test]
+    fn rule_feed_with_bad_name_rejected_by_admin() {
+        assert!(validate_rule_feed(&rule_feed("a b")).is_err());
+    }
+
+    #[test]
+    fn rule_feed_with_http_url_rejected_by_admin() {
+        let mut f = rule_feed("official");
+        f.url = "http://rules.example.com/core.hwrule".to_string();
+        assert!(validate_rule_feed(&f).unwrap_err().contains("HTTPS"));
+    }
+
+    #[test]
+    fn rule_feed_without_key_rejected_by_admin() {
+        let mut f = rule_feed("official");
+        f.public_key = None;
+        assert!(validate_rule_feed(&f).unwrap_err().contains("公钥"));
+    }
+
+    // ============================================================
+    // IP 组订阅构造
     // ============================================================
 
     fn feed(name: &str, url: &str) -> FeedInput {
@@ -1437,5 +1941,28 @@ mod tests {
         let mut input = wl(None, Some("/x"), None);
         input.id = Some("custom-id".to_string());
         assert_eq!(build_whitelist(&input).unwrap().id, "custom-id");
+    }
+
+    #[test]
+    fn csv_fields_are_quoted_when_needed() {
+        assert_eq!(csv_field("plain"), "plain");
+        assert_eq!(csv_field("a,b"), "\"a,b\"");
+        assert_eq!(csv_field("say \"hi\""), "\"say \"\"hi\"\"\"");
+        assert_eq!(csv_field("line\nbreak"), "\"line\nbreak\"");
+    }
+
+    #[test]
+    fn csv_formula_injection_is_neutralized() {
+        assert_eq!(csv_field("=1+1"), "'=1+1");
+        assert_eq!(csv_field("@SUM(A1)"), "'@SUM(A1)");
+        assert_eq!(csv_field("+cmd"), "'+cmd");
+        assert_eq!(csv_field("-2+3"), "'-2+3");
+    }
+
+    #[test]
+    fn utc_format_matches_known_timestamps() {
+        assert_eq!(format_utc(0), "1970-01-01 00:00:00");
+        assert_eq!(format_utc(1_700_000_000), "2023-11-14 22:13:20");
+        assert_eq!(format_utc(951_782_400), "2000-02-29 00:00:00");
     }
 }

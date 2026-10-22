@@ -28,6 +28,19 @@ impl Target {
             Target::UserAgent => "user_agent",
         }
     }
+
+    /// 解析规则包里的目标名，同时接受 snake_case 与紧凑写法。
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "path" | "url" => Some(Target::Path),
+            "query" | "args" => Some(Target::Query),
+            "body" => Some(Target::Body),
+            "header" | "headers" => Some(Target::Header),
+            "cookie" | "cookies" => Some(Target::Cookie),
+            "user_agent" | "useragent" | "ua" => Some(Target::UserAgent),
+            _ => None,
+        }
+    }
 }
 
 /// 攻击分类。
@@ -51,10 +64,65 @@ pub enum Category {
     /// Webshell 特征
     Webshell,
     Scanner,
+    /// 反序列化
+    Deserialization,
+    /// 响应拆分 / 头注入
+    Crlf,
+    /// 恶意文件上传
+    FileUpload,
+    /// 暴力破解
+    Bruteforce,
+    /// 敏感信息泄露
+    SensitiveLeak,
     Custom,
 }
 
 impl Category {
+    pub const COUNT: usize = 17;
+
+    /// 固定的分类顺序，用于按索引存放策略。
+    pub const ALL: [Category; Self::COUNT] = [
+        Category::Sqli,
+        Category::Xss,
+        Category::CmdInjection,
+        Category::PathTraversal,
+        Category::Ssrf,
+        Category::Xxe,
+        Category::Ssti,
+        Category::Nosql,
+        Category::LdapXpath,
+        Category::Webshell,
+        Category::Scanner,
+        Category::Deserialization,
+        Category::Crlf,
+        Category::FileUpload,
+        Category::Bruteforce,
+        Category::SensitiveLeak,
+        Category::Custom,
+    ];
+
+    pub fn index(self) -> usize {
+        match self {
+            Category::Sqli => 0,
+            Category::Xss => 1,
+            Category::CmdInjection => 2,
+            Category::PathTraversal => 3,
+            Category::Ssrf => 4,
+            Category::Xxe => 5,
+            Category::Ssti => 6,
+            Category::Nosql => 7,
+            Category::LdapXpath => 8,
+            Category::Webshell => 9,
+            Category::Scanner => 10,
+            Category::Deserialization => 11,
+            Category::Crlf => 12,
+            Category::FileUpload => 13,
+            Category::Bruteforce => 14,
+            Category::SensitiveLeak => 15,
+            Category::Custom => 16,
+        }
+    }
+
     pub fn as_str(&self) -> &'static str {
         match self {
             Category::Sqli => "sqli",
@@ -68,7 +136,38 @@ impl Category {
             Category::LdapXpath => "ldap",
             Category::Webshell => "webshell",
             Category::Scanner => "scanner",
+            Category::Deserialization => "deserialization",
+            Category::Crlf => "crlf",
+            Category::FileUpload => "file_upload",
+            Category::Bruteforce => "bruteforce",
+            Category::SensitiveLeak => "sensitive_leak",
             Category::Custom => "custom",
+        }
+    }
+
+    /// 解析规则包里的分类名。兼容 `as_str` 与 serde 的紧凑写法。
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "sqli" | "sql" => Some(Category::Sqli),
+            "xss" => Some(Category::Xss),
+            "cmdi" | "cmdinjection" | "cmd_injection" | "command_injection" => {
+                Some(Category::CmdInjection)
+            }
+            "traversal" | "pathtraversal" | "path_traversal" => Some(Category::PathTraversal),
+            "ssrf" => Some(Category::Ssrf),
+            "xxe" => Some(Category::Xxe),
+            "ssti" => Some(Category::Ssti),
+            "nosql" => Some(Category::Nosql),
+            "ldap" | "ldapxpath" | "ldap_xpath" => Some(Category::LdapXpath),
+            "webshell" | "web_shell" => Some(Category::Webshell),
+            "scanner" => Some(Category::Scanner),
+            "deserialization" | "deserialize" => Some(Category::Deserialization),
+            "crlf" => Some(Category::Crlf),
+            "file_upload" | "fileupload" => Some(Category::FileUpload),
+            "bruteforce" | "brute_force" => Some(Category::Bruteforce),
+            "sensitive_leak" | "sensitiveleak" | "leak" => Some(Category::SensitiveLeak),
+            "custom" => Some(Category::Custom),
+            _ => None,
         }
     }
 }
@@ -102,6 +201,16 @@ impl Severity {
             Severity::Critical => 80,
         }
     }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "low" => Some(Severity::Low),
+            "medium" | "med" => Some(Severity::Medium),
+            "high" => Some(Severity::High),
+            "critical" | "crit" => Some(Severity::Critical),
+            _ => None,
+        }
+    }
 }
 
 /// 处置动作。
@@ -114,7 +223,27 @@ pub enum Action {
     Log,
 }
 
+impl Action {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Action::Block => "block",
+            Action::Log => "log",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "block" | "deny" | "drop" => Some(Action::Block),
+            "log" | "monitor" | "observe" => Some(Action::Log),
+            _ => None,
+        }
+    }
+}
+
 /// 一条检测规则。
+///
+/// 这是内置规则的静态定义。运行时使用的规则统一转成 [`RuleMeta`]，
+/// 因为订阅规则包是运行时加载的，不能再依赖 `'static` 生命周期。
 #[derive(Debug, Clone)]
 pub struct Rule {
     pub id: &'static str,
@@ -127,6 +256,60 @@ pub struct Rule {
     /// 预过滤关键词（小写）。命中任一才跑正则。
     pub keywords: &'static [&'static str],
     pub action: Action,
+}
+
+/// 规则来源，用于日志与控制台展示。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuleSource {
+    Builtin,
+    /// 规则包订阅名称
+    Feed(String),
+}
+
+impl RuleSource {
+    pub fn as_str(&self) -> &str {
+        match self {
+            RuleSource::Builtin => "builtin",
+            RuleSource::Feed(name) => name,
+        }
+    }
+
+    pub fn is_builtin(&self) -> bool {
+        matches!(self, RuleSource::Builtin)
+    }
+}
+
+/// 运行时规则。内置规则与订阅规则共用同一套结构与匹配路径。
+#[derive(Debug, Clone)]
+pub struct RuleMeta {
+    pub id: String,
+    pub name: String,
+    pub category: Category,
+    pub severity: Severity,
+    pub pattern: String,
+    pub targets: Vec<Target>,
+    pub keywords: Vec<String>,
+    pub action: Action,
+    /// 影子期内的规则只记录、不计入拦截分。
+    pub shadow: bool,
+    pub source: RuleSource,
+}
+
+impl From<&Rule> for RuleMeta {
+    fn from(rule: &Rule) -> Self {
+        Self {
+            id: rule.id.to_string(),
+            name: rule.name.to_string(),
+            category: rule.category,
+            severity: rule.severity,
+            pattern: rule.pattern.to_string(),
+            targets: rule.targets.to_vec(),
+            keywords: rule.keywords.iter().map(|k| k.to_string()).collect(),
+            action: rule.action,
+            shadow: false,
+            source: RuleSource::Builtin,
+        }
+    }
 }
 
 /// 内置规则集。
@@ -549,7 +732,7 @@ pub const BUILTIN_RULES: &[Rule] = &[
     Rule {
         id: "deser-php-object",
         name: "PHP 对象反序列化",
-        category: Category::Custom,
+        category: Category::Deserialization,
         severity: Severity::High,
         pattern: r#"o:\d{1,3}:"[a-z\\_]{1,80}":\d{1,3}:\{"#,
         targets: &[Target::Query, Target::Body],

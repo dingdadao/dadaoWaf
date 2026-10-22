@@ -29,6 +29,7 @@ pub struct Config {
     pub ip_groups: Vec<IpGroup>,
     pub rule_feeds: Vec<RuleFeed>,
     pub ratelimit: RateLimitConfig,
+    pub challenge: ChallengeConfig,
     pub logging: LoggingConfig,
     pub storage: StorageConfig,
     /// 应用列表。`sites` 为兼容别名。
@@ -673,6 +674,8 @@ pub enum OnFailure {
 pub struct RuleFeed {
     pub name: String,
     pub url: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
     #[serde(default)]
     pub channel: FeedChannel,
     #[serde(default = "default_true")]
@@ -680,6 +683,12 @@ pub struct RuleFeed {
     #[serde(default = "default_rule_check_interval")]
     pub check_interval: Duration,
     pub update_window: Option<String>,
+    #[serde(default = "default_rule_timeout")]
+    pub timeout: Duration,
+    #[serde(default = "default_rule_max_size")]
+    pub max_size: Size,
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
     #[serde(default = "default_true")]
     pub require_signature: bool,
     pub public_key: Option<String>,
@@ -691,6 +700,14 @@ pub struct RuleFeed {
 
 fn default_rule_check_interval() -> Duration {
     Duration::from_secs(86_400)
+}
+
+fn default_rule_timeout() -> Duration {
+    Duration::from_secs(20)
+}
+
+fn default_rule_max_size() -> Size {
+    Size::from_bytes(4 * 1024 * 1024)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
@@ -706,22 +723,62 @@ pub enum FeedChannel {
 // 限流
 // ============================================================
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RateLimitConfig {
+    /// CC 防护总开关。默认关闭：它会改变正常大流量场景的行为，
+    /// 不能因为升级固件就让用户的内网下载/同步突然被限。
+    pub enabled: bool,
     pub global_qps: u32,
     pub per_ip_qps: u32,
     pub per_ip_conn: u32,
     pub per_url_qps: u32,
+    /// 超限后的处置动作
+    pub action: RateLimitAction,
 }
 
 impl Default for RateLimitConfig {
     fn default() -> Self {
         Self {
+            enabled: false,
             global_qps: 2_000,
             per_ip_qps: 100,
             per_ip_conn: 64,
             per_url_qps: 200,
+            action: RateLimitAction::Block,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RateLimitAction {
+    /// 直接返回 429
+    #[default]
+    Block,
+    /// 先过人机验证，通过后放行
+    Challenge,
+    /// 只记录事件，不拦截
+    Log,
+}
+
+/// 人机验证（JS 工作量证明）参数。
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ChallengeConfig {
+    pub enabled: bool,
+    /// 前导零的十六进制位数。每加 1 计算量约翻 16 倍，家用默认 4（平均 6.5 万次哈希）。
+    pub difficulty: u8,
+    /// 通过验证后的免打扰时长
+    pub ttl: Duration,
+}
+
+impl Default for ChallengeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            difficulty: 4,
+            ttl: Duration::from_secs(1_800),
         }
     }
 }
