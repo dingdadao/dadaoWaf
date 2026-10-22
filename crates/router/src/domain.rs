@@ -212,6 +212,11 @@ mod tests {
             headers: Default::default(),
             websocket: false,
             expires_at: None,
+            description: String::new(),
+            group: String::new(),
+            access_mode: Default::default(),
+            static_site: Default::default(),
+            redirect: Default::default(),
         }
     }
 

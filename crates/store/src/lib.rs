@@ -150,6 +150,14 @@ pub struct EventFilter {
     pub action: Option<String>,
     /// 起始时间（Unix 秒，含）
     pub since: Option<i64>,
+    /// 结束时间（Unix 秒，含）
+    pub until: Option<i64>,
+    /// 精确匹配应用名
+    pub app: Option<String>,
+    /// 路径包含匹配
+    pub path: Option<String>,
+    /// 关键字，模糊匹配路径 / 规则 / 来源 IP
+    pub q: Option<String>,
 }
 
 /// 一条分钟级流量聚合。
@@ -480,12 +488,22 @@ impl Store {
                   AND (?2 IS NULL OR client_ip = ?2)
                   AND (?3 IS NULL OR action = ?3)
                   AND (?4 IS NULL OR ts >= ?4)
+                  AND (?5 IS NULL OR app = ?5)
+                  AND (?6 IS NULL OR ts <= ?6)
+                  AND (?7 IS NULL OR path LIKE '%' || ?7 || '%')
+                  AND (?8 IS NULL OR path LIKE '%' || ?8 || '%'
+                       OR rules LIKE '%' || ?8 || '%'
+                       OR client_ip LIKE '%' || ?8 || '%')
                 "#,
                 params![
                     f.kind.as_deref(),
                     f.ip.as_deref(),
                     f.action.as_deref(),
-                    f.since
+                    f.since,
+                    f.app.as_deref(),
+                    f.until,
+                    f.path.as_deref(),
+                    f.q.as_deref(),
                 ],
                 |r| r.get(0),
             )?;
@@ -498,8 +516,14 @@ impl Store {
                   AND (?2 IS NULL OR client_ip = ?2)
                   AND (?3 IS NULL OR action = ?3)
                   AND (?4 IS NULL OR ts >= ?4)
+                  AND (?5 IS NULL OR app = ?5)
+                  AND (?6 IS NULL OR ts <= ?6)
+                  AND (?7 IS NULL OR path LIKE '%' || ?7 || '%')
+                  AND (?8 IS NULL OR path LIKE '%' || ?8 || '%'
+                       OR rules LIKE '%' || ?8 || '%'
+                       OR client_ip LIKE '%' || ?8 || '%')
                 ORDER BY ts DESC, id DESC
-                LIMIT ?5 OFFSET ?6
+                LIMIT ?9 OFFSET ?10
                 "#,
             )?;
             let rows = stmt.query_map(
@@ -508,6 +532,10 @@ impl Store {
                     f.ip.as_deref(),
                     f.action.as_deref(),
                     f.since,
+                    f.app.as_deref(),
+                    f.until,
+                    f.path.as_deref(),
+                    f.q.as_deref(),
                     f.limit as i64,
                     f.offset as i64
                 ],
@@ -652,6 +680,39 @@ impl Store {
         })
     }
 
+    /// 事件趋势总量：按固定宽度聚合为 `(桶起点, 总数, 拦截数)`。
+    pub fn event_series_counts(
+        &self,
+        since: i64,
+        until: i64,
+        group_secs: i64,
+    ) -> Result<Vec<(i64, usize, usize)>, StoreError> {
+        let group = group_secs.max(60);
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT (ts / ?3) * ?3 AS bucket, COUNT(*),
+                       SUM(CASE WHEN action = 'block' THEN 1 ELSE 0 END)
+                FROM events
+                WHERE ts >= ?1 AND ts < ?2
+                GROUP BY bucket ORDER BY bucket
+                "#,
+            )?;
+            let rows = stmt.query_map(params![since, until, group], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)? as usize,
+                    r.get::<_, i64>(2)? as usize,
+                ))
+            })?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        })
+    }
+
     /// 时间范围内去重来源 IP 数。
     pub fn event_ip_count(
         &self,
@@ -692,6 +753,60 @@ impl Store {
                 "#,
             )?;
             let rows = stmt.query_map(params![since, until, action, limit as i64], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as usize))
+            })?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        })
+    }
+
+    /// 应用维度的事件排行，`(应用, 事件数)`，按事件数倒序。
+    pub fn event_app_counts(
+        &self,
+        since: i64,
+        until: i64,
+        action: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<(String, usize)>, StoreError> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT app, COUNT(*) FROM events
+                WHERE ts >= ?1 AND ts < ?2 AND (?3 IS NULL OR action = ?3)
+                  AND app <> ''
+                GROUP BY app ORDER BY COUNT(*) DESC, app
+                LIMIT ?4
+                "#,
+            )?;
+            let rows = stmt.query_map(params![since, until, action, limit as i64], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as usize))
+            })?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        })
+    }
+
+    /// 处置动作分布，`(动作, 条数)`。
+    pub fn event_action_counts(
+        &self,
+        since: i64,
+        until: i64,
+    ) -> Result<Vec<(String, usize)>, StoreError> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT action, COUNT(*) FROM events
+                WHERE ts >= ?1 AND ts < ?2
+                GROUP BY action ORDER BY COUNT(*) DESC
+                "#,
+            )?;
+            let rows = stmt.query_map(params![since, until], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as usize))
             })?;
             let mut out = Vec::new();

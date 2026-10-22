@@ -37,6 +37,8 @@ pub struct AdminState {
     pub token: Option<String>,
     /// 日志根目录，用于控制台的日志查看
     pub log_dir: std::path::PathBuf,
+    /// 进程启动时间（Unix 秒），用于系统页展示运行时长
+    pub started_at: i64,
 }
 
 type Ctx = Arc<AdminState>;
@@ -80,12 +82,14 @@ pub fn router(state: Ctx) -> Router {
         .route("/api/reports/{day}", get(report_detail))
         .route("/api/reports/{day}/csv", get(report_csv))
         .route("/api/screen", get(screen))
+        .route("/api/attack/overview", get(attack_overview))
         .route("/api/geoip", get(geoip_status))
         .route("/api/apps", get(list_apps).post(upsert_app))
-        .route("/api/apps/{id}", delete(delete_app))
+        .route("/api/apps/{id}", get(get_app).delete(delete_app))
+        .route("/api/apps/{id}/enabled", post(set_app_enabled))
         .route("/api/rules", get(list_rules).post(upsert_rule))
         .route("/api/rules/{id}", delete(delete_rule))
-        .route("/api/bans", get(list_bans))
+        .route("/api/bans", get(list_bans).post(create_ban))
         .route("/api/bans/{ip}", delete(unban))
         .route("/api/events", get(list_events))
         .route("/api/events/export", get(export_events))
@@ -106,6 +110,14 @@ pub fn router(state: Ctx) -> Router {
         .route("/api/whitelist/{id}", delete(delete_whitelist))
         .route("/api/settings", get(get_all_settings))
         .route("/api/settings/{key}", get(get_setting).put(put_setting))
+        .route("/api/system/info", get(system_info))
+        .route("/api/system/backup", get(system_backup))
+        .route("/api/system/prune", post(system_prune))
+        .route(
+            "/api/custom-rules",
+            get(list_custom_rules).post(import_custom_rules),
+        )
+        .route("/api/custom-rules/export", get(export_custom_rules))
         .route("/api/reload", post(reload))
         .with_state(state)
 }
@@ -595,6 +607,144 @@ async fn security(
 }
 
 // ============================================================
+// 攻击防护
+// ============================================================
+
+#[derive(Serialize)]
+struct AttackTotals {
+    events: usize,
+    blocked: usize,
+    attack_ips: usize,
+    apps: usize,
+    banned: usize,
+}
+
+#[derive(Serialize)]
+struct AttackPoint {
+    ts: i64,
+    total: usize,
+    blocked: usize,
+}
+
+#[derive(Serialize)]
+struct AttackOverview {
+    generated_at: i64,
+    range: i64,
+    totals: AttackTotals,
+    series: Vec<AttackPoint>,
+    /// 事件类型分布
+    kinds: Vec<NameCount>,
+    /// 处置动作分布
+    actions: Vec<NameCount>,
+    /// 攻击来源排行
+    top_ips: Vec<IpRow>,
+    /// 被攻击应用排行
+    top_apps: Vec<NameCount>,
+    /// 命中规则排行
+    rules: Vec<NameCount>,
+}
+
+async fn attack_overview(
+    State(ctx): State<Ctx>,
+    headers: HeaderMap,
+    Query(q): Query<RangeQuery>,
+) -> Response {
+    if !authorized(&ctx, &headers) {
+        return unauthorized();
+    }
+
+    let now = homewaf_acl::now_unix();
+    let range = q.range.unwrap_or(86_400).clamp(60, SECURITY_MAX_RANGE);
+    let since = now - range + 1;
+    let until = now + 1;
+
+    let kinds: Vec<NameCount> = ctx
+        .store
+        .event_kind_counts(since, until, None)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(name, count)| NameCount { name, count })
+        .collect();
+    let events: usize = kinds.iter().map(|k| k.count).sum();
+    let blocked = ctx
+        .store
+        .event_kind_counts(since, until, Some("block"))
+        .unwrap_or_default()
+        .iter()
+        .map(|(_, n)| *n)
+        .sum();
+    let attack_ips = ctx
+        .store
+        .event_ip_count(since, until, Some("block"))
+        .unwrap_or(0);
+
+    let group = if range <= 3_600 {
+        60
+    } else if range <= 21_600 {
+        300
+    } else {
+        3_600
+    };
+    let series = ctx
+        .store
+        .event_series_counts(since, until, group)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(ts, total, blocked)| AttackPoint {
+            ts,
+            total,
+            blocked,
+        })
+        .collect::<Vec<_>>();
+    let actions = ctx
+        .store
+        .event_action_counts(since, until)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(name, count)| NameCount { name, count })
+        .collect();
+    let top = ctx
+        .store
+        .top_event_ips(since, until, None, 10)
+        .unwrap_or_default();
+    let top_ips = ip_rows(&ctx.geoip, &top);
+    let app_counts = ctx
+        .store
+        .event_app_counts(since, until, None, 10)
+        .unwrap_or_default();
+    let apps = app_counts.len();
+    let top_apps = app_counts
+        .into_iter()
+        .map(|(name, count)| NameCount { name, count })
+        .collect();
+    let rules = rule_hits(&ctx.store, since, until, 10);
+    let banned = ctx
+        .store
+        .load_active_bans(now)
+        .map(|b| b.len())
+        .unwrap_or(0);
+
+    Json(AttackOverview {
+        generated_at: now,
+        range,
+        totals: AttackTotals {
+            events,
+            blocked,
+            attack_ips,
+            apps,
+            banned,
+        },
+        series,
+        kinds,
+        actions,
+        top_ips,
+        top_apps,
+        rules,
+    })
+    .into_response()
+}
+
+// ============================================================
 // 防护报告
 // ============================================================
 
@@ -1017,6 +1167,103 @@ async fn list_apps(State(ctx): State<Ctx>, headers: HeaderMap) -> Response {
     }
 }
 
+/// 单个应用详情：完整配置 + 上游健康状态 + 最近 24 小时概况。
+async fn get_app(
+    State(ctx): State<Ctx>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if !authorized(&ctx, &headers) {
+        return unauthorized();
+    }
+
+    let apps: Vec<Application> = match ctx.store.list_applications() {
+        Ok(apps) => apps,
+        Err(e) => return internal(e).into_response(),
+    };
+    let Some((index, app)) = apps
+        .iter()
+        .enumerate()
+        .find(|(_, a)| a.id == id)
+        .map(|(i, a)| (i, a.clone()))
+    else {
+        return (StatusCode::NOT_FOUND, "应用不存在").into_response();
+    };
+
+    let runtime = ctx.shared.load_full();
+    let health = runtime.pool.health_for_app(index);
+    let health: Vec<_> = app
+        .upstreams
+        .iter()
+        .enumerate()
+        .map(|(i, u)| {
+            serde_json::json!({
+                "addr": u.addr,
+                "healthy": health.get(i).map(|h| h.1).unwrap_or(true),
+            })
+        })
+        .collect();
+
+    let now = homewaf_acl::now_unix();
+    let dashboard = ctx.metrics.dashboard(86_400, Some(&app.id), now);
+    let stats = serde_json::json!({
+        "requests": dashboard.requests,
+        "blocked": dashboard.blocked,
+        "attack_ips": dashboard.attack_ips,
+        "unique_ips": dashboard.unique_ips,
+    });
+
+    Json(serde_json::json!({
+        "app": app,
+        "health": health,
+        "stats": stats,
+    }))
+    .into_response()
+}
+
+#[derive(Deserialize)]
+struct EnabledInput {
+    enabled: bool,
+}
+
+/// 启停应用。列表里的开关直接调这个接口，不必整份配置回传。
+async fn set_app_enabled(
+    State(ctx): State<Ctx>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(input): Json<EnabledInput>,
+) -> Response {
+    if !authorized(&ctx, &headers) {
+        return unauthorized();
+    }
+    let mut app: Application = match ctx
+        .store
+        .list_applications::<Application>()
+        .map(|apps| apps.into_iter().find(|a| a.id == id))
+    {
+        Ok(Some(app)) => app,
+        Ok(None) => return (StatusCode::NOT_FOUND, "应用不存在").into_response(),
+        Err(e) => return internal(e).into_response(),
+    };
+    app.enabled = input.enabled;
+
+    let now = homewaf_acl::now_unix();
+    if let Err(e) =
+        ctx.store
+            .upsert_application(&app.id, &app.domains.primary, app.enabled, &app, now)
+    {
+        return internal(e).into_response();
+    }
+    match reload_state(&ctx) {
+        Ok(()) => Json(serde_json::json!({"ok": true, "enabled": app.enabled})).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            format!("已写入数据库，但重载失败：{e}"),
+        )
+            .into_response(),
+    }
+}
+
 async fn upsert_app(
     State(ctx): State<Ctx>,
     headers: HeaderMap,
@@ -1077,15 +1324,44 @@ fn validate_app(ctx: &AdminState, app: &Application) -> Result<(), String> {
             .map_err(|e| format!("别名 {} 非法：{e}", i + 1))?;
     }
 
-    if app.upstreams.is_empty() {
-        return Err("至少需要一个上游".into());
+    if app.listen_ports.contains(&0) {
+        return Err("监听端口不能为 0".into());
     }
-    for (i, u) in app.upstreams.iter().enumerate() {
-        if u.addr.trim().is_empty() {
-            return Err(format!("上游 {} 的地址不能为空", i + 1));
+
+    match app.access_mode {
+        homewaf_config::AccessMode::Proxy => {
+            if app.upstreams.is_empty() {
+                return Err("反向代理应用至少需要一个上游".into());
+            }
+            for (i, u) in app.upstreams.iter().enumerate() {
+                if u.addr.trim().is_empty() {
+                    return Err(format!("上游 {} 的地址不能为空", i + 1));
+                }
+                if u.port == Some(0) {
+                    return Err(format!("上游 {} 的端口不能为 0", i + 1));
+                }
+            }
         }
-        if u.port == Some(0) {
-            return Err(format!("上游 {} 的端口不能为 0", i + 1));
+        homewaf_config::AccessMode::Static => {
+            if app.static_site.root.trim().is_empty() {
+                return Err("静态站点必须填写根目录".into());
+            }
+            let root = std::path::Path::new(app.static_site.root.trim());
+            if !root.is_dir() {
+                return Err(format!("静态站点根目录不存在或不是目录：{}", root.display()));
+            }
+        }
+        homewaf_config::AccessMode::Redirect => {
+            let target = app.redirect.target.trim();
+            if target.is_empty() {
+                return Err("重定向必须填写目标地址".into());
+            }
+            if !(target.starts_with("http://") || target.starts_with("https://")) {
+                return Err("重定向目标必须以 http:// 或 https:// 开头".into());
+            }
+            if ![301, 302, 303, 307, 308].contains(&app.redirect.status) {
+                return Err("重定向状态码只能是 301 / 302 / 303 / 307 / 308".into());
+            }
         }
     }
 
@@ -1293,6 +1569,61 @@ async fn unban(State(ctx): State<Ctx>, headers: HeaderMap, Path(ip): Path<String
     }
 }
 
+#[derive(Deserialize)]
+struct BanCreate {
+    ip: String,
+    /// 封禁时长（秒），默认 1 小时
+    #[serde(default)]
+    duration_secs: Option<u64>,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+/// 手动封禁。写入运行时封禁表与数据库，重启后可恢复。
+async fn create_ban(
+    State(ctx): State<Ctx>,
+    headers: HeaderMap,
+    Json(body): Json<BanCreate>,
+) -> Response {
+    if !authorized(&ctx, &headers) {
+        return unauthorized();
+    }
+
+    let Ok(addr) = body.ip.trim().parse::<std::net::IpAddr>() else {
+        return (StatusCode::BAD_REQUEST, "IP 格式非法").into_response();
+    };
+    let now = homewaf_acl::now_unix().max(0) as u64;
+    let duration = body.duration_secs.unwrap_or(3_600).clamp(60, 30 * 86_400);
+    let until = now + duration;
+    let reason = body
+        .reason
+        .map(|r| r.trim().to_string())
+        .filter(|r| !r.is_empty())
+        .unwrap_or_else(|| "manual".to_string());
+
+    ctx.bans.manual_ban(addr, until, 1, now);
+    let record = homewaf_store::BanRecord {
+        ip: addr.to_string(),
+        until: until as i64,
+        offenses: 1,
+        score: 0,
+        reason: reason.clone(),
+        created_at: now as i64,
+    };
+    if let Err(e) = ctx.store.upsert_ban(&record, now as i64) {
+        return internal(e).into_response();
+    }
+
+    Json(serde_json::json!({
+        "ok": true,
+        "ip": record.ip,
+        "until": until,
+        "duration_secs": duration,
+        "reason": reason,
+    }))
+    .into_response()
+}
+
 // ============================================================
 // 事件
 // ============================================================
@@ -1311,6 +1642,14 @@ struct EventQuery {
     action: Option<String>,
     #[serde(default)]
     since: Option<i64>,
+    #[serde(default)]
+    until: Option<i64>,
+    #[serde(default)]
+    app: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    q: Option<String>,
 }
 
 fn default_limit() -> usize {
@@ -1333,6 +1672,10 @@ async fn list_events(
         ip: q.ip,
         action: q.action,
         since: q.since,
+        until: q.until,
+        app: q.app,
+        path: q.path,
+        q: q.q,
     };
 
     match ctx.store.query_events(&filter) {
@@ -1368,6 +1711,10 @@ async fn export_events(
         ip: q.ip,
         action: q.action,
         since: q.since,
+        until: q.until,
+        app: q.app,
+        path: q.path,
+        q: q.q,
     };
 
     let Ok((events, _)) = ctx.store.query_events(&filter) else {
@@ -1606,6 +1953,7 @@ async fn get_all_settings(State(ctx): State<Ctx>, headers: HeaderMap) -> Respons
         ),
         // GeoIP 数据库路径，空表示未启用
         ("geoip_db", serde_json::Value::String(String::new())),
+        ("custom_rules", serde_json::Value::Array(Vec::new())),
     ] {
         out.insert(key.to_string(), load(key, value));
     }
@@ -1717,6 +2065,10 @@ fn check_setting_type(key: &str, value: &serde_json::Value) -> Result<(), String
         "rule_feeds" => serde_json::from_value::<Vec<RuleFeed>>(value.clone())
             .map(|_| ())
             .map_err(|e| format!("rule_feeds 结构不合法：{e}")),
+        // 兼容雷池（长亭）导出的自定义规则数组
+        "custom_rules" => serde_json::from_value::<Vec<CustomRule>>(value.clone())
+            .map(|_| ())
+            .map_err(|e| format!("custom_rules 结构不合法：{e}")),
         "geoip_db" => {
             let path = value
                 .as_str()
@@ -1725,6 +2077,283 @@ fn check_setting_type(key: &str, value: &serde_json::Value) -> Result<(), String
         }
         // 未知 key 直接拒绝，避免往库里塞垃圾
         other => Err(format!("未知的设置项 `{other}`")),
+    }
+}
+
+// ============================================================
+// 系统设置 / 自定义规则
+// ============================================================
+
+const CUSTOM_RULES_KEY: &str = "custom_rules";
+
+fn load_custom_rules(
+    store: &Store,
+) -> Result<Vec<homewaf_config::CustomRule>, homewaf_store::StoreError> {
+    Ok(store
+        .get_setting::<Vec<homewaf_config::CustomRule>>(CUSTOM_RULES_KEY)?
+        .unwrap_or_default())
+}
+
+async fn system_info(State(ctx): State<Ctx>, headers: HeaderMap) -> Response {
+    if !authorized(&ctx, &headers) {
+        return unauthorized();
+    }
+
+    let now = homewaf_acl::now_unix();
+    let state = ctx.shared.load_full();
+    let apps = ctx
+        .store
+        .list_applications::<homewaf_config::Application>()
+        .map(|v| v.len())
+        .unwrap_or(0);
+    let acl_rules = ctx.store.list_acl_rules().map(|v| v.len()).unwrap_or(0);
+    let custom_rules = load_custom_rules(&ctx.store).map(|v| v.len()).unwrap_or(0);
+    let events = ctx.store.event_count().unwrap_or(0);
+    let active_bans = ctx
+        .store
+        .load_active_bans(now)
+        .map(|v| v.len())
+        .unwrap_or(0);
+
+    Json(serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "pid": std::process::id(),
+        "started_at": ctx.started_at,
+        "now": now,
+        "uptime_secs": (now - ctx.started_at).max(0),
+        "listen": state.server.listen,
+        "tls_listen": state.server.tls_listen,
+        "admin_listen": state.server.admin.listen,
+        "workers": state.server.workers,
+        "apps": apps,
+        "acl_rules": acl_rules,
+        "custom_rules": custom_rules,
+        "detection_rules": state.detection_rule_count(),
+        "upstreams": state.upstream_count(),
+        "events": events,
+        "active_bans": active_bans,
+    }))
+    .into_response()
+}
+
+/// 导出可迁移的配置快照（不含事件与日志）。
+async fn system_backup(State(ctx): State<Ctx>, headers: HeaderMap) -> Response {
+    if !authorized(&ctx, &headers) {
+        return unauthorized();
+    }
+
+    let mut settings = serde_json::Map::new();
+    for key in [
+        "server",
+        "tls",
+        "protection",
+        "real_ip",
+        "acl",
+        "limits",
+        "ratelimit",
+        "challenge",
+        "logging",
+        "storage",
+        "rule_feeds",
+        CUSTOM_RULES_KEY,
+        "geoip_db",
+    ] {
+        if let Ok(Some(v)) = ctx.store.get_setting::<serde_json::Value>(key) {
+            settings.insert(key.to_string(), v);
+        }
+    }
+
+    let applications: Vec<homewaf_config::Application> =
+        ctx.store.list_applications().unwrap_or_default();
+    let acl_rules = ctx.store.list_acl_rules().unwrap_or_default();
+    let custom_rules = load_custom_rules(&ctx.store).unwrap_or_default();
+
+    let body = serde_json::json!({
+        "product": "homewaf",
+        "version": env!("CARGO_PKG_VERSION"),
+        "exported_at": homewaf_acl::now_unix(),
+        "applications": applications,
+        "settings": settings,
+        "acl_rules": acl_rules,
+        "custom_rules": custom_rules,
+    });
+
+    let filename = format!("homewaf-backup-{}.json", homewaf_acl::now_unix());
+    (
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "application/json; charset=utf-8".to_string(),
+            ),
+            (
+                axum::http::header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{filename}\""),
+            ),
+        ],
+        serde_json::to_string_pretty(&body).unwrap_or_default(),
+    )
+        .into_response()
+}
+
+#[derive(Deserialize)]
+struct PruneInput {
+    /// 保留天数
+    days: u32,
+}
+
+/// 清理过期事件。只删事件，不动配置与封禁记录。
+async fn system_prune(
+    State(ctx): State<Ctx>,
+    headers: HeaderMap,
+    Json(input): Json<PruneInput>,
+) -> Response {
+    if !authorized(&ctx, &headers) {
+        return unauthorized();
+    }
+    let days = input.days.clamp(1, 3_650) as i64;
+    let before = homewaf_acl::now_unix() - days * 86_400;
+    match ctx.store.prune_events(before) {
+        Ok(removed) => Json(serde_json::json!({
+            "ok": true,
+            "removed": removed,
+            "before": before,
+        }))
+        .into_response(),
+        Err(e) => internal(e).into_response(),
+    }
+}
+
+async fn list_custom_rules(State(ctx): State<Ctx>, headers: HeaderMap) -> Response {
+    if !authorized(&ctx, &headers) {
+        return unauthorized();
+    }
+    match load_custom_rules(&ctx.store) {
+        Ok(rules) => Json(rules).into_response(),
+        Err(e) => internal(e).into_response(),
+    }
+}
+
+async fn export_custom_rules(State(ctx): State<Ctx>, headers: HeaderMap) -> Response {
+    if !authorized(&ctx, &headers) {
+        return unauthorized();
+    }
+    let rules = match load_custom_rules(&ctx.store) {
+        Ok(rules) => rules,
+        Err(e) => return internal(e).into_response(),
+    };
+    let filename = format!("homewaf-custom-rules-{}.json", homewaf_acl::now_unix());
+    (
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "application/json; charset=utf-8".to_string(),
+            ),
+            (
+                axum::http::header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{filename}\""),
+            ),
+        ],
+        serde_json::to_string_pretty(&rules).unwrap_or_default(),
+    )
+        .into_response()
+}
+
+/// 兼容雷池导出的三种形态：裸数组、`{"rules": [...]}`、`{"data": [...]}`。
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RulesPayload {
+    List(Vec<homewaf_config::CustomRule>),
+    Wrapper {
+        #[serde(default)]
+        rules: Vec<homewaf_config::CustomRule>,
+        #[serde(default)]
+        data: Vec<homewaf_config::CustomRule>,
+    },
+}
+
+#[derive(Deserialize)]
+struct ImportQuery {
+    /// append 追加（按 id 去重），默认整体替换
+    #[serde(default)]
+    mode: Option<String>,
+}
+
+async fn import_custom_rules(
+    State(ctx): State<Ctx>,
+    headers: HeaderMap,
+    Query(q): Query<ImportQuery>,
+    Json(payload): Json<RulesPayload>,
+) -> Response {
+    if !authorized(&ctx, &headers) {
+        return unauthorized();
+    }
+
+    let incoming = match payload {
+        RulesPayload::List(v) => v,
+        RulesPayload::Wrapper { rules, data } => {
+            if !rules.is_empty() {
+                rules
+            } else {
+                data
+            }
+        }
+    };
+
+    let now = homewaf_acl::now_unix();
+    let mut rules: Vec<homewaf_config::CustomRule> = Vec::with_capacity(incoming.len());
+    for (i, mut rule) in incoming.into_iter().enumerate() {
+        if rule.action > 1 {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("第 {} 条规则的 action 只能是 0（白名单）或 1（黑名单）", i + 1),
+            )
+                .into_response();
+        }
+        rule.pattern.retain(|group| !group.is_empty());
+        if rule.pattern.is_empty() {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("第 {} 条规则的 pattern 不能为空", i + 1),
+            )
+                .into_response();
+        }
+        if rule.id.trim().is_empty() {
+            rule.id = format!("lei-{now}-{i}");
+        }
+        if rule.name.trim().is_empty() {
+            rule.name = rule.id.clone();
+        }
+        rules.push(rule);
+    }
+
+    let merged = if q.mode.as_deref() == Some("append") {
+        let mut existing = load_custom_rules(&ctx.store).unwrap_or_default();
+        for rule in rules {
+            match existing.iter_mut().find(|r| r.id == rule.id) {
+                Some(old) => *old = rule,
+                None => existing.push(rule),
+            }
+        }
+        existing
+    } else {
+        rules
+    };
+
+    let value = match serde_json::to_value(&merged) {
+        Ok(v) => v,
+        Err(e) => return internal(e).into_response(),
+    };
+    if let Err(e) = ctx.store.set_setting(CUSTOM_RULES_KEY, &value, now) {
+        return internal(e).into_response();
+    }
+
+    match reload_state(&ctx) {
+        Ok(()) => Json(serde_json::json!({"ok": true, "count": merged.len()})).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            format!("已写入数据库，但重载失败：{e}"),
+        )
+            .into_response(),
     }
 }
 
@@ -2317,6 +2946,7 @@ mod tests {
             tls: Default::default(),
             feed_failures: Vec::new(),
             rule_feeds: Vec::new(),
+            custom_rules: Vec::new(),
         }
     }
 
@@ -2330,6 +2960,7 @@ mod tests {
             allow_regex: false,
             token: None,
             log_dir: std::env::temp_dir(),
+            started_at: 0,
         }
     }
 
@@ -2362,6 +2993,11 @@ mod tests {
             headers: Default::default(),
             websocket: false,
             expires_at: None,
+            description: String::new(),
+            group: String::new(),
+            access_mode: Default::default(),
+            static_site: Default::default(),
+            redirect: Default::default(),
         }
     }
 

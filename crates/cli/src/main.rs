@@ -444,6 +444,7 @@ fn cmd_serve(
             allow_regex,
             token,
             log_dir: std::path::PathBuf::from(&logging_cfg.dir),
+            started_at: homewaf_acl::now_unix(),
         };
         match homewaf_admin::spawn(admin_state, admin_listen.clone()) {
             Ok(()) => tracing::info!(listen = %admin_listen, "控制台启动中"),

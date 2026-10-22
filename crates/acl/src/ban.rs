@@ -49,6 +49,8 @@ struct Entry {
     last_score_at: u64,
     until: u64,
     offenses: u32,
+    /// 手动封禁：即使自动封禁关闭也必须生效
+    manual: bool,
 }
 
 /// 可热更新的封禁参数。
@@ -111,12 +113,14 @@ impl BanTable {
     /// 查询某 IP 是否处于封禁中。
     pub fn check(&self, ip: IpAddr, now: u64) -> Option<BanStatus> {
         let settings = self.settings_snapshot()?;
-        if !settings.enabled {
-            return None;
-        }
         let key = ban_key(ip, settings.ipv6_prefix);
         let map = self.inner.read().ok()?;
         let entry = map.get(&key)?;
+
+        // 手动封禁不受 auto_ban.enabled 影响，否则关掉自动封禁时手动操作会失效
+        if !settings.enabled && !entry.manual {
+            return None;
+        }
 
         if entry.until > now {
             Some(BanStatus {
@@ -182,6 +186,23 @@ impl BanTable {
             let entry = map.entry(key).or_default();
             entry.until = until;
             entry.offenses = offenses;
+        }
+    }
+
+    /// 手动封禁。不受自动封禁开关影响，重犯时长由调用方决定。
+    pub fn manual_ban(&self, ip: IpAddr, until: u64, offenses: u32, now: u64) {
+        if until <= now {
+            return;
+        }
+        let Some(settings) = self.settings_snapshot() else {
+            return;
+        };
+        let key = ban_key(ip, settings.ipv6_prefix);
+        if let Ok(mut map) = self.inner.write() {
+            let entry = map.entry(key).or_default();
+            entry.until = until;
+            entry.offenses = offenses;
+            entry.manual = true;
         }
     }
 

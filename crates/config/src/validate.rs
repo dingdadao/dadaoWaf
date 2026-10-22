@@ -697,11 +697,34 @@ fn validate_applications(apps: &[Application], ctx: &mut Ctx) {
             }
         }
 
-        // 上游
-        if app.upstreams.is_empty() {
-            ctx.error(format!("{base}.upstreams"), "应用至少需要一个上游");
-        } else {
-            validate_upstreams(&app.upstreams, &format!("{base}.upstreams"), ctx);
+        // 上游：只有反向代理应用需要
+        match app.access_mode {
+            AccessMode::Proxy => {
+                if app.upstreams.is_empty() {
+                    ctx.error(format!("{base}.upstreams"), "应用至少需要一个上游");
+                } else {
+                    validate_upstreams(&app.upstreams, &format!("{base}.upstreams"), ctx);
+                }
+            }
+            AccessMode::Static => {
+                if app.static_site.root.trim().is_empty() {
+                    ctx.error(format!("{base}.static_site.root"), "静态站点必须填写根目录");
+                }
+            }
+            AccessMode::Redirect => {
+                let target = app.redirect.target.trim();
+                if target.is_empty() {
+                    ctx.error(format!("{base}.redirect.target"), "重定向必须填写目标地址");
+                } else if !(target.starts_with("http://") || target.starts_with("https://")) {
+                    ctx.error(
+                        format!("{base}.redirect.target"),
+                        "重定向目标必须以 http:// 或 https:// 开头",
+                    );
+                }
+                if ![301, 302, 303, 307, 308].contains(&app.redirect.status) {
+                    ctx.error(format!("{base}.redirect.status"), "重定向状态码非法");
+                }
+            }
         }
 
         // 路由
@@ -1058,6 +1081,11 @@ mod tests {
             headers: HeadersConfig::default(),
             websocket: false,
             expires_at: None,
+            description: String::new(),
+            group: String::new(),
+            access_mode: Default::default(),
+            static_site: Default::default(),
+            redirect: Default::default(),
         }
     }
 

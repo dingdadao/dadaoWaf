@@ -410,6 +410,22 @@
     .screen-kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .screen-row.main, .screen-row.split3 { grid-template-columns: 1fr; }
   }
+
+  /* 系统设置 / 应用详情：独立页签，避免与统计页的 .stats-panel 互相干扰 */
+  .sys-tabs { display: flex; gap: 6px; margin-bottom: 14px; flex-wrap: wrap; }
+  .sys-tabs a {
+    padding: 7px 14px; border-radius: 7px; cursor: pointer; font-size: 13px;
+    color: var(--muted); border: 1px solid transparent; user-select: none;
+  }
+  .sys-tabs a:hover { background: #f2f2ee; color: var(--text); }
+  .sys-tabs a.active { background: #1c2530; color: #fff; }
+  .sys-panel { display: none; }
+  .sys-panel.active { display: block; }
+  .sys-panel .card, .sys-panel .dcard { margin-bottom: 14px; }
+  .sys-info-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1px; background: var(--border); }
+  .sys-info-grid > div { background: var(--card); padding: 14px 16px; }
+  .sys-info-grid b { display: block; margin-top: 6px; font-size: 16px; font-variant-numeric: tabular-nums; }
+  .sys-info-grid span { font-size: 12px; color: var(--muted); }
 </style>
 </head>
 <body>
@@ -419,7 +435,8 @@
     <div class="brand">HomeWAF<small>家用 Web 应用防火墙</small></div>
     <nav class="nav" id="nav">
       <a data-page="statistics" class="active">统计报表</a>
-      <a data-page="apps">应用</a>
+      <a data-page="apps">防护应用</a>
+      <a data-page="attack">攻击防护</a>
       <a data-page="rules">访问控制</a>
       <a data-page="whitelist">检测白名单</a>
       <a data-page="feeds">IP 组订阅</a>
@@ -427,7 +444,7 @@
       <a data-page="bans">封禁<span class="badge" id="nav-bans">0</span></a>
       <a data-page="events">事件</a>
       <a data-page="logs">日志</a>
-      <a data-page="settings">设置</a>
+      <a data-page="system">系统设置</a>
     </nav>
   </aside>
 
@@ -559,28 +576,96 @@
         </div>
       </div>
 
-      <!-- ========== 应用 ========== -->
+      <!-- ========== 防护应用 ========== -->
       <div class="page" data-page="apps">
+        <div id="apps-list-view">
+          <section class="card">
+            <header>
+              <h2>防护应用</h2>
+              <div class="filters">
+                <input id="apps-q" placeholder="搜索应用 / 域名 / 上游" onkeydown="if(event.key==='Enter')loadApps()">
+                <button class="primary" onclick="openAppEditor(null)">+ 新建应用</button>
+              </div>
+            </header>
+            <div id="apps"></div>
+          </section>
+        </div>
+
+        <div id="apps-detail-view" style="display:none">
+          <section class="card">
+            <header>
+              <h2 id="app-detail-title">应用详情</h2>
+              <div class="filters">
+                <button onclick="closeAppDetail()">返回列表</button>
+                <button class="primary" id="app-detail-save" onclick="saveAppDetail()">保存</button>
+              </div>
+            </header>
+            <div class="sys-tabs" id="app-tabs">
+              <a data-apptab="basicInfo" class="active">基本信息</a>
+              <a data-apptab="forwardingRule">转发规则</a>
+              <a data-apptab="proxyConfig">高级配置</a>
+              <a data-apptab="resource">应用路由</a>
+            </div>
+            <div id="app-detail"></div>
+          </section>
+        </div>
+      </div>
+
+      <!-- ========== 攻击防护 ========== -->
+      <div class="page" data-page="attack">
+        <div class="stats-filters" style="margin-bottom:12px">
+          <select id="attack-range">
+            <option value="3600">最近 1 小时</option>
+            <option value="21600">最近 6 小时</option>
+            <option value="86400" selected>最近 24 小时</option>
+            <option value="604800">最近 7 天</option>
+            <option value="2592000">最近 30 天</option>
+          </select>
+          <select id="attack-app"><option value="">全部应用</option></select>
+          <select id="attack-kind">
+            <option value="">全部类型</option><option value="detect">检测</option>
+            <option value="ban">封禁</option><option value="acl">ACL</option>
+            <option value="ratelimit">CC 限流</option><option value="challenge">人机验证</option>
+          </select>
+          <select id="attack-action">
+            <option value="">全部处置</option><option value="block">拦截</option>
+            <option value="log">记录</option><option value="observe">观察</option>
+          </select>
+          <input id="attack-q" placeholder="IP / 路径 / 规则关键字" onkeydown="if(event.key==='Enter'){attackPage=0;loadAttack()}">                    
+          <button onclick="attackPage=0;loadAttack()">查询</button>
+          <button onclick="exportAttack()">导出 CSV</button>
+          <label class="row" style="margin:0;font-size:12px"><input type="checkbox" id="attack-auto" onchange="toggleAttackAuto()"> 自动刷新</label>
+        </div>
+
+        <div class="kpi-grid" id="attack-kpis"></div>
+
+        <div class="stats-cols wide-left">
+          <section class="dcard">
+            <header>
+              <h2>攻击趋势</h2>
+              <span class="chart-legend"><span><i style="background:#f06a6a"></i>拦截</span><span><i style="background:#4a9eda"></i>全部事件</span></span>
+            </header>
+            <div class="chart" id="attack-trend"></div>
+          </section>
+          <section class="dcard">
+            <header><h2>攻击类型分布</h2></header>
+            <div id="attack-kinds"></div>
+          </section>
+        </div>
+
+        <div class="stats-cols three">
+          <section class="dcard"><header><h2>攻击来源 IP</h2></header><div id="attack-ips"></div></section>
+          <section class="dcard"><header><h2>被攻击应用</h2></header><div id="attack-apps"></div></section>
+          <section class="dcard"><header><h2>命中规则</h2></header><div id="attack-rules"></div></section>
+        </div>
+
         <section class="card">
           <header>
-            <h2>应用列表</h2>
-            <button class="primary" onclick="showAppForm()">+ 新建应用</button>
+            <h2>攻击事件</h2>
+            <div class="filters"><span class="muted" id="attack-total"></span></div>
           </header>
-          <form id="app-form" onsubmit="submitApp(event)" style="display:none">
-            <div><label for="af-id">ID</label><input id="af-id" placeholder="nas" required></div>
-            <div><label for="af-domain">对外域名</label><input id="af-domain" placeholder="nas.home.lan" required></div>
-            <div><label for="af-ports">监听端口（逗号分隔）</label><input id="af-ports" placeholder="80, 443"></div>
-            <div class="hint">留空接受任意端口；填了则只在该端口响应</div>
-            <div class="wide"><label for="af-addr">上游服务器（每行一个）</label><textarea id="af-addr" rows="2" placeholder="http://192.168.1.5:8080&#10;http://192.168.1.6:8080" required></textarea></div>
-            <div class="hint">不写协议默认 http:80；写 https:// 默认 443；端口可省略。多个上游默认轮询。</div>
-            <div class="wide"><label for="af-policy">策略覆盖（JSON，留空跟随全局）</label><textarea id="af-policy" rows="4" placeholder='{ "preset": "strict", "require_challenge": true }'></textarea></div>
-            <div class="hint">支持 preset / protection / observe_mode / block_threshold / ratelimit / require_challenge / allow_cidr / deny_cidr / max_body_size / allow_methods。路由级策略需在数据库或 YAML 中配置。</div>
-            <div style="display:flex;gap:8px;align-items:center">
-              <button type="submit" class="primary" id="af-submit">保存</button>
-              <button type="button" onclick="hideAppForm()">取消</button>
-            </div>
-          </form>
-          <div id="apps"></div>
+          <div id="attack-events"></div>
+          <div id="attack-pager" class="pager"></div>
         </section>
       </div>
 
@@ -753,15 +838,83 @@
         </section>
       </div>
 
-      <!-- ========== 设置 ========== -->
-      <div class="page" data-page="settings">
-        <section class="card">
-          <header>
-            <h2>设置</h2>
-            <button class="primary" id="save-settings" onclick="saveSettings()">保存设置</button>
-          </header>
-          <div id="settings"></div>
-        </section>
+      <!-- ========== 系统设置 ========== -->
+      <div class="page" data-page="system">
+        <div class="sys-tabs" id="system-tabs">
+          <a data-systemtab="basic" class="active">基本设置</a>
+          <a data-systemtab="engine">防护引擎</a>
+          <a data-systemtab="rules">规则管理</a>
+          <a data-systemtab="maintenance">数据维护</a>
+        </div>
+
+        <div class="sys-panel active" data-systemtab="basic">
+          <section class="card">
+            <header>
+              <h2>系统信息</h2>
+              <button onclick="loadSystemInfo()">刷新</button>
+            </header>
+            <div id="system-info"><div class="empty">加载中…</div></div>
+          </section>
+          <section class="card">
+            <header><h2>接入与端口</h2></header>
+            <div id="system-listen"></div>
+          </section>
+          <section class="card">
+            <header><h2>控制台</h2></header>
+            <div class="fieldset">
+              <div class="wide"><label>管理面监听</label><input id="sys-admin-listen" readonly></div>
+              <div class="wide hint">管理面地址由启动参数与 server.admin.listen 决定，修改后需要重启进程。HomeWAF 不包含共享计划、许可证与云端配额。</div>
+            </div>
+          </section>
+        </div>
+
+        <div class="sys-panel" data-systemtab="engine">
+          <section class="card">
+            <header>
+              <h2>防护引擎</h2>
+              <button class="primary" id="save-settings" onclick="saveSettings()">保存设置</button>
+            </header>
+            <div id="settings"></div>
+          </section>
+        </div>
+
+        <div class="sys-panel" data-systemtab="rules">
+          <section class="card">
+            <header>
+              <h2>自定义规则</h2>
+              <div class="filters">
+                <button onclick="loadCustomRules()">刷新</button>
+                <button onclick="exportCustomRules()">导出（雷池格式）</button>
+                <button class="primary" onclick="document.getElementById('rules-file').click()">导入 JSON</button>
+                <input type="file" id="rules-file" accept=".json,application/json" style="display:none" onchange="readRulesFile(this)">
+              </div>
+            </header>
+            <div class="hint" style="padding:10px 16px;border-bottom:1px solid var(--border)">
+              兼容雷池（长亭）自定义规则：pattern 外层 OR、内层 AND，action 0 为白名单、1 为黑名单。
+              支持裸数组、<code>{"rules": [...]}</code> 与 <code>{"data": [...]}</code> 三种导入格式。
+            </div>
+            <div id="custom-rules"></div>
+          </section>
+        </div>
+
+        <div class="sys-panel" data-systemtab="maintenance">
+          <section class="card">
+            <header><h2>配置备份</h2></header>
+            <div class="fieldset">
+              <div class="wide hint">导出应用、全部全局设置、访问控制规则与自定义规则，可用于迁移到另一台设备。</div>
+              <div><button class="primary" onclick="downloadBackup()">下载配置备份</button></div>
+            </div>
+          </section>
+          <section class="card">
+            <header><h2>事件清理</h2></header>
+            <div class="fieldset">
+              <div><label for="sys-prune-days">保留最近多少天的事件</label>
+                <input type="number" id="sys-prune-days" min="1" max="3650" value="30"></div>
+              <div><button class="danger" onclick="pruneEvents()">清理过期事件</button></div>
+              <div class="wide hint">只删除事件表，不影响应用、规则与封禁记录。清理后统计报表的历史数据会同步减少。</div>
+            </div>
+          </section>
+        </div>
       </div>
 
     </div>
@@ -851,9 +1004,9 @@ const durationToSecs = (d) => {
 // 页面切换
 // ============================================================
 const PAGE_TITLES = {
-  statistics: '统计报表', apps: '应用', rules: '访问控制', whitelist: '检测白名单',
-  feeds: 'IP 组订阅', 'rule-feeds': '规则订阅', bans: '封禁', events: '事件',
-  logs: '日志', settings: '设置',
+  statistics: '统计报表', apps: '防护应用', attack: '攻击防护', rules: '访问控制',
+  whitelist: '检测白名单', feeds: 'IP 组订阅', 'rule-feeds': '规则订阅',
+  bans: '封禁', events: '事件', logs: '日志', system: '系统设置',
 };
 
 let currentPage = 'statistics';
@@ -869,9 +1022,9 @@ document.getElementById('nav').addEventListener('click', (e) => {
   document.getElementById('page-title').textContent = PAGE_TITLES[page] || page;
 
   // 切换时按需加载
-  ({ apps: loadApps, rules: loadRules, whitelist: loadWhitelist, feeds: loadFeeds,
+  ({ apps: loadApps, attack: loadAttackPage, rules: loadRules, whitelist: loadWhitelist, feeds: loadFeeds,
      'rule-feeds': loadRuleFeeds,
-     bans: loadBans, events: loadEvents, logs: loadLogs, settings: loadSettings,
+     bans: loadBans, events: loadEvents, logs: loadLogs, system: loadSystemPage,
      statistics: loadStatistics }[page] || (() => {}))();
 });
 
@@ -1577,120 +1730,354 @@ async function loadStatisticsApps() {
 // 应用
 // ============================================================
 let appsCache = [];
-let editingApp = null;
+let currentApp = null;
+let appDetailTab = 'basicInfo';
+let appDetailNew = false;
+let appDetailStats = null;
+let appDetailHealth = [];
+
+const accessModeLabel = (m) => ({ proxy: '反向代理', static: '静态站点', redirect: '重定向' }[m] || '反向代理');
+function targetSummary(a) {
+  if (a.access_mode === 'static') return `<code>${esc(a.static_site?.root || '-')}</code>`;
+  if (a.access_mode === 'redirect') return `<code>${esc(a.redirect?.target || '-')}</code>`;
+  return (a.upstreams || []).map(u => `<code>${esc(u.port ? `${u.addr}:${u.port}` : u.addr)}</code>`).join('<br>') || '—';
+}
 
 async function loadApps() {
   const el = document.getElementById('apps');
+  const q = (document.getElementById('apps-q')?.value || '').trim().toLowerCase();
   try {
-    const apps = await api('/apps');
+    let apps = await api('/apps');
+    if (q) {
+      apps = apps.filter(a => [a.id, a.name, a.description, a.group, a.domains.primary,
+        ...(a.domains.aliases || []), ...(a.upstreams || []).map(u => u.addr)]
+        .join(' ').toLowerCase().includes(q));
+    }
     appsCache = apps;
     if (!apps.length) { el.innerHTML = '<div class="empty">还没有应用，点右上角新建</div>'; return; }
     el.innerHTML = `<table>
-      <thead><tr><th>ID</th><th>入口域名</th><th>代理地址</th><th>状态</th><th>路由</th><th></th></tr></thead>
+      <thead><tr><th>应用</th><th>域名</th><th>接入方式</th><th>上游 / 目标</th><th>状态</th><th>路由</th><th></th></tr></thead>
       <tbody>${apps.map(a => `<tr>
-        <td><code>${esc(a.id)}</code></td>
-        <td>${esc(a.domains.primary)}${a.domains.aliases.length ? `<br><span class="sub" style="margin:0">+${a.domains.aliases.length} 别名</span>` : ''}</td>
-        <td>${a.upstreams.map(u => `<code>${esc(u.port ? `${u.addr}:${u.port}` : u.addr)}</code>`).join('<br>')}</td>
+        <td><code>${esc(a.id)}</code>${a.group ? `<br><span class="sub" style="margin:0">${esc(a.group)}</span>` : ''}</td>
+        <td>${esc(a.domains.primary)}${a.domains.aliases?.length ? `<br><span class="sub" style="margin:0">+${a.domains.aliases.length} 别名</span>` : ''}</td>
+        <td><span class="tag log">${accessModeLabel(a.access_mode)}</span></td>
+        <td>${targetSummary(a)}</td>
         <td>${a.enabled ? '<span class="tag allow">启用</span>' : '<span class="tag deny">禁用</span>'}</td>
-        <td>${a.routes.length}</td>
+        <td>${a.routes?.length || 0}</td>
         <td style="white-space:nowrap">
-          <button onclick="editApp('${esc(a.id)}')">编辑</button>
+          <button onclick="openAppDetail('${esc(a.id)}')">详情</button>
+          <button onclick="toggleApp('${esc(a.id)}', ${a.enabled ? 'false' : 'true'})">${a.enabled ? '禁用' : '启用'}</button>
           <button class="danger" onclick="deleteApp('${esc(a.id)}')">删除</button>
         </td>
       </tr>`).join('')}</tbody></table>`;
   } catch (e) { el.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`; }
 }
 
-function showAppForm(app) {
-  editingApp = app || null;
-  const f = document.getElementById('app-form');
-  f.style.display = 'grid';
-  const idEl = document.getElementById('af-id');
-  idEl.value = app?.id || '';
-  idEl.readOnly = !!app;
-  idEl.style.background = app ? '#f5f5f2' : '#fff';
-  document.getElementById('af-domain').value = app?.domains?.primary || '';
-  document.getElementById('af-ports').value = (app?.listen_ports || []).join(', ');
-  document.getElementById('af-addr').value = (app?.upstreams || [])
-    .map(u => u.port ? `${u.addr}:${u.port}` : u.addr).join('\n');
-  const policy = Object.fromEntries(
-    Object.entries(app?.policy || {}).filter(([, v]) => v != null)
-  );
-  document.getElementById('af-policy').value = Object.keys(policy).length
-    ? JSON.stringify(policy, null, 2) : '';
-  document.getElementById('af-submit').textContent = app ? '保存修改' : '创建';
-  idEl.focus();
+async function toggleApp(id, enabled) {
+  try {
+    await api(`/apps/${encodeURIComponent(id)}/enabled`, { method: 'POST', body: JSON.stringify({ enabled }) });
+    showMsg(`${id} 已${enabled ? '启用' : '禁用'}`);
+    loadApps(); loadStatistics();
+  } catch (e) { showMsg('操作失败：' + e.message, 'error'); }
 }
 
-function hideAppForm() {
-  document.getElementById('app-form').style.display = 'none';
-  editingApp = null;
+function blankApp() {
+  return {
+    id: '', name: '', enabled: true, description: '', group: '',
+    domains: { primary: '', aliases: [] }, listen_ports: [], upstreams: [], routes: [],
+    tls: { mode: 'auto', cert_id: null }, policy: {},
+    lb: { algorithm: 'round_robin', sticky: false },
+    timeouts: { connect: '5s', read: '60s', write: '60s', idle: '75s', request: null },
+    health_check: {}, retry: { enabled: false, attempts: 2 },
+    headers: {}, websocket: false, expires_at: null,
+    access_mode: 'proxy',
+    static_site: { root: '', index: 'index.html', spa_fallback: false },
+    redirect: { target: '', status: 302 },
+  };
 }
 
-function editApp(id) {
-  const app = appsCache.find(a => a.id === id);
-  if (app) showAppForm(app);
+function showAppDetailView() {
+  document.getElementById('apps-list-view').style.display = 'none';
+  document.getElementById('apps-detail-view').style.display = 'block';
+  document.getElementById('app-detail-title').textContent = appDetailNew
+    ? '新建防护应用' : `防护应用 · ${currentApp.id}`;
+  document.getElementById('app-detail-save').textContent = appDetailNew ? '创建' : '保存';
+  document.querySelectorAll('#app-tabs a').forEach(a => a.classList.toggle('active', a.dataset.apptab === appDetailTab));
+  renderAppDetail();
 }
 
-async function submitApp(e) {
-  e.preventDefault();
-  const btn = document.getElementById('af-submit');
-  const id = document.getElementById('af-id').value.trim();
-  const domain = document.getElementById('af-domain').value.trim();
-  const addrLines = document.getElementById('af-addr').value
-    .split('\n').map(s => s.trim()).filter(Boolean);
-  const portsRaw = document.getElementById('af-ports').value.trim();
-  const policyRaw = document.getElementById('af-policy').value.trim();
+async function openAppDetail(id) {
+  try {
+    const data = await api('/apps/' + encodeURIComponent(id));
+    currentApp = data.app;
+    appDetailStats = data.stats;
+    appDetailHealth = data.health || [];
+    appDetailNew = false;
+    appDetailTab = 'basicInfo';
+    showAppDetailView();
+  } catch (e) { showMsg('加载应用失败：' + e.message, 'error'); }
+}
 
-  if (!/^[a-z0-9][a-z0-9-]*$/.test(id)) return showMsg('ID 只能包含小写字母、数字和横线', 'error');
-  if (!addrLines.length) return showMsg('至少需要一个上游服务器', 'error');
+function openAppEditor(app) {
+  currentApp = app ? JSON.parse(JSON.stringify(app)) : blankApp();
+  appDetailStats = null; appDetailHealth = [];
+  appDetailNew = !app; appDetailTab = 'basicInfo';
+  showAppDetailView();
+}
 
-  const listenPorts = portsRaw
-    ? portsRaw.split(',').map(s => parseInt(s.trim(), 10)).filter(p => p > 0 && p <= 65535)
-    : [];
-  if (portsRaw && !listenPorts.length) return showMsg('监听端口格式不对，应该是 80, 443 这样', 'error');
+function closeAppDetail() {
+  document.getElementById('apps-detail-view').style.display = 'none';
+  document.getElementById('apps-list-view').style.display = 'block';
+  currentApp = null;
+  loadApps();
+}
 
-  let policy = {};
-  if (policyRaw) {
-    try { policy = JSON.parse(policyRaw); }
-    catch { return showMsg('策略 JSON 格式不对', 'error'); }
-    if (!policy || Array.isArray(policy) || typeof policy !== 'object') {
-      return showMsg('策略必须是一个 JSON 对象', 'error');
-    }
+document.getElementById('app-tabs').addEventListener('click', (e) => {
+  const a = e.target.closest('a[data-apptab]');
+  if (!a || !currentApp) return;
+  collectAppDetail();
+  appDetailTab = a.dataset.apptab;
+  document.querySelectorAll('#app-tabs a').forEach(x => x.classList.toggle('active', x === a));
+  renderAppDetail();
+});
+
+function renderAppDetail() {
+  const a = currentApp;
+  const el = document.getElementById('app-detail');
+  if (!a) { el.innerHTML = ''; return; }
+
+  if (appDetailTab === 'basicInfo') {
+    const health = (appDetailHealth || []).map(h => `<span class="tag ${h.healthy ? 'allow' : 'deny'}">${esc(h.addr)} · ${h.healthy ? '健康' : '异常'}</span>`).join(' ') || '<span class="muted">暂无运行时状态</span>';
+    el.innerHTML = `<div class="fieldset">
+      <div><label for="ad-id">应用 ID</label><input id="ad-id" value="${esc(a.id)}" ${appDetailNew ? '' : 'readonly'} placeholder="nas"></div>
+      <div><label for="ad-name">名称</label><input id="ad-name" value="${esc(a.name || '')}"></div>
+      <div><label for="ad-group">分组</label><input id="ad-group" value="${esc(a.group || '')}" placeholder="家庭服务"></div>
+      <div><label for="ad-status">状态</label><select id="ad-status">
+        <option value="true" ${a.enabled ? 'selected' : ''}>启用</option>
+        <option value="false" ${!a.enabled ? 'selected' : ''}>禁用</option></select></div>
+      <div class="wide"><label for="ad-desc">描述</label><input id="ad-desc" value="${esc(a.description || '')}" placeholder="备注用途"></div>
+      <div><label for="ad-domain">主域名</label><input id="ad-domain" value="${esc(a.domains?.primary || '')}" placeholder="nas.home.lan"></div>
+      <div><label for="ad-aliases">别名域名（逗号分隔）</label><input id="ad-aliases" value="${esc((a.domains?.aliases || []).join(', '))}"></div>
+      <div><label for="ad-ports">监听端口（逗号分隔，空为任意）</label><input id="ad-ports" value="${(a.listen_ports || []).join(', ')}"></div>
+      <div><label for="ad-mode">接入方式</label><select id="ad-mode" onchange="collectAppDetail();renderAppDetail()">
+        <option value="proxy" ${a.access_mode === 'proxy' ? 'selected' : ''}>反向代理</option>
+        <option value="static" ${a.access_mode === 'static' ? 'selected' : ''}>静态站点</option>
+        <option value="redirect" ${a.access_mode === 'redirect' ? 'selected' : ''}>重定向</option></select></div>
+      <div class="wide"><label>运行状态</label><div>${health}</div></div>
+      <div class="wide hint">${appDetailStats ? `最近 24 小时：请求 ${appDetailStats.requests} · 拦截 ${appDetailStats.blocked} · 攻击 IP ${appDetailStats.attack_ips}` : '保存后可在列表查看状态'}</div>
+    </div>`;
+    return;
   }
 
-  // 编辑时保留其他字段；别名域名不在表单里了，但要保留已有数据
-  const app = {
-    ...(editingApp || {}),
-    id,
-    name: editingApp?.name || id,
-    domains: {
-      primary: domain,
-      aliases: editingApp?.domains?.aliases || [],
-    },
-    listen_ports: listenPorts,
-    upstreams: addrLines.map(addr => {
-      const old = (editingApp?.upstreams || []).find(u => (u.port ? `${u.addr}:${u.port}` : u.addr) === addr);
-      return old ? { ...old } : { addr };
-    }),
-    policy,
-    enabled: editingApp?.enabled ?? true,
-  };
+  if (appDetailTab === 'forwardingRule') {
+    if (a.access_mode === 'static') {
+      el.innerHTML = `<div class="fieldset">
+        <div class="wide"><label for="ad-root">站点根目录</label><input id="ad-root" value="${esc(a.static_site?.root || '')}" placeholder="/var/www/site"></div>
+        <div><label for="ad-index">首页文件</label><input id="ad-index" value="${esc(a.static_site?.index || 'index.html')}"></div>
+        <div><label class="row"><input type="checkbox" id="ad-spa" ${a.static_site?.spa_fallback ? 'checked' : ''}> 单页应用回退</label></div>
+        <div class="wide hint">静态文件在 ACL 与检测之后返回，仍然受 WAF 保护。</div>
+      </div>`;
+      return;
+    }
+    if (a.access_mode === 'redirect') {
+      el.innerHTML = `<div class="fieldset">
+        <div class="wide"><label for="ad-target">重定向目标</label><input id="ad-target" value="${esc(a.redirect?.target || '')}" placeholder="https://example.com{path}"></div>
+        <div><label for="ad-redir-status">状态码</label><select id="ad-redir-status">
+          ${[301, 302, 303, 307, 308].map(s => `<option value="${s}" ${a.redirect?.status === s ? 'selected' : ''}>${s}</option>`).join('')}
+        </select></div>
+        <div class="wide hint">{path} 会被替换为请求路径，{query} 替换为查询串。</div>
+      </div>`;
+      return;
+    }
+    const ups = a.upstreams?.length ? a.upstreams : [{ addr: '', port: null, scheme: 'http', weight: 1, backup: false, max_conns: 128 }];
+    el.innerHTML = `<div class="fieldset">
+      <div class="wide"><label>上游服务器</label></div>
+      <div class="wide"><table id="app-upstreams"><thead><tr>
+        <th>地址</th><th>端口</th><th>协议</th><th>权重</th><th>备份</th><th>最大连接</th><th></th>
+      </tr></thead><tbody>${ups.map((u, i) => upstreamRow(u, i)).join('')}</tbody></table></div>
+      <div class="wide"><button type="button" onclick="addUpstreamRow()">+ 添加上游</button></div>
+      <div><label for="ad-lb">负载均衡</label><select id="ad-lb">
+        ${[['round_robin', '轮询'], ['weighted', '加权'], ['least_conn', '最少连接'], ['ip_hash', 'IP 哈希'], ['consistent_hash', '一致性哈希']]
+          .map(([v, t]) => `<option value="${v}" ${a.lb?.algorithm === v ? 'selected' : ''}>${t}</option>`).join('')}
+      </select></div>
+      <div><label class="row"><input type="checkbox" id="ad-sticky" ${a.lb?.sticky ? 'checked' : ''}> 会话保持</label></div>
+      <div><label class="row"><input type="checkbox" id="ad-hc" ${a.health_check?.active?.enabled ? 'checked' : ''}> 主动健康检查</label></div>
+      <div><label for="ad-hc-path">健康检查路径</label><input id="ad-hc-path" value="${esc(a.health_check?.active?.path || '/')}"></div>
+      <div><label for="ad-hc-interval">检查间隔</label><input id="ad-hc-interval" value="${esc(a.health_check?.active?.interval || '10s')}"></div>
+      <div><label class="row"><input type="checkbox" id="ad-pc" ${a.health_check?.passive?.enabled !== false ? 'checked' : ''}> 被动健康检查</label></div>
+      <div class="wide hint">备份上游仅在主上游全部不可用时接管流量。权重只在加权算法下生效。</div>
+    </div>`;
+    return;
+  }
 
+  if (appDetailTab === 'proxyConfig') {
+    const t = a.timeouts || {};
+    el.innerHTML = `<div class="fieldset">
+      <h3>TLS</h3>
+      <div><label for="ad-tls">证书模式</label><select id="ad-tls">
+        ${[['auto', '自动'], ['manual', '手动'], ['off', '关闭']].map(([v, n]) => `<option value="${v}" ${a.tls?.mode === v ? 'selected' : ''}>${n}</option>`).join('')}
+      </select></div>
+      <div><label for="ad-cert">证书 ID</label><input id="ad-cert" value="${esc(a.tls?.cert_id || '')}" placeholder="可选"></div>
+      <h3>超时</h3>
+      <div><label for="ad-connect">连接</label><input id="ad-connect" value="${esc(t.connect || '5s')}"></div>
+      <div><label for="ad-read">读取</label><input id="ad-read" value="${esc(t.read || '60s')}"></div>
+      <div><label for="ad-write">写入</label><input id="ad-write" value="${esc(t.write || '60s')}"></div>
+      <div><label for="ad-idle">空闲</label><input id="ad-idle" value="${esc(t.idle || '75s')}"></div>
+      <h3>重试与连接</h3>
+      <div><label class="row"><input type="checkbox" id="ad-retry" ${a.retry?.enabled ? 'checked' : ''}> 启用重试</label></div>
+      <div><label for="ad-attempts">重试次数</label><input type="number" id="ad-attempts" min="0" value="${a.retry?.attempts ?? 2}"></div>
+      <div><label class="row"><input type="checkbox" id="ad-ws" ${a.websocket ? 'checked' : ''}> WebSocket</label></div>
+      <h3>头部改写（JSON）</h3>
+      <div class="wide"><textarea id="ad-headers" rows="3" placeholder='{"request":{"set":{},"add":{},"remove":[]}}'>${esc(JSON.stringify(a.headers || {}, null, 2))}</textarea></div>
+      <h3>策略覆盖（JSON，留空跟随全局）</h3>
+      <div class="wide"><textarea id="ad-policy" rows="4" placeholder='{ "preset": "strict", "require_challenge": true }'>${esc(JSON.stringify(Object.fromEntries(Object.entries(a.policy || {}).filter(([, v]) => v != null)), null, 2))}</textarea></div>
+      <div class="wide hint">策略支持 preset / protection / observe_mode / block_threshold / ratelimit / require_challenge / allow_cidr / deny_cidr / max_body_size / allow_methods。</div>
+    </div>`;
+    return;
+  }
+
+  el.innerHTML = `<div class="fieldset">
+    <div class="wide hint">按路径把请求分发到不同上游。路径按前缀匹配，rewrite 支持 replace / strip_prefix 等模式。</div>
+    <div class="wide"><textarea id="ad-routes" rows="10">${esc(JSON.stringify(a.routes || [], null, 2))}</textarea></div>
+  </div>`;
+}
+
+function upstreamRow(u, i) {
+  return `<tr data-up="${i}">
+    <td><input data-f="addr" value="${esc(u.addr || '')}" placeholder="192.168.1.5"></td>
+    <td><input data-f="port" type="number" min="1" max="65535" value="${u.port ?? ''}" style="width:90px"></td>
+    <td><select data-f="scheme">${['http', 'https', 'grpc'].map(s => `<option value="${s}" ${u.scheme === s ? 'selected' : ''}>${s}</option>`).join('')}</select></td>
+    <td><input data-f="weight" type="number" min="1" value="${u.weight ?? 1}" style="width:80px"></td>
+    <td><input data-f="backup" type="checkbox" ${u.backup ? 'checked' : ''}></td>
+    <td><input data-f="max_conns" type="number" min="1" value="${u.max_conns ?? 128}" style="width:100px"></td>
+    <td><button type="button" class="danger" onclick="this.closest('tr').remove()">删除</button></td>
+  </tr>`;
+}
+
+function addUpstreamRow() {
+  const tbody = document.querySelector('#app-upstreams tbody');
+  if (!tbody) return;
+  tbody.insertAdjacentHTML('beforeend', upstreamRow({ addr: '', port: null, scheme: 'http', weight: 1, backup: false, max_conns: 128 }, tbody.children.length));
+}
+
+/// 把当前页签里未保存的输入写回 currentApp，切换页签与保存前都会调用
+function collectAppDetail() {
+  const a = currentApp;
+  if (!a) return;
+  const val = (id) => document.getElementById(id)?.value ?? '';
+  const bool = (id) => !!document.getElementById(id)?.checked;
+
+  if (appDetailTab === 'basicInfo') {
+    if (appDetailNew) a.id = val('ad-id').trim();
+    a.name = val('ad-name').trim();
+    a.group = val('ad-group').trim();
+    a.description = val('ad-desc').trim();
+    a.enabled = val('ad-status') === 'true';
+    a.domains = {
+      primary: val('ad-domain').trim(),
+      aliases: val('ad-aliases').split(',').map(s => s.trim()).filter(Boolean),
+    };
+    a.listen_ports = val('ad-ports').split(',').map(s => parseInt(s.trim(), 10)).filter(p => p > 0 && p <= 65535);
+    a.access_mode = val('ad-mode') || 'proxy';
+    return;
+  }
+  if (appDetailTab === 'forwardingRule') {
+    if (a.access_mode === 'static') {
+      a.static_site = { root: val('ad-root').trim(), index: val('ad-index').trim() || 'index.html', spa_fallback: bool('ad-spa') };
+      return;
+    }
+    if (a.access_mode === 'redirect') {
+      a.redirect = { target: val('ad-target').trim(), status: parseInt(val('ad-redir-status'), 10) || 302 };
+      return;
+    }
+    const rows = [...document.querySelectorAll('#app-upstreams tbody tr[data-up]')];
+    const old = a.upstreams || [];
+    a.upstreams = rows.map(tr => {
+      const f = (n) => tr.querySelector(`[data-f="${n}"]`);
+      const addr = f('addr').value.trim();
+      const prev = old.find(u => u.addr === addr) || {};
+      const port = f('port').value.trim();
+      return {
+        ...prev, addr,
+        port: port ? parseInt(port, 10) : null,
+        scheme: f('scheme').value,
+        weight: parseInt(f('weight').value, 10) || 1,
+        backup: f('backup').checked,
+        max_conns: parseInt(f('max_conns').value, 10) || 128,
+      };
+    }).filter(u => u.addr);
+    a.lb = { ...(a.lb || {}), algorithm: val('ad-lb') || 'round_robin', sticky: bool('ad-sticky') };
+    const hc = a.health_check || {};
+    a.health_check = {
+      ...hc,
+      active: {
+        ...(hc.active || {}), enabled: bool('ad-hc'),
+        path: val('ad-hc-path') || '/', interval: val('ad-hc-interval') || '10s',
+      },
+      passive: { ...(hc.passive || {}), enabled: bool('ad-pc') },
+    };
+    return;
+  }
+  if (appDetailTab === 'proxyConfig') {
+    a.tls = { ...(a.tls || {}), mode: val('ad-tls') || 'auto', cert_id: val('ad-cert').trim() || null };
+    a.timeouts = {
+      ...(a.timeouts || {}),
+      connect: val('ad-connect').trim() || '5s',
+      read: val('ad-read').trim() || '60s',
+      write: val('ad-write').trim() || '60s',
+      idle: val('ad-idle').trim() || '75s',
+    };
+    a.retry = { ...(a.retry || {}), enabled: bool('ad-retry'), attempts: parseInt(val('ad-attempts'), 10) || 0 };
+    a.websocket = bool('ad-ws');
+    for (const [field, id] of [['headers', 'ad-headers'], ['policy', 'ad-policy']]) {
+      const raw = val(id).trim();
+      if (raw) {
+        try { a[field] = JSON.parse(raw); }
+        catch { showMsg(`${field === 'headers' ? '头部改写' : '策略'} JSON 格式不对`, 'error'); }
+      } else {
+        a[field] = {};
+      }
+    }
+    return;
+  }
+  const raw = val('ad-routes').trim();
+  if (raw) {
+    try { a.routes = JSON.parse(raw); }
+    catch { showMsg('路由 JSON 格式不对', 'error'); }
+  } else {
+    a.routes = [];
+  }
+}
+
+async function saveAppDetail() {
+  if (!currentApp) return;
+  collectAppDetail();
+  const a = currentApp;
+  if (!/^[a-z0-9][a-z0-9-]*$/.test(a.id)) return showMsg('ID 只能包含小写字母、数字和横线', 'error');
+  if (!a.domains.primary) return showMsg('主域名不能为空', 'error');
+  if (a.access_mode === 'proxy' && !a.upstreams.length) return showMsg('反向代理至少需要一个上游', 'error');
+  if (a.access_mode === 'static' && !a.static_site.root) return showMsg('静态站点必须填写根目录', 'error');
+  if (a.access_mode === 'redirect' && !a.redirect.target) return showMsg('重定向必须填写目标地址', 'error');
+
+  const btn = document.getElementById('app-detail-save');
   btn.disabled = true; btn.textContent = '保存中…';
   try {
-    await api('/apps', { method: 'POST', body: JSON.stringify(app) });
-    showMsg(editingApp ? `已更新 ${id}` : `已创建 ${id}`);
-    hideAppForm(); loadApps(); loadStatistics();
-  } catch (err) { showMsg('保存失败：' + err.message, 'error'); }
-  finally { btn.disabled = false; btn.textContent = editingApp ? '保存修改' : '创建'; }
+    await api('/apps', { method: 'POST', body: JSON.stringify(a) });
+    showMsg(appDetailNew ? `已创建 ${a.id}` : `已更新 ${a.id}`);
+    appDetailNew = false;
+    await openAppDetail(a.id);
+    loadStatistics();
+  } catch (e) { showMsg('保存失败：' + e.message, 'error'); }
+  finally { btn.disabled = false; btn.textContent = appDetailNew ? '创建' : '保存'; }
 }
 
 async function deleteApp(id) {
   if (!confirm(`删除应用 ${id}？该域名的请求会立即停止转发。`)) return;
   try {
     await api('/apps/' + encodeURIComponent(id), { method: 'DELETE' });
-    showMsg(`已删除 ${id}`); loadApps(); loadStatistics();
+    showMsg(`已删除 ${id}`);
+    if (currentApp?.id === id) closeAppDetail();
+    loadApps(); loadStatistics();
   } catch (e) { showMsg('删除失败：' + e.message, 'error'); }
 }
 
@@ -2396,6 +2783,300 @@ async function saveSettings() {
     showMsg('保存失败：' + e.message, 'error');
     loadSettings();
   } finally { btn.disabled = false; btn.textContent = '保存设置'; }
+}
+
+// ============================================================
+// 攻击防护
+// ============================================================
+let attackPage = 0;
+let attackAutoTimer = null;
+const ATTACK_PAGE_SIZE = 20;
+
+const attackRange = () => parseInt(document.getElementById('attack-range')?.value || '86400', 10);
+const attackWindow = () => ({ since: Math.floor(Date.now() / 1000) - attackRange(), until: Math.floor(Date.now() / 1000) + 1 });
+
+function attackFilterParams(withWindow) {
+  const params = new URLSearchParams();
+  const app = document.getElementById('attack-app')?.value || '';
+  const kind = document.getElementById('attack-kind')?.value || '';
+  const action = document.getElementById('attack-action')?.value || '';
+  const q = (document.getElementById('attack-q')?.value || '').trim();
+  if (app) params.set('app', app);
+  if (kind) params.set('kind', kind);
+  if (action) params.set('action', action);
+  if (q) params.set('q', q);
+  if (withWindow) {
+    const w = attackWindow();
+    params.set('since', String(w.since));
+    params.set('until', String(w.until));
+  }
+  return params;
+}
+
+async function loadAttackPage() {
+  const sel = document.getElementById('attack-app');
+  if (sel && sel.options.length <= 1) {
+    try {
+      const apps = await api('/apps');
+      sel.innerHTML = '<option value="">全部应用</option>'
+        + apps.map(a => `<option value="${esc(a.id)}">${esc(a.id)}</option>`).join('');
+    } catch { /* 应用下拉失败不影响查询 */ }
+  }
+  ['attack-range', 'attack-app', 'attack-kind', 'attack-action'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el && !el.dataset.bound) {
+      el.dataset.bound = '1';
+      el.addEventListener('change', () => { attackPage = 0; loadAttack(); });
+    }
+  });
+  await loadAttack();
+}
+
+async function loadAttack() {
+  try {
+    const params = attackFilterParams(false);
+    params.set('range', String(attackRange()));
+    const eventsParams = attackFilterParams(true);
+    eventsParams.set('limit', String(ATTACK_PAGE_SIZE));
+    eventsParams.set('offset', String(attackPage * ATTACK_PAGE_SIZE));
+    const [overview, list] = await Promise.all([
+      api('/attack/overview?' + params),
+      api('/events?' + eventsParams),
+    ]);
+    renderAttackOverview(overview);
+    renderAttackEvents(list);
+  } catch (e) {
+    document.getElementById('attack-events').innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`;
+  }
+}
+
+function renderAttackOverview(o) {
+  const t = o.totals || {};
+  const rate = t.events ? (t.blocked / t.events * 100) : 0;
+  renderKpis(document.getElementById('attack-kpis'), [
+    { label: '攻击事件', value: t.events || 0, sub: '所选范围内全部安全事件' },
+    { label: '拦截次数', value: t.blocked || 0, sub: '处置为拒绝/验证的请求', cls: 'hot' },
+    { label: '拦截率', value: rate, decimals: 1, suffix: '%', sub: '拦截数 / 事件总数' },
+    { label: '攻击来源 IP', value: t.attack_ips || 0, sub: '产生过拦截的独立 IP' },
+    { label: '受影响应用', value: t.apps || 0, sub: '出现安全事件的应用数' },
+    { label: '当前封禁', value: t.banned || 0, sub: '封禁表中的有效记录' },
+  ]);
+
+  const series = (o.series || []).filter(p => p.ts);
+  const longRange = (o.range || 0) > 86400;
+  lineChart(document.getElementById('attack-trend'), [
+    { color: '#4a9eda', points: series.map(p => ({ ts: p.ts, v: p.total })) },
+    { color: '#f06a6a', points: series.map(p => ({ ts: p.ts, v: p.blocked })) },
+  ], { height: 220, tickFormatter: (ts) => (longRange ? dayLabel(ts) : hhmm(ts)) });
+
+  donut(document.getElementById('attack-kinds'),
+    (o.kinds || []).map(k => ({ name: kindLabel(k.name), count: k.count })),
+    { center: '事件' });
+
+  const geoText = (g) => g ? [g.country, g.province, g.city].filter(Boolean).join(' · ') : '';
+  rankList(document.getElementById('attack-ips'), (o.top_ips || []).map(ip => ({
+    name: ip.ip + (ip.geo ? ' · ' + geoText(ip.geo) : ''),
+    count: ip.count,
+  })), {});
+  rankList(document.getElementById('attack-apps'), o.top_apps || [], {});
+  rankList(document.getElementById('attack-rules'), o.rules || [], { label: (n) => n || '自定义规则' });
+}
+
+function renderAttackEvents(res) {
+  const el = document.getElementById('attack-events');
+  const pager = document.getElementById('attack-pager');
+  const totalEl = document.getElementById('attack-total');
+  const { events = [], total = 0 } = res || {};
+  if (totalEl) totalEl.textContent = `共 ${fmtNum(total)} 条事件`;
+  if (!events.length) {
+    el.innerHTML = '<div class="empty">没有符合条件的攻击事件</div>';
+    pager.innerHTML = '';
+    return;
+  }
+  el.innerHTML = `<table>
+    <thead><tr><th>时间</th><th>类型</th><th>来源 IP</th><th>应用</th><th>路径</th>
+      <th>命中规则</th><th>分数</th><th>处置</th><th>操作</th></tr></thead>
+    <tbody>${events.map(e => {
+      const rid = 'atk-' + e.id;
+      return `<tr style="cursor:pointer" onclick="toggleRaw('${rid}')">
+        <td>${fmtTime(e.ts)}</td><td>${esc(kindLabel(e.kind))}</td>
+        <td><code>${esc(e.client_ip)}</code></td><td>${esc(e.app)}</td>
+        <td class="mono" title="${esc(e.path)}">${esc(e.path)}</td>
+        <td><code>${esc(e.rules)}</code></td><td>${e.score}</td>
+        <td><span class="tag ${esc(e.action)}">${esc(actionLabel(e.action))}</span></td>
+        <td><button onclick="event.stopPropagation();banAttackIp('${esc(e.client_ip)}')">封禁</button></td>
+      </tr>
+      <tr class="rawrow hidden" id="raw-${rid}"><td colspan="9"><pre>${esc(JSON.stringify(e, null, 2))}</pre></td></tr>`;
+    }).join('')}</tbody></table>`;
+
+  const pages = Math.max(1, Math.ceil(total / ATTACK_PAGE_SIZE));
+  pager.innerHTML = `
+    <button ${attackPage === 0 ? 'disabled' : ''} onclick="attackPage--;loadAttack()">上一页</button>
+    <span>第 ${attackPage + 1} / ${pages} 页</span>
+    <button ${attackPage + 1 >= pages ? 'disabled' : ''} onclick="attackPage++;loadAttack()">下一页</button>`;
+}
+
+function toggleAttackAuto() {
+  const on = document.getElementById('attack-auto').checked;
+  if (attackAutoTimer) { clearInterval(attackAutoTimer); attackAutoTimer = null; }
+  if (on) attackAutoTimer = setInterval(() => {
+    if (currentPage === 'attack') loadAttack();
+  }, 10000);
+}
+
+function exportAttack() {
+  const params = attackFilterParams(true);
+  window.location.href = '/api/events/export?' + params.toString();
+}
+
+async function banAttackIp(ip) {
+  const mins = parseInt(prompt(`封禁 ${ip}（分钟）`, '60') || '', 10);
+  if (!mins || mins <= 0) return;
+  try {
+    await api('/bans', { method: 'POST', body: JSON.stringify({ ip, duration_secs: mins * 60, reason: 'manual' }) });
+    showMsg(`已封禁 ${ip}，时长 ${mins} 分钟`);
+    loadAttack();
+  } catch (e) { showMsg('封禁失败：' + e.message, 'error'); }
+}
+
+// ============================================================
+// 系统设置
+// ============================================================
+const SYSTEM = { tab: 'basic', info: null };
+
+function loadSystemPage() {
+  const tabs = document.getElementById('system-tabs');
+  if (tabs && !tabs.dataset.bound) {
+    tabs.dataset.bound = '1';
+    tabs.addEventListener('click', (e) => {
+      const a = e.target.closest('a[data-systemtab]');
+      if (!a) return;
+      switchSystemTab(a.dataset.systemtab);
+    });
+  }
+  switchSystemTab(SYSTEM.tab || 'basic');
+}
+
+function switchSystemTab(tab) {
+  SYSTEM.tab = tab;
+  document.querySelectorAll('#system-tabs a').forEach(a =>
+    a.classList.toggle('active', a.dataset.systemtab === tab));
+  document.querySelectorAll('.sys-panel').forEach(p =>
+    p.classList.toggle('active', p.dataset.systemtab === tab));
+  if (tab === 'basic') loadSystemInfo();
+  else if (tab === 'engine') loadSettings();
+  else if (tab === 'rules') loadCustomRules();
+}
+
+const sysField = (label, value) => `<div>
+  <span>${esc(label)}</span><b>${value}</b></div>`;
+
+async function loadSystemInfo() {
+  const el = document.getElementById('system-info');
+  if (!el) return;
+  el.innerHTML = '<div class="empty">加载中…</div>';
+  try {
+    const s = await api('/system/info');
+    SYSTEM.info = s;
+    el.innerHTML = `<div class="sys-info-grid">
+      ${sysField('版本', `<code>${esc(s.version)}</code>`)}
+      ${sysField('进程 PID', `<code>${s.pid}</code>`)}
+      ${sysField('启动时间', esc(fmtTime(s.started_at)))}
+      ${sysField('已运行', esc(fmtDuration(s.uptime_secs || 0)))}
+      ${sysField('防护应用', fmtNum(s.apps))}
+      ${sysField('检测规则', fmtNum(s.detection_rules))}
+      ${sysField('ACL 规则', fmtNum(s.acl_rules))}
+      ${sysField('自定义规则', fmtNum(s.custom_rules))}
+      ${sysField('上游节点', fmtNum(s.upstreams))}
+      ${sysField('事件总数', fmtNum(s.events))}
+      ${sysField('当前封禁', fmtNum(s.active_bans))}
+      ${sysField('Worker 线程', s.workers ? String(s.workers) : '自动')}
+    </div>`;
+
+    const listen = document.getElementById('system-listen');
+    const rows = [];
+    (s.listen || []).forEach(addr => rows.push({ kind: 'HTTP', addr }));
+    (s.tls_listen || []).forEach(addr => rows.push({ kind: 'HTTPS', addr }));
+    listen.innerHTML = rows.length ? `<table>
+      <thead><tr><th>协议</th><th>监听地址</th></tr></thead>
+      <tbody>${rows.map(r => `<tr><td><span class="tag log">${r.kind}</span></td>
+        <td><code>${esc(r.addr)}</code></td></tr>`).join('')}</tbody></table>`
+      : '<div class="empty">未配置监听地址</div>';
+
+    const adminListen = document.getElementById('sys-admin-listen');
+    if (adminListen) adminListen.value = s.admin_listen || '';
+  } catch (e) {
+    el.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`;
+  }
+}
+
+function ruleConditionText(c) {
+  const key = c.sub_k ? `${c.k}.${c.sub_k}` : c.k;
+  const vals = (c.v || []).join(' / ');
+  return `${key} ${c.op} ${vals}`;
+}
+
+function rulePatternText(pattern) {
+  return (pattern || []).map(group =>
+    (group || []).map(ruleConditionText).join(' 且 ')).join(' 或 ');
+}
+
+async function loadCustomRules() {
+  const el = document.getElementById('custom-rules');
+  if (!el) return;
+  el.innerHTML = '<div class="empty">加载中…</div>';
+  try {
+    const rules = await api('/custom-rules');
+    if (!rules.length) {
+      el.innerHTML = '<div class="empty">还没有自定义规则，可导入雷池导出的 JSON</div>';
+      return;
+    }
+    el.innerHTML = `<table>
+      <thead><tr><th>名称</th><th>动作</th><th>条件</th><th>状态</th></tr></thead>
+      <tbody>${rules.map(r => `<tr>
+        <td><code>${esc(r.name || r.id)}</code><br><span class="sub" style="margin:0">${esc(r.id)}</span></td>
+        <td>${r.action === 0 ? '<span class="tag allow">白名单</span>' : '<span class="tag deny">黑名单</span>'}</td>
+        <td class="mono" title="${esc(rulePatternText(r.pattern))}">${esc(rulePatternText(r.pattern))}</td>
+        <td>${r.is_enabled ? '<span class="tag allow">启用</span>' : '<span class="tag deny">禁用</span>'}</td>
+      </tr>`).join('')}</tbody></table>`;
+  } catch (e) {
+    el.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`;
+  }
+}
+
+function exportCustomRules() {
+  window.location.href = '/api/custom-rules/export';
+}
+
+async function readRulesFile(input) {
+  const file = input.files && input.files[0];
+  if (!file) return;
+  try {
+    const text = await file.text();
+    const data = JSON.parse(text);
+    const append = confirm('确定导入？点击“确定”追加到现有规则，点击“取消”整体替换。');
+    const mode = append ? '?mode=append' : '';
+    const res = await api('/custom-rules' + mode, { method: 'POST', body: JSON.stringify(data) });
+    showMsg(`导入成功，当前共 ${res.count} 条自定义规则`);
+    loadCustomRules();
+  } catch (e) {
+    showMsg('导入失败：' + e.message, 'error');
+  } finally { input.value = ''; }
+}
+
+function downloadBackup() {
+  window.location.href = '/api/system/backup';
+}
+
+async function pruneEvents() {
+  const days = parseInt(document.getElementById('sys-prune-days').value || '30', 10);
+  if (!days || days < 1) { showMsg('请输入有效的保留天数', 'error'); return; }
+  if (!confirm(`将删除 ${days} 天之前的全部事件，确定继续？`)) return;
+  try {
+    const res = await api('/system/prune', { method: 'POST', body: JSON.stringify({ days }) });
+    showMsg(`已清理 ${res.removed} 条过期事件`);
+    loadSystemInfo();
+  } catch (e) { showMsg('清理失败：' + e.message, 'error'); }
 }
 
 // ============================================================

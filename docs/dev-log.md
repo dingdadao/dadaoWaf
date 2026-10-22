@@ -139,6 +139,29 @@
 - `cargo test --workspace`：519 个单元/集成/E2E 测试 + 2 个 doc-test 全绿；`cargo clippy --workspace --all-targets -- -D warnings` 零警告。
 - 同步更新 README、功能差距分析、产品规格与本日志。
 
+### 21:20 — 防护应用 / 攻击防护 / 系统设置与雷池规则兼容（任务 #16）
+
+- **防护应用**：列表 + 详情两视图，详情对齐雷池站点页签（基本信息 / 转发规则 / 高级配置 / 应用路由）。
+  应用模型新增 `description`、`group`、`access_mode`（`proxy` / `static` / `redirect`）、`static_site`、`redirect`；
+  代理层新增本地静态文件与固定重定向，仍排在检测与 ACL 之后，静态根目录做 canonicalize 与软链接逃逸检查。
+- **攻击防护**：`GET /api/attack/overview?range=` 汇总 KPI、趋势序列、类型/处置分布、Top IP（含归属地）、
+  被攻击应用与命中规则；页面支持时间范围、应用/类型/处置/关键字筛选、分页、CSV 导出、10 秒自动刷新与一键封禁。
+  事件查询扩展 `until` / `app` / `path` / `q`，`/api/events` 与导出共用同一套筛选参数。
+- **封禁**：`POST /api/bans` 手动封禁（默认 60 分钟、上限 30 天），`manual` 标记使自动封禁关闭时仍生效，
+  重启后按 reason 恢复；`GET /api/bans` 与解封沿用原接口。
+- **系统设置**：四个页签（基本设置 / 防护引擎 / 规则管理 / 数据维护）。`GET /api/system/info` 返回版本、PID、
+  启动时间、运行时长、监听地址、应用/规则/上游/事件/封禁计数；`GET /api/system/backup` 导出应用、全局设置、
+  ACL 与自定义规则；`POST /api/system/prune` 按天清理事件。不包含共享计划、许可证与云端配额。
+- **雷池（长亭）规则兼容**：新增 `custom_rules` 设置项与 `CustomRule` / `RuleCondition` 模型，字段对齐
+  `name` / `is_enabled` / `pattern` / `action`（0 白名单、1 黑名单），`pattern` 外层 OR、内层 AND；
+  `v` 兼容字符串、数组、数字与 `null`。控制台支持裸数组、`{"rules": [...]}`、`{"data": [...]}` 三种导入格式，
+  支持追加（按 id 合并）与整体替换、导出与热重载。
+- **规则求值**：`crates/proxy/src/custom_rule.rs` 支持 `src_ip`（CIDR）、`website`、`host`、`path`、`url`、
+  `query`、`method`、`user_agent`、`content_type`、`cookie`、`header`（`sub_k`）等条件键，算子覆盖
+  eq/ne/contain/prefix/suffix/regex；白名单命中放行并跳过检测、限流与自动封禁，黑名单命中直接 403 并记事件。
+- **验证**：workspace 测试全绿，clippy 零警告；导入雷池格式规则后热重载成功，`User-Agent: sqlmap` 请求被 403
+  拦截并记录「自定义黑名单」事件，清空规则后恢复正常；浏览器逐页验证三页签无 JS 报错。
+
 ---
 
 ## 下一步开发任务
@@ -151,6 +174,7 @@
 | #13 | 统计 API | `/api/stats` 重做（range + app 参数 → 完整 DashboardData JSON）；`/api/security` 安全态势聚合；`/api/reports` 报告列表/详情/CSV；大屏数据接口；`geoip_db` 设置项注册 | ✅ |
 | #14 | 深色四页签控制台 | 深色主题 + 流量分析/安全态势/防护报告/防护大屏；自绘 SVG 图表；点阵世界/中国地图；数字滚动动画；大屏全屏浮层 + 明/暗主题 + 自定义标题；导航「概览」改名「统计报表」 | ✅ |
 | #15 | 验证与文档 | 全量测试、浏览器逐页验证四页签、README/差距分析/功能规格/日志更新 | ✅ |
+| #16 | 防护应用 / 攻击防护 / 系统设置 | 应用列表+详情四页签与静态/重定向、攻击概览与筛选分页封禁、系统信息/备份/清理、雷池自定义规则导入导出与热重载 | ✅ |
 
 ### 远期遗留（差距分析中未排期）
 
@@ -164,4 +188,4 @@
 
 ### 当前进度估计
 
-基线（初始提交）→ 防护增强 → 规则订阅 → 指标底座 → GeoIP → 统计 API → 深色四页签控制台与防护大屏，统计报表批次（#12–#15）已全部入库。整体功能完成度约 **70%**（对照差距分析）。
+基线（初始提交）→ 防护增强 → 规则订阅 → 指标底座 → GeoIP → 统计 API → 深色四页签控制台与防护大屏 → 防护应用 / 攻击防护 / 系统设置，任务 #12–#16 已全部入库。整体功能完成度约 **75%**（对照差距分析）。

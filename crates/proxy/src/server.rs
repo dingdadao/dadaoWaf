@@ -1,6 +1,7 @@
 //! Pingora 集成。
 
 use std::net::{IpAddr, SocketAddr};
+use std::path::{Component, Path};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -430,32 +431,86 @@ impl ProxyHttp for WafProxy {
             }
         }
 
-        // 自动封禁检查：命中直接拒绝，连检测都不必做。
-        // 这是 WAF 的核心价值回路——被封的 IP 不再消耗检测资源。
-        if let Some(ip) = ctx.client_ip {
-            let now_secs = homewaf_acl::now_unix().max(0) as u64;
-            if let Some(status) = self.bans.check(ip, now_secs) {
+        // 自定义规则（兼容雷池格式）：白名单优先放行，黑名单直接拦截。
+        // 放在 ACL 之后、自动封禁之前——白名单命中时连封禁都可以绕过。
+        let mut custom_whitelisted = false;
+        let custom = {
+            let headers = &session.req_header().headers;
+            let creq = crate::custom_rule::RuleRequest {
+                app: &app.id,
+                host: &host,
+                ip: ctx.client_ip,
+                path: &hit.normalized_path,
+                query: query.as_deref(),
+                method: &method,
+                user_agent: user_agent.as_deref(),
+                content_type: content_type.as_deref(),
+                cookie: cookie_header.as_deref(),
+                headers,
+            };
+            crate::custom_rule::evaluate(&state.custom_rules, &creq)
+        };
+        match custom {
+            Some(crate::custom_rule::CustomDecision::Allow(name)) => {
+                tracing::debug!(req = %ctx.request_id, rule = %name, "自定义白名单命中");
+                ctx.acl_allowed = true;
+                custom_whitelisted = true;
+            }
+            Some(crate::custom_rule::CustomDecision::Deny(name)) => {
+                let reason = format!("自定义黑名单：{name}");
                 tracing::info!(
                     target: "homewaf.security",
 
                     req = %ctx.request_id,
-                    client_ip = %ip,
-                    remaining_secs = status.remaining_secs,
-                    offenses = status.offenses,
-                    "处于自动封禁中，拒绝"
+                    client_ip = ?ctx.client_ip,
+                    app = %app.id,
+                    rule = %name,
+                    "自定义规则拦截"
                 );
                 self.record_security_event(
                     ctx,
-                    EventKind::Ban,
+                    EventKind::Acl,
                     &app.id,
                     &hit.normalized_path,
-                    "自动封禁",
-                    status.offenses,
+                    &reason,
+                    0,
                     "block",
                 );
-                ctx.acl_reason = Some("自动封禁".to_string());
+                ctx.acl_reason = Some(reason);
                 ctx.blocked = true;
                 return write_empty(session, 403).await;
+            }
+            None => {}
+        }
+
+        // 自动封禁检查：命中直接拒绝，连检测都不必做。
+        // 这是 WAF 的核心价值回路——被封的 IP 不再消耗检测资源。
+        if let Some(ip) = ctx.client_ip {
+            let now_secs = homewaf_acl::now_unix().max(0) as u64;
+            if !custom_whitelisted {
+                if let Some(status) = self.bans.check(ip, now_secs) {
+                    tracing::info!(
+                        target: "homewaf.security",
+
+                        req = %ctx.request_id,
+                        client_ip = %ip,
+                        remaining_secs = status.remaining_secs,
+                        offenses = status.offenses,
+                        "处于自动封禁中，拒绝"
+                    );
+                    self.record_security_event(
+                        ctx,
+                        EventKind::Ban,
+                        &app.id,
+                        &hit.normalized_path,
+                        "自动封禁",
+                        status.offenses,
+                        "block",
+                    );
+                    ctx.acl_reason = Some("自动封禁".to_string());
+                    ctx.blocked = true;
+                    return write_empty(session, 403).await;
+                }
             }
         }
 
@@ -866,6 +921,23 @@ impl ProxyHttp for WafProxy {
             return write_empty(session, 403).await;
         }
 
+        // 本地接入方式：静态文件 / 重定向不经过上游，但仍走完上面的 ACL 与检测。
+        match app.access_mode {
+            homewaf_config::AccessMode::Static => {
+                return serve_static(session, app, &hit.normalized_path, method.as_str()).await;
+            }
+            homewaf_config::AccessMode::Redirect => {
+                return serve_redirect(
+                    session,
+                    app,
+                    &hit.normalized_path,
+                    query.as_deref(),
+                )
+                .await;
+            }
+            homewaf_config::AccessMode::Proxy => {}
+        }
+
         let upstreams = state
             .router
             .route_of(&hit)
@@ -1260,6 +1332,137 @@ async fn write_text(session: &mut Session, status: u16, body: &str) -> Result<bo
     Ok(true)
 }
 
+/// 本地静态文件响应。
+///
+/// 只允许 GET / HEAD；路径逐段检查，拒绝 `..` 与绝对路径段，
+/// 再用 canonicalize 兜一层，确保最终文件始终位于站点根目录内。
+async fn serve_static(
+    session: &mut Session,
+    app: &homewaf_config::Application,
+    path: &str,
+    method: &str,
+) -> Result<bool> {
+    if !matches!(method, "GET" | "HEAD") {
+        let mut resp = ResponseHeader::build(405, None)?;
+        resp.insert_header("allow", "GET, HEAD")?;
+        resp.insert_header("content-length", "0")?;
+        session.write_response_header(Box::new(resp), true).await?;
+        return Ok(true);
+    }
+
+    let root_cfg = app.static_site.root.trim();
+    let Ok(root) = std::fs::canonicalize(root_cfg) else {
+        tracing::warn!(app = %app.id, root = %root_cfg, "静态站点根目录不可用");
+        return service_unavailable(session).await;
+    };
+
+    let rel = path.trim_start_matches('/');
+    let mut candidate = root.join(rel);
+    if candidate.is_dir() || path.ends_with('/') {
+        candidate.push(&app.static_site.index);
+    }
+
+    let mut data = std::fs::read(&candidate).ok();
+    if data.is_none() && app.static_site.spa_fallback {
+        candidate = root.join(&app.static_site.index);
+        data = std::fs::read(&candidate).ok();
+    }
+    let Some(data) = data else {
+        return write_text(session, 404, "Not Found").await;
+    };
+
+    // 防止软链接把文件指到站点根目录之外
+    let Ok(real) = std::fs::canonicalize(&candidate) else {
+        return write_text(session, 404, "Not Found").await;
+    };
+    if !real.starts_with(&root) || !is_safe_relative(rel) {
+        return write_text(session, 404, "Not Found").await;
+    }
+
+    let mut resp = ResponseHeader::build(200, None)?;
+    resp.insert_header("content-type", mime_of(&real))?;
+    resp.insert_header("content-length", data.len().to_string())?;
+    resp.insert_header("cache-control", "public, max-age=0, must-revalidate")?;
+    resp.insert_header("x-content-type-options", "nosniff")?;
+
+    if method == "HEAD" {
+        session.write_response_header(Box::new(resp), true).await?;
+    } else {
+        session
+            .write_response_header(Box::new(resp), false)
+            .await?;
+        session
+            .write_response_body(Some(Bytes::from(data)), true)
+            .await?;
+    }
+    Ok(true)
+}
+
+/// 重定向响应。目标地址支持 `{path}` 与 `{query}` 占位符。
+async fn serve_redirect(
+    session: &mut Session,
+    app: &homewaf_config::Application,
+    path: &str,
+    query: Option<&str>,
+) -> Result<bool> {
+    let target = app.redirect.target.trim();
+    if target.is_empty() {
+        return service_unavailable(session).await;
+    }
+    let location = target
+        .replace("{path}", path)
+        .replace("{query}", query.unwrap_or(""));
+    let status = if [301, 302, 303, 307, 308].contains(&app.redirect.status) {
+        app.redirect.status
+    } else {
+        302
+    };
+
+    let mut resp = ResponseHeader::build(status, None)?;
+    resp.insert_header("location", location.as_str())?;
+    resp.insert_header("content-length", "0")?;
+    resp.insert_header("cache-control", "no-store")?;
+    session.write_response_header(Box::new(resp), true).await?;
+    Ok(true)
+}
+
+/// 只允许普通路径段，阻断 `..`、`.` 和绝对路径。
+fn is_safe_relative(rel: &str) -> bool {
+    Path::new(rel)
+        .components()
+        .all(|c| matches!(c, Component::Normal(_)))
+}
+
+fn mime_of(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "html" | "htm" => "text/html; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "js" | "mjs" => "application/javascript; charset=utf-8",
+        "json" | "map" => "application/json; charset=utf-8",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "ico" => "image/x-icon",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        "ttf" => "font/ttf",
+        "txt" | "md" => "text/plain; charset=utf-8",
+        "xml" => "application/xml; charset=utf-8",
+        "pdf" => "application/pdf",
+        "wasm" => "application/wasm",
+        "mp4" => "video/mp4",
+        _ => "application/octet-stream",
+    }
+}
+
 /// 只接受站内绝对路径，防止验证后被重定向到外部站点。
 fn safe_next(next: &str) -> &str {
     if next.starts_with('/')
@@ -1441,7 +1644,11 @@ pub fn run(state: SharedState, settings: ProxySettings) -> anyhow::Result<()> {
                 let count = records.len();
                 for r in &records {
                     if let Ok(ip) = r.ip.parse() {
-                        bans.restore(ip, r.until as u64, r.offenses, now);
+                        if r.reason == "manual" {
+                            bans.manual_ban(ip, r.until as u64, r.offenses, now);
+                        } else {
+                            bans.restore(ip, r.until as u64, r.offenses, now);
+                        }
                     }
                 }
                 if count > 0 {

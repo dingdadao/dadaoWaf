@@ -92,6 +92,8 @@ pub struct RuntimeState {
     pub feed_failures: Vec<(String, String)>,
     /// 规则包订阅状态，用于控制台展示
     pub rule_feeds: Vec<crate::rulefeed::RuleFeedStatus>,
+    /// 自定义规则（兼容雷池格式）
+    pub custom_rules: Vec<homewaf_config::CustomRule>,
 }
 
 impl RuntimeState {
@@ -153,6 +155,7 @@ impl RuntimeState {
             tls: config.tls,
             feed_failures,
             rule_feeds: rule_feeds.statuses,
+            custom_rules: config.custom_rules,
         })
     }
 
@@ -224,6 +227,7 @@ pub fn load_state_from_db_with(
     load_setting!("logging", config.logging);
     load_setting!("storage", config.storage);
     load_setting!("rule_feeds", config.rule_feeds);
+    load_setting!("custom_rules", config.custom_rules);
 
     // ACL 静态规则
     let rows = store

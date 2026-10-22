@@ -7,6 +7,7 @@
 //! - 请求/响应生命周期钩子（后续接入检测引擎）
 
 pub mod challenge;
+pub mod custom_rule;
 pub mod headers;
 pub mod metrics;
 pub mod policy;
@@ -17,6 +18,7 @@ mod server;
 pub mod upstream;
 
 pub use challenge::{ChallengeService, CHALLENGE_PATH, COOKIE_NAME};
+pub use custom_rule::{evaluate as evaluate_custom_rules, CustomDecision, RuleRequest};
 pub use headers::ForwardedCtx;
 pub use metrics::{
     BucketSnapshot, Count as TrafficCount, DashboardData as TrafficDashboard, Point as TrafficPoint,

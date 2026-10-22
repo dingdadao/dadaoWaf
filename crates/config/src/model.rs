@@ -35,6 +35,96 @@ pub struct Config {
     /// 应用列表。`sites` 为兼容别名。
     #[serde(alias = "sites")]
     pub applications: Vec<Application>,
+    /// 自定义规则。兼容雷池（长亭）的 pattern / action 0|1 格式。
+    pub custom_rules: Vec<CustomRule>,
+}
+
+// ============================================================
+// 自定义规则（兼容雷池 / 长亭格式）
+// ============================================================
+
+/// 一条自定义规则。
+///
+/// 与雷池导出的 JSON 字段保持一致：`name` / `is_enabled` / `pattern` / `action`，
+/// 其中 `pattern` 是「OR 的外层 + AND 的内层」，`action` 0 为白名单、1 为黑名单。
+/// `id` 是 HomeWAF 自己的标识，导入时缺失会自动生成。
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct CustomRule {
+    pub id: String,
+    pub name: String,
+    #[serde(rename = "is_enabled", alias = "enabled")]
+    pub enabled: bool,
+    /// 0 = 白名单（放行），1 = 黑名单（拦截）
+    pub action: u8,
+    /// 外层 OR，内层 AND
+    pub pattern: Vec<Vec<RuleCondition>>,
+}
+
+impl CustomRule {
+    /// 白名单规则：命中后跳过检测与自动封禁。
+    pub fn is_whitelist(&self) -> bool {
+        self.action == 0
+    }
+}
+
+/// 规则条件。`k` 是字段、`op` 是算子、`v` 是候选值。
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct RuleCondition {
+    pub k: String,
+    pub op: String,
+    /// 雷池导出既可能是数组也可能是单个字符串，统一读成数组
+    #[serde(deserialize_with = "string_or_vec")]
+    pub v: Vec<String>,
+    /// 子字段，例如 `header` 条件下的头名
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sub_k: Option<String>,
+}
+
+fn string_or_vec<'de, D>(de: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+        Num(u64),
+        /// 雷池导出里可能出现 `v: null`
+        Null,
+    }
+
+    Ok(match OneOrMany::deserialize(de)? {
+        OneOrMany::One(s) => vec![s],
+        OneOrMany::Many(v) => v,
+        OneOrMany::Num(n) => vec![n.to_string()],
+        OneOrMany::Null => Vec::new(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CustomRule;
+
+    #[test]
+    fn parses_leichi_custom_rule_payload() {
+        let json = r#"[{
+            "name": "放行内网",
+            "is_enabled": true,
+            "action": 0,
+            "pattern": [[
+                {"k": "src_ip", "op": "eq", "v": "192.168.1.0/24"},
+                {"k": "header", "sub_k": "X-Token", "op": "contain", "v": null}
+            ]]
+        }]"#;
+        let rules: Vec<CustomRule> = serde_json::from_str(json).unwrap();
+        assert_eq!(rules[0].name, "放行内网");
+        assert!(rules[0].is_whitelist());
+        assert_eq!(rules[0].pattern[0][0].v, vec!["192.168.1.0/24"]);
+        assert!(rules[0].pattern[0][1].v.is_empty());
+    }
 }
 
 /// 持久化配置。
@@ -905,6 +995,73 @@ pub struct Application {
     pub websocket: bool,
     /// 临时应用到期时间（Unix 秒）
     pub expires_at: Option<i64>,
+    /// 备注，显示在应用列表与详情页
+    #[serde(default)]
+    pub description: String,
+    /// 分组名，仅用于控制台归类
+    #[serde(default)]
+    pub group: String,
+    /// 接入方式：反向代理 / 静态文件 / 重定向
+    #[serde(default)]
+    pub access_mode: AccessMode,
+    /// `access_mode = static` 时生效
+    #[serde(default)]
+    pub static_site: StaticSiteConfig,
+    /// `access_mode = redirect` 时生效
+    #[serde(default)]
+    pub redirect: RedirectConfig,
+}
+
+/// 应用的接入方式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AccessMode {
+    /// 反向代理到上游（默认）
+    #[default]
+    Proxy,
+    /// 直接由 WAF 提供本地静态文件
+    Static,
+    /// 固定重定向到另一个地址
+    Redirect,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct StaticSiteConfig {
+    /// 站点根目录，必须存在且可读
+    pub root: String,
+    /// 目录请求与找不到文件时使用的首页
+    pub index: String,
+    /// 单页应用：非静态资源路径回退到 index
+    pub spa_fallback: bool,
+}
+
+impl Default for StaticSiteConfig {
+    fn default() -> Self {
+        Self {
+            root: String::new(),
+            index: "index.html".to_string(),
+            spa_fallback: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RedirectConfig {
+    /// 目标地址，支持 `{path}` / `{query}` 占位符
+    pub target: String,
+    /// 301 / 302 / 307 / 308
+    pub status: u16,
+}
+
+impl Default for RedirectConfig {
+    fn default() -> Self {
+        Self {
+            target: String::new(),
+            status: 302,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

@@ -444,6 +444,20 @@ impl UpstreamPool {
             })
             .collect()
     }
+
+    /// 单个应用的默认上游健康状态，供应用详情页展示。
+    pub fn health_for_app(&self, app_index: usize) -> Vec<(String, bool)> {
+        self.apps
+            .get(app_index)
+            .map(|a| {
+                a.default
+                    .slots
+                    .iter()
+                    .map(|s| (s.addr.clone(), !s.is_down()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
 }
 
 /// 一个待探测的上游。
@@ -549,6 +563,11 @@ mod tests {
             headers: Default::default(),
             websocket: false,
             expires_at: None,
+            description: String::new(),
+            group: String::new(),
+            access_mode: Default::default(),
+            static_site: Default::default(),
+            redirect: Default::default(),
         }
     }
 

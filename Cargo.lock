@@ -974,6 +974,7 @@ version = "0.1.0"
 dependencies = [
  "ipnet",
  "serde",
+ "serde_json",
  "serde_path_to_error",
  "serde_yaml",
  "thiserror 2.0.21",
@@ -1015,6 +1016,7 @@ dependencies = [
  "http",
  "ipnet",
  "pingora",
+ "regex",
  "ring",
  "serde",
  "serde_json",

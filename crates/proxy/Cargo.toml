@@ -14,6 +14,7 @@ homewaf-detect = { path = "../detect" }
 homewaf-limit = { path = "../limit" }
 homewaf-store = { path = "../store" }
 ipnet.workspace = true
+regex = "1"
 serde.workspace = true
 serde_json.workspace = true
 # 主动健康检查探测
