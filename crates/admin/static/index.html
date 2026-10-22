@@ -426,25 +426,292 @@
   .sys-info-grid > div { background: var(--card); padding: 14px 16px; }
   .sys-info-grid b { display: block; margin-top: 6px; font-size: 16px; font-variant-numeric: tabular-nums; }
   .sys-info-grid span { font-size: 12px; color: var(--muted); }
+
+  /* ============================================================
+     UI 2.0：统一深色设计系统
+     卡片 / 页签 / 表格 / 表单 / 侧边栏共用一套 tokens，
+     统计页不再单独使用浅色外壳，避免页与页之间割裂。
+     ============================================================ */
+  :root {
+    color-scheme: dark;
+    --bg: #0b0f14;
+    --card: #141a22;
+    --card-2: #111820;
+    --border: #232c38;
+    --border-soft: #1c242e;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --accent: #4a9eda;
+    --accent-soft: rgba(74, 158, 218, 0.14);
+    --danger: #f06a6a;
+    --ok: #3ddc97;
+    --warn: #e3b341;
+    --sidebar: #070b10;
+    --radius: 12px;
+    --s-bg: var(--bg);
+    --s-card: var(--card);
+    --s-border: var(--border);
+    --s-text: var(--text);
+    --s-muted: var(--muted);
+    --s-accent: var(--accent);
+    --s-green: var(--ok);
+    --s-red: var(--danger);
+    --s-amber: var(--warn);
+    --s-purple: #a371f7;
+  }
+
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-thumb {
+    background: #263241; border-radius: 6px; border: 2px solid var(--bg);
+  }
+  ::-webkit-scrollbar-track { background: transparent; }
+
+  body {
+    background: radial-gradient(1200px 500px at 12% -10%, #101a26 0%, var(--bg) 55%);
+    font-size: 13.5px;
+  }
+
+  /* ---------- 侧边栏 ---------- */
+  .sidebar {
+    width: 218px;
+    background: linear-gradient(180deg, #0a1017 0%, var(--sidebar) 100%);
+    border-right: 1px solid #161d26;
+  }
+  .brand {
+    display: flex; align-items: center; gap: 10px;
+    padding: 16px 16px 14px; border-bottom: 1px solid #161d26;
+    font-size: 15px; letter-spacing: 0.01em;
+  }
+  .brand-mark {
+    width: 30px; height: 30px; flex-shrink: 0; border-radius: 9px;
+    display: grid; place-items: center;
+    background: linear-gradient(135deg, #4a9eda, #24629c);
+    color: #fff; font-size: 14px; font-weight: 700;
+    box-shadow: 0 4px 14px rgba(74, 158, 218, 0.25);
+  }
+  .brand-text { font-size: 15px; font-weight: 600; color: #fff; line-height: 1.2; }
+  .brand-text small {
+    display: block; margin-top: 2px; font-size: 10.5px;
+    font-weight: 400; color: #68778a; letter-spacing: 0.02em;
+  }
+  .nav { padding: 10px 0 22px; }
+  .nav-group { padding: 4px 0; }
+  .nav-title {
+    padding: 8px 18px 4px; font-size: 10.5px; letter-spacing: 0.12em;
+    color: #566375; text-transform: uppercase;
+  }
+  .nav a {
+    margin: 2px 10px; padding: 8px 12px; border-radius: 8px;
+    border-left: 0; color: #93a1b1; font-size: 13px;
+    transition: background 0.15s ease, color 0.15s ease;
+  }
+  .nav a:hover { background: #121a24; color: var(--text); }
+  .nav a.active {
+    background: rgba(74, 158, 218, 0.13); color: #fff;
+    box-shadow: inset 2px 0 0 var(--accent);
+  }
+  .nav .badge {
+    float: right; margin-top: 1px; padding: 0 7px;
+    background: #1b2531; color: #93a1b1; border-radius: 999px;
+  }
+  .nav .badge.alert { background: #3a1d22; color: #f0a0a0; }
+
+  /* ---------- 顶栏与内容区 ---------- */
+  .topbar {
+    height: 60px; padding: 0 28px;
+    background: rgba(11, 15, 20, 0.82);
+    backdrop-filter: blur(12px);
+    border-bottom: 1px solid var(--border);
+    position: sticky; top: 0; z-index: 10;
+  }
+  .topbar h1 { font-size: 16px; letter-spacing: 0.01em; }
+  .topbar .meta { gap: 8px; }
+  .topbar .meta span {
+    padding: 4px 10px; border-radius: 999px;
+    background: #111820; border: 1px solid var(--border);
+    font-size: 11.5px;
+  }
+  .content { padding: 20px 28px 48px; }
+  .page.active { animation: page-in 0.18s ease; }
+  @keyframes page-in {
+    from { opacity: 0; transform: translateY(4px); }
+    to { opacity: 1; transform: none; }
+  }
+
+  /* ---------- 卡片 ---------- */
+  section.card, .dcard {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: 0 1px 0 rgba(255, 255, 255, 0.02), 0 10px 28px rgba(0, 0, 0, 0.16);
+    overflow: hidden;
+  }
+  section.card { margin-bottom: 16px; }
+  section.card > header, .dcard > header {
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+    background: rgba(255, 255, 255, 0.015);
+  }
+  section.card > header h2, .dcard > header h2 { font-size: 13.5px; }
+  .dcard > header h2 { color: var(--text); }
+  .dcard .empty { color: var(--muted); }
+
+  /* ---------- 表格 ---------- */
+  th {
+    background: var(--card-2); color: var(--muted);
+    font-size: 11.5px; letter-spacing: 0.03em;
+    border-bottom: 1px solid var(--border);
+  }
+  td { border-bottom: 1px solid var(--border-soft); }
+  tbody tr:hover td { background: #171f2a; }
+  tr:last-child td { border-bottom: none; }
+  code { color: #9fc7e8; }
+
+  /* ---------- 表单与按钮 ---------- */
+  button {
+    background: #18212c; border: 1px solid #2a3542; color: var(--text);
+    border-radius: 8px; padding: 6px 12px;
+    transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+  }
+  button:hover { background: #1f2a37; border-color: #364454; }
+  button.primary { background: #2f7fc1; border-color: #2f7fc1; color: #fff; }
+  button.primary:hover { background: #3a8ed1; border-color: #3a8ed1; }
+  button.danger { background: #211417; border-color: #54282c; color: #f08a8a; }
+  button.danger:hover { background: #2c181c; border-color: #6a3438; }
+  button:disabled { opacity: 0.45; }
+
+  input, select, textarea {
+    background: #0e151d; border: 1px solid #2a3542; color: var(--text);
+    border-radius: 8px;
+  }
+  input:focus, select:focus, textarea:focus {
+    outline: none; border-color: var(--accent);
+    box-shadow: 0 0 0 3px rgba(74, 158, 218, 0.15);
+  }
+  select option { background: #111820; color: var(--text); }
+  ::placeholder { color: #5f6b7a; }
+  label { color: #93a1b1; }
+  .fieldset h3 { color: #93a1b1; letter-spacing: 0.04em; }
+  form, .fieldset { border-bottom-color: var(--border); }
+
+  .filters select, .filters input { background: #0e151d; }
+  input[type="checkbox"], input[type="radio"] { width: auto; }
+  .toolbar select { width: auto; }
+  .toolbar input:not([type="checkbox"]):not([type="radio"]) {
+    width: auto; min-width: 200px; flex: 1 1 220px;
+  }
+  .toolbar label { display: flex; align-items: center; gap: 6px; margin: 0; font-size: 12px; }
+  .toolbar {
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    padding: 10px 12px; margin-bottom: 14px;
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: var(--radius);
+  }
+
+  /* ---------- 标签与状态 ---------- */
+  .tag { background: var(--accent-soft); color: #7cc0f0; border-radius: 5px; }
+  .tag.deny, .tag.block { background: rgba(240, 106, 106, 0.14); color: #f39a9a; }
+  .tag.allow { background: rgba(61, 220, 151, 0.14); color: #6fe0b4; }
+  .tag.log, .tag.observe { background: rgba(227, 179, 65, 0.14); color: #e8c06a; }
+
+  .status.st-2 { background: rgba(61, 220, 151, 0.14); color: #6fe0b4; }
+  .status.st-3 { background: var(--accent-soft); color: #7cc0f0; }
+  .status.st-4 { background: rgba(227, 179, 65, 0.14); color: #e8c06a; }
+  .status.st-5 { background: rgba(240, 106, 106, 0.14); color: #f39a9a; }
+
+  .msg.error {
+    background: rgba(240, 106, 106, 0.12);
+    border: 1px solid #4a2429; color: #f3a0a0;
+  }
+  .msg.ok {
+    background: rgba(61, 220, 151, 0.12);
+    border: 1px solid #1f4637; color: #7fe0b6;
+  }
+
+  .logtable tbody tr:hover { background: transparent; }
+  .logtable tbody tr:hover td { background: #171f2a; }
+  .logtable .req { color: #b08ad0; }
+  .rawrow td { background: #0e151d; }
+  .rawrow pre { color: #a8b6c5; }
+
+  .trend .bar { background: #2b4a66; }
+  .catrow .track { background: #1a2430; }
+
+  /* ---------- 统一页签 ---------- */
+  .stats-wrap {
+    background: transparent; border: 0; border-radius: 0;
+    padding: 0; min-height: 0; color: var(--text);
+  }
+  .stats-head { border-bottom: 0; padding-bottom: 0; margin-bottom: 16px; }
+  .stats-tabs, .sys-tabs {
+    display: flex; gap: 4px; flex-wrap: wrap;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 16px; padding: 0;
+  }
+  .stats-tabs a, .sys-tabs a {
+    margin-bottom: -1px; padding: 10px 16px;
+    border: 0; border-bottom: 2px solid transparent; border-radius: 0;
+    background: transparent; color: var(--muted); font-size: 13px;
+  }
+  .stats-tabs a:hover, .sys-tabs a:hover {
+    background: transparent; color: var(--text);
+  }
+  .stats-tabs a.active, .sys-tabs a.active {
+    background: transparent; color: #fff;
+    border-bottom-color: var(--accent); box-shadow: none;
+  }
+  section.card > .sys-tabs {
+    margin: 0; padding: 0 16px; background: rgba(255, 255, 255, 0.012);
+  }
+
+  /* ---------- KPI / 图表 ---------- */
+  .kpi {
+    background: linear-gradient(160deg, #171f2a 0%, #111820 100%);
+    border: 1px solid var(--border); border-radius: var(--radius);
+    transition: border-color 0.15s ease;
+  }
+  .kpi:hover { border-color: #31404f; }
+  .kpi .kpi-label, .kpi .kpi-sub { color: var(--muted); }
+
+  .chart-legend, .legend, .rank-h { color: var(--muted); }
+  .pager { border-top: 1px solid var(--border); }
+
+  #attack-events, #events, #apps { overflow-x: auto; }
+  #attack-events table, #events table, #apps table { min-width: 680px; }
 </style>
 </head>
 <body>
 <div class="app">
 
   <aside class="sidebar">
-    <div class="brand">HomeWAF<small>家用 Web 应用防火墙</small></div>
+    <div class="brand">
+      <span class="brand-mark">W</span>
+      <div class="brand-text">HomeWAF<small>家用 Web 应用防火墙</small></div>
+    </div>
     <nav class="nav" id="nav">
-      <a data-page="statistics" class="active">统计报表</a>
-      <a data-page="apps">防护应用</a>
-      <a data-page="attack">攻击防护</a>
-      <a data-page="rules">访问控制</a>
-      <a data-page="whitelist">检测白名单</a>
-      <a data-page="feeds">IP 组订阅</a>
-      <a data-page="rule-feeds">规则订阅</a>
-      <a data-page="bans">封禁<span class="badge" id="nav-bans">0</span></a>
-      <a data-page="events">事件</a>
-      <a data-page="logs">日志</a>
-      <a data-page="system">系统设置</a>
+      <div class="nav-group">
+        <div class="nav-title">监控</div>
+        <a data-page="statistics" class="active">统计报表</a>
+        <a data-page="attack">攻击防护</a>
+      </div>
+      <div class="nav-group">
+        <div class="nav-title">防护</div>
+        <a data-page="apps">防护应用</a>
+        <a data-page="rules">访问控制</a>
+        <a data-page="whitelist">检测白名单</a>
+      </div>
+      <div class="nav-group">
+        <div class="nav-title">订阅</div>
+        <a data-page="feeds">IP 组订阅</a>
+        <a data-page="rule-feeds">规则订阅</a>
+      </div>
+      <div class="nav-group">
+        <div class="nav-title">运维</div>
+        <a data-page="bans">封禁<span class="badge" id="nav-bans">0</span></a>
+        <a data-page="events">事件</a>
+        <a data-page="logs">日志</a>
+        <a data-page="system">系统设置</a>
+      </div>
     </nav>
   </aside>
 
@@ -613,7 +880,7 @@
 
       <!-- ========== 攻击防护 ========== -->
       <div class="page" data-page="attack">
-        <div class="stats-filters" style="margin-bottom:12px">
+        <div class="toolbar stats-filters">
           <select id="attack-range">
             <option value="3600">最近 1 小时</option>
             <option value="21600">最近 6 小时</option>
