@@ -924,7 +924,16 @@ impl ProxyHttp for WafProxy {
         // 本地接入方式：静态文件 / 重定向不经过上游，但仍走完上面的 ACL 与检测。
         match app.access_mode {
             homewaf_config::AccessMode::Static => {
-                return serve_static(session, app, &hit.normalized_path, method.as_str()).await;
+                return serve_static(
+                    session,
+                    app,
+                    &hit.normalized_path,
+                    method.as_str(),
+                    state.tamper.get(hit.app_index),
+                    self.store.as_deref(),
+                    ctx.client_ip,
+                )
+                .await;
             }
             homewaf_config::AccessMode::Redirect => {
                 return serve_redirect(
@@ -1341,6 +1350,9 @@ async fn serve_static(
     app: &homewaf_config::Application,
     path: &str,
     method: &str,
+    baseline: Option<&crate::tamper::TamperBaseline>,
+    store: Option<&Store>,
+    client_ip: Option<std::net::IpAddr>,
 ) -> Result<bool> {
     if !matches!(method, "GET" | "HEAD") {
         let mut resp = ResponseHeader::build(405, None)?;
@@ -1377,6 +1389,43 @@ async fn serve_static(
     };
     if !real.starts_with(&root) || !is_safe_relative(rel) {
         return write_text(session, 404, "Not Found").await;
+    }
+
+    // 网页防篡改：基线比对。只在受保护目录内生效。
+    match crate::tamper::check_file(app, baseline, &real, &data) {
+        crate::tamper::FileState::Modified | crate::tamper::FileState::Added => {
+            let block = app.tamper.action == homewaf_config::TamperAction::Block;
+            let act = if block { "block" } else { "log" };
+            let file_path = real.display().to_string();
+            if crate::tamper::should_record(&app.id, &file_path) {
+                tracing::warn!(
+                    target: "homewaf.security",
+                    app = %app.id,
+                    path = %file_path,
+                    action = act,
+                    "网页文件与基线不一致"
+                );
+                if let Some(store) = store {
+                    let event = Event::new(
+                        homewaf_acl::now_unix(),
+                        EventKind::Detect,
+                        client_ip.map(|i| i.to_string()).unwrap_or_default(),
+                    )
+                    .with_app(app.id.clone())
+                    .with_path(file_path.clone())
+                    .with_rules("tamper".to_string())
+                    .with_score(100)
+                    .with_action(act.to_string());
+                    if let Err(e) = store.insert_event(&event) {
+                        tracing::warn!(error = %e, "写入防篡改事件失败");
+                    }
+                }
+            }
+            if block {
+                return write_text(session, 403, "文件已被篡改，访问被拒绝").await;
+            }
+        }
+        _ => {}
     }
 
     let mut resp = ResponseHeader::build(200, None)?;

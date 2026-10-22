@@ -939,6 +939,7 @@
               <a data-apptab="forwardingRule">转发规则</a>
               <a data-apptab="proxyConfig">高级配置</a>
               <a data-apptab="resource">应用路由</a>
+              <a data-apptab="tamper">网页防篡改</a>
             </div>
             <div id="app-detail"></div>
           </section>
@@ -2191,6 +2192,7 @@ function blankApp() {
     health_check: {}, retry: { enabled: false, attempts: 2 },
     headers: {}, websocket: false, expires_at: null,
     features: { attack: true, cc: true, bot: false, auth: false },
+    tamper: { enabled: false, paths: [], action: 'block' },
     access_mode: 'proxy',
     static_site: { root: '', index: 'index.html', spa_fallback: false },
     redirect: { target: '', status: 302 },
@@ -2401,6 +2403,30 @@ function renderAppDetail() {
     return;
   }
 
+  if (appDetailTab === 'tamper') {
+    const t = a.tamper || { enabled: false, paths: [], action: 'block' };
+    const isStatic = a.access_mode === 'static';
+    el.innerHTML = `<div class="fieldset">
+      <div><label>防护方式</label><div class="hint" style="margin:0">${isStatic ? '静态站点实时比对（请求时拦截）' : '定时 / 手动检查（反向代理应用不经过静态文件服务）'}</div></div>
+      <div><label class="row" for="ad-tamper-enabled"><input type="checkbox" id="ad-tamper-enabled" ${t.enabled ? 'checked' : ''}> 启用网页防篡改</label></div>
+      <div><label for="ad-tamper-action">篡改处置</label><select id="ad-tamper-action">
+        <option value="block" ${t.action !== 'log' ? 'selected' : ''}>拦截访问并记录</option>
+        <option value="log" ${t.action === 'log' ? 'selected' : ''}>仅记录事件</option>
+      </select></div>
+      <div class="wide"><label for="ad-tamper-paths">监控目录（每行一个；相对静态站点根目录，留空表示整个站点根目录）</label>
+        <textarea id="ad-tamper-paths" rows="4" placeholder="public&#10;uploads">${esc((t.paths || []).join('\n'))}</textarea></div>
+      <div class="wide hint">建立基线后会记录每个受保护文件的大小与 SHA-256。静态站点请求命中「文件被修改 / 新增文件」时按处置方式拦截或只记事件；「立即检查」还会发现被删除的文件。修改配置后请先保存，再重新建立基线。</div>
+      <div class="wide"><div id="ad-tamper-status" class="hint" style="margin:0">加载中…</div></div>
+      <div class="wide" style="display:flex;gap:8px;flex-wrap:wrap">
+        <button type="button" onclick="buildTamperBaseline()">建立 / 重建基线</button>
+        <button type="button" onclick="scanTamper()">立即检查</button>
+      </div>
+      <div class="wide" id="ad-tamper-result"></div>
+    </div>`;
+    if (!appDetailNew) loadTamperStatus();
+    return;
+  }
+
   el.innerHTML = `<div class="fieldset">
     <div class="wide hint">按路径把请求分发到不同上游。路径按前缀匹配，rewrite 支持 replace / strip_prefix 等模式。</div>
     <div class="wide"><textarea id="ad-routes" rows="10">${esc(JSON.stringify(a.routes || [], null, 2))}</textarea></div>
@@ -2505,6 +2531,14 @@ function collectAppDetail() {
     }
     return;
   }
+  if (appDetailTab === 'tamper') {
+    a.tamper = {
+      enabled: bool('ad-tamper-enabled'),
+      paths: val('ad-tamper-paths').split('\n').map(s => s.trim()).filter(Boolean),
+      action: val('ad-tamper-action') || 'block',
+    };
+    return;
+  }
   const raw = val('ad-routes').trim();
   if (raw) {
     try { a.routes = JSON.parse(raw); }
@@ -2534,6 +2568,58 @@ async function saveAppDetail() {
     loadStatistics();
   } catch (e) { showMsg('保存失败：' + e.message, 'error'); }
   finally { btn.disabled = false; btn.textContent = appDetailNew ? '创建' : '保存'; }
+}
+
+async function loadTamperStatus() {
+  const el = document.getElementById('ad-tamper-status');
+  if (!el || !currentApp || appDetailNew) return;
+  try {
+    const s = await api(`/apps/${encodeURIComponent(currentApp.id)}/tamper`);
+    if (!s.enabled) {
+      el.innerHTML = '未启用：勾选启用并保存后生效';
+    } else if (!s.baseline) {
+      el.innerHTML = '<span style="color:var(--warn)">基线未建立，防护尚未生效</span>';
+    } else {
+      el.innerHTML = `基线 <b style="color:var(--accent)">${s.baseline}</b> 个文件 · ${s.live_check ? '静态请求实时拦截已生效' : '仅在「立即检查」时比对'}<br><span class="muted">保护目录：${s.roots.map(esc).join('、') || '—'}</span>`;
+    }
+  } catch (e) { el.textContent = '状态读取失败：' + e.message; }
+}
+
+async function buildTamperBaseline() {
+  if (!currentApp) return;
+  if (appDetailNew) return showMsg('请先保存应用，再建立基线', 'error');
+  collectAppDetail();
+  const id = currentApp.id;
+  try {
+    // 先保存最新配置，服务端按库里的配置扫描目录
+    await api('/apps', { method: 'POST', body: JSON.stringify(currentApp) });
+    const r = await api(`/apps/${encodeURIComponent(id)}/tamper/baseline`, { method: 'POST' });
+    const skipped = (r.skipped || []).length;
+    showMsg(`基线已建立：${r.baseline} 个文件${skipped ? `，跳过 ${skipped} 项` : ''}`);
+    loadTamperStatus();
+    loadApps();
+  } catch (e) { showMsg('建立基线失败：' + e.message, 'error'); }
+}
+
+async function scanTamper() {
+  if (!currentApp || appDetailNew) return showMsg('请先保存应用', 'error');
+  const id = currentApp.id;
+  const box = document.getElementById('ad-tamper-result');
+  try {
+    const r = await api(`/apps/${encodeURIComponent(id)}/tamper/scan`, { method: 'POST' });
+    if (!r.changes.length) {
+      box.innerHTML = '<div class="hint" style="margin:0">未发现文件变更</div>';
+      return showMsg('检查完成：未发现变更');
+    }
+    const label = { modified: '已修改', added: '新增', deleted: '已删除' };
+    box.innerHTML = `<div class="hint" style="margin:0 0 6px">发现 ${r.changes.length} 处变更（已记录事件）</div>
+      ${r.changes.map(c => `<div style="padding:3px 0"><span class="tag ${c.kind === 'added' ? 'log' : 'deny'}">${label[c.kind] || esc(c.kind)}</span> <code>${esc(c.path)}</code></div>`).join('')}`;
+    showMsg(`检查完成：${r.changes.length} 处变更`);
+    loadApps();
+  } catch (e) {
+    box.innerHTML = '';
+    showMsg('检查失败：' + e.message, 'error');
+  }
 }
 
 async function deleteApp(id) {

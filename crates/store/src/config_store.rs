@@ -360,4 +360,88 @@ impl super::Store {
             Ok(n as usize)
         })
     }
+
+    // ============================================================
+    // 网页防篡改基线
+    // ============================================================
+
+    /// 用新扫描结果整体替换某个应用的基线。
+    pub fn replace_tamper_baseline(
+        &self,
+        app_id: &str,
+        entries: &[(String, u64, String)],
+        now: i64,
+    ) -> Result<(), StoreError> {
+        self.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute(
+                "DELETE FROM tamper_baselines WHERE app_id = ?1",
+                params![app_id],
+            )?;
+            {
+                let mut stmt = tx.prepare(
+                    "INSERT INTO tamper_baselines (app_id, path, size, digest, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                )?;
+                for (path, size, digest) in entries {
+                    stmt.execute(params![app_id, path, *size as i64, digest, now])?;
+                }
+            }
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    /// 读取某个应用的基线：`(路径, 大小, SHA-256)`。
+    pub fn tamper_baseline(&self, app_id: &str) -> Result<Vec<(String, u64, String)>, StoreError> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT path, size, digest FROM tamper_baselines WHERE app_id = ?1 ORDER BY path",
+            )?;
+            let rows = stmt.query_map(params![app_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)? as u64,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        })
+    }
+
+    /// 读取全部基线，用于启动时构建运行时索引：`(应用, 路径, 大小, SHA-256)`。
+    pub fn all_tamper_baselines(&self) -> Result<Vec<(String, String, u64, String)>, StoreError> {
+        self.with_conn(|conn| {
+            let mut stmt = conn
+                .prepare("SELECT app_id, path, size, digest FROM tamper_baselines ORDER BY app_id, path")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)? as u64,
+                    row.get::<_, String>(3)?,
+                ))
+            })?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        })
+    }
+
+    pub fn tamper_baseline_count(&self, app_id: &str) -> Result<usize, StoreError> {
+        self.with_conn(|conn| {
+            let n: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM tamper_baselines WHERE app_id = ?1",
+                params![app_id],
+                |r| r.get(0),
+            )?;
+            Ok(n as usize)
+        })
+    }
 }

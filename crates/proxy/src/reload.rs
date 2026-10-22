@@ -94,6 +94,8 @@ pub struct RuntimeState {
     pub rule_feeds: Vec<crate::rulefeed::RuleFeedStatus>,
     /// 自定义规则（兼容雷池格式）
     pub custom_rules: Vec<homewaf_config::CustomRule>,
+    /// 网页防篡改基线，索引与 Router 的应用顺序一致
+    pub tamper: Vec<crate::tamper::TamperBaseline>,
 }
 
 impl RuntimeState {
@@ -156,6 +158,7 @@ impl RuntimeState {
             feed_failures,
             rule_feeds: rule_feeds.statuses,
             custom_rules: config.custom_rules,
+            tamper: Vec::new(),
         })
     }
 
@@ -196,8 +199,9 @@ pub fn load_state_from_db_with(
 ) -> Result<RuntimeState, String> {
     // 应用
     let applications = store
-        .list_applications()
+        .list_applications::<homewaf_config::Application>()
         .map_err(|e| format!("读取应用失败：{e}"))?;
+    let app_ids: Vec<String> = applications.iter().map(|a| a.id.clone()).collect();
 
     let mut config = Config {
         applications,
@@ -301,6 +305,28 @@ pub fn load_state_from_db_with(
             path: w.path,
             rule_id: w.rule_id,
             note: w.note,
+        })
+        .collect();
+
+    // 网页防篡改基线。按应用 id 归组后，按 Router 顺序对齐成 Vec。
+    let mut by_app: std::collections::HashMap<String, Vec<(String, u64, String)>> =
+        std::collections::HashMap::new();
+    for (app_id, path, size, digest) in store
+        .all_tamper_baselines()
+        .map_err(|e| format!("读取防篡改基线失败：{e}"))?
+    {
+        by_app
+            .entry(app_id)
+            .or_default()
+            .push((path, size, digest));
+    }
+    state.tamper = app_ids
+        .iter()
+        .map(|id| {
+            by_app
+                .get(id)
+                .map(|rows| crate::tamper::TamperBaseline::from_rows(rows))
+                .unwrap_or_default()
         })
         .collect();
 

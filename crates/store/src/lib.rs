@@ -315,6 +315,16 @@ impl Store {
                 updated_at    INTEGER NOT NULL
             );
 
+            -- 网页防篡改基线：一行一个受保护文件
+            CREATE TABLE IF NOT EXISTS tamper_baselines (
+                app_id     TEXT NOT NULL,
+                path       TEXT NOT NULL,
+                size       INTEGER NOT NULL,
+                digest     TEXT NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (app_id, path)
+            );
+
             -- 检测白名单（误报豁免）
             CREATE TABLE IF NOT EXISTS detect_whitelist (
                 id         TEXT PRIMARY KEY,

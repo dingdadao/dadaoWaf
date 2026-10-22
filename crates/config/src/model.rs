@@ -1013,6 +1013,44 @@ pub struct Application {
     /// 应用级快捷防护开关（对应列表页的防护按钮）
     #[serde(default)]
     pub features: AppFeatures,
+    /// 网页防篡改：按基线校验静态文件是否被修改
+    #[serde(default)]
+    pub tamper: TamperConfig,
+}
+
+/// 网页防篡改配置。
+///
+/// 通过「基线指纹」判断文件是否被改动：建立基线时记录每个文件的大小与 SHA-256，
+/// 之后静态文件请求会先比对指纹，命中变更按 [`TamperAction`] 处置。
+/// `paths` 为空时默认监控 `static_site.root`。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TamperConfig {
+    pub enabled: bool,
+    /// 需要监控的目录，相对路径按 `static_site.root` 解析，也支持绝对路径
+    pub paths: Vec<String>,
+    pub action: TamperAction,
+}
+
+impl Default for TamperConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            paths: Vec::new(),
+            action: TamperAction::Block,
+        }
+    }
+}
+
+/// 篡改命中后的处置。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TamperAction {
+    /// 拒绝访问被修改的文件，并记录事件
+    #[default]
+    Block,
+    /// 正常返回文件，只记录事件
+    Log,
 }
 
 /// 应用级快捷开关。

@@ -88,6 +88,9 @@ pub fn router(state: Ctx) -> Router {
         .route("/api/apps/{id}", get(get_app).delete(delete_app))
         .route("/api/apps/{id}/enabled", post(set_app_enabled))
         .route("/api/apps/{id}/features", post(set_app_features))
+        .route("/api/apps/{id}/tamper", get(get_app_tamper))
+        .route("/api/apps/{id}/tamper/baseline", post(build_app_tamper_baseline))
+        .route("/api/apps/{id}/tamper/scan", post(scan_app_tamper))
         .route("/api/rules", get(list_rules).post(upsert_rule))
         .route("/api/rules/{id}", delete(delete_rule))
         .route("/api/bans", get(list_bans).post(create_ban))
@@ -1302,6 +1305,137 @@ async fn set_app_features(
         )
             .into_response(),
     }
+}
+
+fn find_app(ctx: &AdminState, id: &str) -> Result<Application, ApiError> {
+    match ctx.store.list_applications::<Application>() {
+        Ok(apps) => apps
+            .into_iter()
+            .find(|a| a.id == id)
+            .ok_or_else(|| (StatusCode::NOT_FOUND, "应用不存在".to_string())),
+        Err(e) => Err(internal(e)),
+    }
+}
+
+/// 应用防篡改状态：配置、基线文件数与实际保护目录。
+async fn get_app_tamper(
+    State(ctx): State<Ctx>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if !authorized(&ctx, &headers) {
+        return unauthorized();
+    }
+    let app = match find_app(&ctx, &id) {
+        Ok(app) => app,
+        Err(e) => return e.into_response(),
+    };
+    let baseline = match ctx.store.tamper_baseline_count(&id) {
+        Ok(n) => n,
+        Err(e) => return internal(e).into_response(),
+    };
+    let roots: Vec<String> = homewaf_proxy::tamper::protected_roots(&app)
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect();
+    Json(serde_json::json!({
+        "app": id,
+        "enabled": app.tamper.enabled,
+        "paths": app.tamper.paths,
+        "action": app.tamper.action,
+        "baseline": baseline,
+        "roots": roots,
+        "live_check": matches!(app.access_mode, homewaf_config::AccessMode::Static),
+    }))
+    .into_response()
+}
+
+/// 扫描受保护目录并重建基线。
+async fn build_app_tamper_baseline(
+    State(ctx): State<Ctx>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if !authorized(&ctx, &headers) {
+        return unauthorized();
+    }
+    let app = match find_app(&ctx, &id) {
+        Ok(app) => app,
+        Err(e) => return e.into_response(),
+    };
+    let (entries, scan) = match homewaf_proxy::tamper::build_baseline(&app) {
+        Ok(v) => v,
+        Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
+    };
+    if let Err(e) = ctx.store.replace_tamper_baseline(
+        &id,
+        &entries,
+        homewaf_acl::now_unix(),
+    ) {
+        return internal(e).into_response();
+    }
+    if let Err(e) = reload_state(&ctx) {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("基线已保存，但热重载失败：{e}"),
+        )
+            .into_response();
+    }
+    Json(serde_json::json!({
+        "ok": true,
+        "baseline": entries.len(),
+        "files": scan.files,
+        "skipped": scan.skipped,
+    }))
+    .into_response()
+}
+
+/// 与基线对比，返回被修改 / 新增 / 删除的文件，并记录事件。
+async fn scan_app_tamper(
+    State(ctx): State<Ctx>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if !authorized(&ctx, &headers) {
+        return unauthorized();
+    }
+    let app = match find_app(&ctx, &id) {
+        Ok(app) => app,
+        Err(e) => return e.into_response(),
+    };
+    let rows = match ctx.store.tamper_baseline(&id) {
+        Ok(rows) if !rows.is_empty() => rows,
+        Ok(_) => {
+            return (StatusCode::BAD_REQUEST, "尚未建立基线，请先建立基线").into_response();
+        }
+        Err(e) => return internal(e).into_response(),
+    };
+    let baseline = homewaf_proxy::tamper::TamperBaseline::from_rows(&rows);
+    let scan = match homewaf_proxy::tamper::scan_changes(&app, &baseline) {
+        Ok(scan) => scan,
+        Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
+    };
+
+    let action = match app.tamper.action {
+        homewaf_config::TamperAction::Block => "block",
+        homewaf_config::TamperAction::Log => "log",
+    };
+    for change in &scan.changes {
+        if !homewaf_proxy::tamper::should_record(&id, &change.path) {
+            continue;
+        }
+        let event = homewaf_store::Event::new(homewaf_acl::now_unix(), homewaf_store::EventKind::Detect, "")
+            .with_app(id.clone())
+            .with_path(change.path.clone())
+            .with_rules(format!("tamper-{}", change.kind))
+            .with_score(100)
+            .with_action(action.to_string());
+        if let Err(e) = ctx.store.insert_event(&event) {
+            tracing::warn!(error = %e, "写入防篡改扫描事件失败");
+        }
+    }
+
+    Json(scan).into_response()
 }
 
 async fn upsert_app(
@@ -2987,6 +3121,7 @@ mod tests {
             feed_failures: Vec::new(),
             rule_feeds: Vec::new(),
             custom_rules: Vec::new(),
+            tamper: Vec::new(),
         }
     }
 
@@ -3039,6 +3174,7 @@ mod tests {
             static_site: Default::default(),
             redirect: Default::default(),
             features: Default::default(),
+            tamper: Default::default(),
         }
     }
 

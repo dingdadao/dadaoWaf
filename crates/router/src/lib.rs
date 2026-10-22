@@ -204,6 +204,7 @@ mod tests {
             static_site: Default::default(),
             redirect: Default::default(),
             features: Default::default(),
+            tamper: Default::default(),
         }
     }
 
