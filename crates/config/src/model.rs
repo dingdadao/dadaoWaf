@@ -1010,6 +1010,37 @@ pub struct Application {
     /// `access_mode = redirect` 时生效
     #[serde(default)]
     pub redirect: RedirectConfig,
+    /// 应用级快捷防护开关（对应列表页的防护按钮）
+    #[serde(default)]
+    pub features: AppFeatures,
+}
+
+/// 应用级快捷开关。
+///
+/// `attack` / `cc` 直接参与请求策略解析；`bot` 与 `auth` 先保留字段，
+/// 便于后续接入 BOT 识别与身份认证，不影响现有配置兼容。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AppFeatures {
+    #[serde(default = "default_true")]
+    pub attack: bool,
+    #[serde(default = "default_true")]
+    pub cc: bool,
+    #[serde(default)]
+    pub bot: bool,
+    #[serde(default)]
+    pub auth: bool,
+}
+
+impl Default for AppFeatures {
+    fn default() -> Self {
+        Self {
+            attack: true,
+            cc: true,
+            bot: false,
+            auth: false,
+        }
+    }
 }
 
 /// 应用的接入方式。

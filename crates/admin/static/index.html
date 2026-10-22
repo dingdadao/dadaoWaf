@@ -6,17 +6,17 @@
 <title>HomeWAF 控制台</title>
 <style>
   :root {
-    --bg: #f7f7f5;
-    --card: #ffffff;
-    --border: #e5e4df;
-    --text: #2c2c2a;
-    --muted: #888780;
-    --accent: #185fa5;
-    --accent-soft: #eef2f7;
-    --danger: #a32d2d;
-    --ok: #0f6e56;
-    --warn: #854f0b;
-    --sidebar: #1f1f1e;
+    --bg: #181818;
+    --card: #232323;
+    --border: #353535;
+    --text: #e6e6e6;
+    --muted: #8b9097;
+    --accent: #f1d6bf;
+    --accent-soft: rgba(241,214,191,.12);
+    --danger: #ef7a7a;
+    --ok: #66d9a8;
+    --warn: #e3b341;
+    --sidebar: #141414;
   }
   * { box-sizing: border-box; }
   html, body { height: 100%; }
@@ -30,26 +30,26 @@
   .app { display: flex; height: 100vh; overflow: hidden; }
 
   .sidebar {
-    width: 196px; flex-shrink: 0; background: var(--sidebar); color: #c9c8c3;
+    width: 196px; flex-shrink: 0; background: var(--sidebar); color: #a9a9a6;
     display: flex; flex-direction: column; padding: 0;
   }
   .brand {
     padding: 18px 20px 14px; font-size: 15px; font-weight: 600; color: #fff;
-    letter-spacing: 0.02em; border-bottom: 1px solid #333331;
+    letter-spacing: 0.02em; border-bottom: 1px solid #262626;
   }
-  .brand small { display: block; font-size: 11px; font-weight: 400; color: #7d7c77; margin-top: 2px; }
+  .brand small { display: block; font-size: 11px; font-weight: 400; color: #6f6f6c; margin-top: 2px; }
   .nav { padding: 8px 0; flex: 1; overflow-y: auto; }
   .nav a {
-    display: block; padding: 8px 20px; font-size: 13px; color: #b5b4af;
+    display: block; padding: 8px 20px; font-size: 13px; color: #a9a9a6;
     text-decoration: none; cursor: pointer; border-left: 2px solid transparent;
   }
-  .nav a:hover { background: #2a2a28; color: #e8e7e2; }
-  .nav a.active { background: #2a2a28; color: #fff; border-left-color: #4a9eda; }
+  .nav a:hover { background: #232323; color: #e6e6e6; }
+  .nav a.active { background: #232323; color: #fff; border-left-color: #f1d6bf; }
   .nav .badge {
-    float: right; font-size: 11px; background: #3a3a37; color: #b5b4af;
+    float: right; font-size: 11px; background: #2a2a2a; color: #a9a9a6;
     padding: 0 6px; border-radius: 8px; margin-top: 3px;
   }
-  .nav .badge.alert { background: #5c2020; color: #f0b0b0; }
+  .nav .badge.alert { background: #3a1d22; color: #f0a0a0; }
 
   main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
 
@@ -88,24 +88,24 @@
 
   table { width: 100%; border-collapse: collapse; }
   th, td { padding: 9px 16px; text-align: left; border-bottom: 1px solid var(--border); vertical-align: top; }
-  th { font-weight: 500; color: var(--muted); font-size: 12px; background: #fafaf8; }
+  th { font-weight: 500; color: var(--muted); font-size: 12px; background: #1f1f1f; }
   tr:last-child td { border-bottom: none; }
   code { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; }
 
   .tag { display: inline-block; padding: 1px 8px; border-radius: 4px; font-size: 12px; background: var(--accent-soft); color: var(--accent); }
-  .tag.deny, .tag.block { background: #fdeeee; color: var(--danger); }
-  .tag.allow { background: #e8f5ef; color: var(--ok); }
-  .tag.log, .tag.observe { background: #fdf3e6; color: var(--warn); }
+  .tag.deny, .tag.block { background: rgba(239,122,122,.14); color: var(--danger); }
+  .tag.allow { background: rgba(102,217,168,.14); color: var(--ok); }
+  .tag.log, .tag.observe { background: rgba(227,179,65,.14); color: var(--warn); }
 
   button {
     font: inherit; font-size: 13px; padding: 5px 12px; border-radius: 6px;
     border: 1px solid var(--border); background: var(--card); color: var(--text); cursor: pointer;
   }
-  button:hover { background: #f0efec; }
+  button:hover { background: #2a2a2a; }
   button:disabled { opacity: 0.5; cursor: default; }
-  button.danger { color: var(--danger); border-color: #f0c8c8; }
-  button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
-  button.primary:hover { background: #134a80; }
+  button.danger { color: var(--danger); border-color: #5a2a2a; }
+  button.primary { background: var(--accent); color: #1a1a1a; border-color: var(--accent); font-weight: 600; }
+  button.primary:hover { background: #e8c9ae; }
 
   .empty { padding: 28px 16px; color: var(--muted); text-align: center; font-size: 13px; }
 
@@ -121,8 +121,8 @@
 
   .msg { padding: 10px 16px; font-size: 13px; display: none; margin-bottom: 16px; border-radius: 8px; }
   .msg.show { display: block; }
-  .msg.error { background: #fdeeee; color: var(--danger); border: 1px solid #f0c8c8; }
-  .msg.ok { background: #e8f5ef; color: var(--ok); border: 1px solid #b8e0cd; }
+  .msg.error { background: rgba(239,122,122,.14); color: var(--danger); border: 1px solid #5a2a2a; }
+  .msg.ok { background: rgba(102,217,168,.14); color: var(--ok); border: 1px solid #2f5a47; }
 
   .filters { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
   .filters select, .filters input { width: auto; min-width: 110px; padding: 4px 8px; font-size: 12px; }
@@ -146,11 +146,11 @@
   .logtable th { padding: 8px 12px; }
   .logtable td { padding: 7px 12px; white-space: nowrap; }
   .logtable tbody tr { cursor: pointer; }
-  .logtable tbody tr:hover { background: #fafaf8; }
+  .logtable tbody tr:hover { background: #1f1f1f; }
   .logtable .mono { font-family: ui-monospace, "SF Mono", Menlo, monospace; }
   .logtable .path { max-width: 280px; overflow: hidden; text-overflow: ellipsis; }
   .logtable .num { text-align: right; font-variant-numeric: tabular-nums; }
-  .logtable .req { color: #8a6a9e; }
+  .logtable .req { color: #b08ad0; }
   .logtable .muted { color: var(--muted); }
 
   .status {
@@ -158,19 +158,19 @@
     padding: 1px 6px; border-radius: 4px; font-size: 12px; font-weight: 500;
     font-variant-numeric: tabular-nums;
   }
-  .status.st-2 { background: #e8f5ef; color: var(--ok); }
-  .status.st-3 { background: #eef2f7; color: var(--accent); }
-  .status.st-4 { background: #fdf3e6; color: var(--warn); }
-  .status.st-5 { background: #fdeeee; color: var(--danger); }
+  .status.st-2 { background: rgba(102,217,168,.14); color: var(--ok); }
+  .status.st-3 { background: rgba(241,214,191,.12); color: var(--accent); }
+  .status.st-4 { background: rgba(227,179,65,.14); color: var(--warn); }
+  .status.st-5 { background: rgba(239,122,122,.14); color: var(--danger); }
 
   .rawrow td {
-    background: #fafaf8; padding: 0 !important;
+    background: #1f1f1f; padding: 0 !important;
     border-bottom: 1px solid var(--border);
   }
   .rawrow pre {
     margin: 0; padding: 10px 14px; font-size: 11.5px; line-height: 1.6;
     font-family: ui-monospace, "SF Mono", Menlo, monospace;
-    color: #5f5e5a; white-space: pre-wrap; word-break: break-all;
+    color: #a8a8a5; white-space: pre-wrap; word-break: break-all;
   }
   .rawrow.hidden { display: none; }
 
@@ -179,14 +179,14 @@
   @media (max-width: 900px) { .cols { grid-template-columns: 1fr; } }
   .trend { display: flex; align-items: flex-end; gap: 3px; height: 150px; padding: 16px 16px 8px; }
   .trend .col { flex: 1; height: 100%; display: flex; align-items: flex-end; position: relative; }
-  .trend .bar { width: 100%; background: #b9cfe4; border-radius: 2px 2px 0 0; min-height: 0; position: relative; }
-  .trend .bar .blocked { position: absolute; left: 0; right: 0; bottom: 0; background: #c96a6a; border-radius: 2px 2px 0 0; }
+  .trend .bar { width: 100%; background: #6f6257; border-radius: 2px 2px 0 0; min-height: 0; position: relative; }
+  .trend .bar .blocked { position: absolute; left: 0; right: 0; bottom: 0; background: #ef7a7a; border-radius: 2px 2px 0 0; }
   .trend .col:hover .bar { background: var(--accent); }
   .trend-axis { display: flex; justify-content: space-between; padding: 0 16px 12px; font-size: 11px; color: var(--muted); }
   .catlist { padding: 8px 16px 16px; display: grid; gap: 9px; }
   .catrow { display: grid; grid-template-columns: 90px 1fr 46px; gap: 10px; align-items: center; font-size: 12px; }
   .catrow .name { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .catrow .track { height: 7px; background: #f0efec; border-radius: 4px; overflow: hidden; }
+  .catrow .track { height: 7px; background: #2a2a2a; border-radius: 4px; overflow: hidden; }
   .catrow .fill { display: block; height: 100%; background: var(--accent); border-radius: 4px; }
   .catrow .num { text-align: right; font-variant-numeric: tabular-nums; }
   .legend { font-size: 11px; color: var(--muted); display: flex; gap: 14px; align-items: center; }
@@ -194,18 +194,18 @@
 
   /* ---------- 统计报表（深色） ---------- */
   .stats-wrap {
-    --s-bg: #0b0f14;
-    --s-card: #141a22;
-    --s-border: #232c38;
-    --s-text: #e6edf3;
-    --s-muted: #8b949e;
-    --s-accent: #4a9eda;
-    --s-green: #3ddc97;
-    --s-red: #f06a6a;
+    --s-bg: #181818;
+    --s-card: #232323;
+    --s-border: #353535;
+    --s-text: #e6e6e6;
+    --s-muted: #8b9097;
+    --s-accent: #f1d6bf;
+    --s-green: #66d9a8;
+    --s-red: #ef7a7a;
     --s-amber: #e3b341;
     --s-purple: #a371f7;
     background: var(--s-bg); color: var(--s-text);
-    border: 1px solid #1a222c; border-radius: 12px;
+    border: 1px solid #2b2b2b; border-radius: 12px;
     padding: 16px 18px 22px; min-height: calc(100vh - 132px);
   }
   .stats-head {
@@ -218,35 +218,35 @@
     padding: 6px 14px; font-size: 13px; color: var(--s-muted); border-radius: 7px;
     cursor: pointer; border: 1px solid transparent; user-select: none;
   }
-  .stats-tabs a:hover { color: var(--s-text); background: #161e27; }
+  .stats-tabs a:hover { color: var(--s-text); background: #232323; }
   .stats-tabs a.active {
-    color: #fff; background: #1c2733; border-color: #2b3a4a;
+    color: #fff; background: #2a2a2a; border-color: #3a3a3a;
     box-shadow: inset 0 -2px 0 var(--s-accent);
   }
   .stats-filters { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
   .stats-wrap select, .stats-wrap input {
-    width: auto; background: #111820; border-color: var(--s-border);
+    width: auto; background: #1f1f1f; border-color: var(--s-border);
     color: var(--s-text); font-size: 12px; padding: 5px 9px;
   }
   .stats-wrap button {
-    background: #16202a; border-color: var(--s-border); color: var(--s-text);
+    background: #232323; border-color: var(--s-border); color: var(--s-text);
     font-size: 12px; padding: 5px 12px;
   }
-  .stats-wrap button:hover { background: #1d2936; }
-  .stats-wrap button.primary { background: var(--s-accent); border-color: var(--s-accent); color: #06121d; font-weight: 600; }
-  .stats-wrap button.primary:hover { background: #63b0e9; }
+  .stats-wrap button:hover { background: #2a2a2a; }
+  .stats-wrap button.primary { background: var(--s-accent); border-color: var(--s-accent); color: #1a1a1a; font-weight: 600; }
+  .stats-wrap button.primary:hover { background: #e8c9ae; }
   .stats-panel { display: none; }
   .stats-panel.active { display: block; }
 
   .kpi-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; margin-bottom: 14px; }
   .kpi {
-    background: linear-gradient(160deg, #18212c 0%, #111820 100%);
+    background: linear-gradient(160deg, #232323 0%, #1f1f1f 100%);
     border: 1px solid var(--s-border); border-radius: 10px; padding: 12px 14px;
     position: relative; overflow: hidden;
   }
   .kpi::after {
     content: ''; position: absolute; right: -18px; top: -18px; width: 56px; height: 56px;
-    border-radius: 50%; background: radial-gradient(circle, rgba(74,158,218,.22), transparent 70%);
+    border-radius: 50%; background: radial-gradient(circle, rgba(241,214,191,.16), transparent 70%);
   }
   .kpi .kpi-label { font-size: 12px; color: var(--s-muted); margin-bottom: 6px; }
   .kpi .kpi-value { font-size: 25px; font-weight: 600; font-variant-numeric: tabular-nums; line-height: 1.15; }
@@ -275,20 +275,20 @@
 
   .chart { padding: 8px 6px 4px; }
   .chart-svg { display: block; width: 100%; }
-  .chart-svg .grid { stroke: #232c38; stroke-width: 1; stroke-dasharray: 3 4; }
-  .chart-svg .axis { fill: #7d8794; font-size: 10px; }
+  .chart-svg .grid { stroke: #353535; stroke-width: 1; stroke-dasharray: 3 4; }
+  .chart-svg .axis { fill: #8b9097; font-size: 10px; }
   .chart-legend { display: flex; gap: 14px; font-size: 11px; color: var(--s-muted); }
   .chart-legend i { display: inline-block; width: 9px; height: 3px; border-radius: 2px; margin-right: 5px; vertical-align: middle; }
 
-  .seg { display: inline-flex; gap: 2px; background: #101820; border: 1px solid var(--s-border); border-radius: 7px; padding: 2px; }
+  .seg { display: inline-flex; gap: 2px; background: #1f1f1f; border: 1px solid var(--s-border); border-radius: 7px; padding: 2px; }
   .stats-wrap .seg button { border: none; background: transparent; padding: 3px 10px; border-radius: 5px; color: var(--s-muted); }
-  .stats-wrap .seg button.on { background: #223040; color: #fff; }
+  .stats-wrap .seg button.on { background: #2f2f2f; color: #fff; }
   .screen-shell .seg button { border: none; background: transparent; padding: 3px 10px; border-radius: 5px; color: var(--sc-muted); font-size: 12px; }
-  .screen-shell .seg button.on { background: #17303f; color: #fff; }
+  .screen-shell .seg button.on { background: #2f2a26; color: #fff; }
 
   .mapbox { position: relative; padding: 6px 8px 10px; min-height: 240px; }
   .mapbox svg { display: block; width: 100%; }
-  .map-land { fill: #243342; }
+  .map-land { fill: #2f2f2f; }
   .geo-point { fill: var(--s-accent); opacity: .85; }
   .geo-point.hot { fill: var(--s-red); }
   .map-note {
@@ -303,42 +303,42 @@
     display: grid; grid-template-columns: 16px minmax(60px, 1fr) 90px 62px;
     gap: 8px; align-items: center; font-size: 12px;
   }
-  .rankrow .idx { color: #5b6673; font-variant-numeric: tabular-nums; }
-  .rankrow .nm { color: #c6d2dd; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .rankrow .track { height: 6px; background: #1a2430; border-radius: 4px; overflow: hidden; }
-  .rankrow .fill { display: block; height: 100%; border-radius: 4px; background: linear-gradient(90deg, #2f6fa8, #4a9eda); }
+  .rankrow .idx { color: #6f6f6c; font-variant-numeric: tabular-nums; }
+  .rankrow .nm { color: #d0d0cd; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .rankrow .track { height: 6px; background: #2a2a2a; border-radius: 4px; overflow: hidden; }
+  .rankrow .fill { display: block; height: 100%; border-radius: 4px; background: linear-gradient(90deg, #8c7a68, #f1d6bf); }
   .rankrow .num { text-align: right; color: var(--s-text); font-variant-numeric: tabular-nums; }
 
   .donut-wrap { display: flex; gap: 12px; align-items: center; padding: 10px 14px 14px; flex-wrap: wrap; }
   .donut-legend { flex: 1; min-width: 120px; display: grid; gap: 5px; font-size: 12px; }
-  .legendrow { display: grid; grid-template-columns: 8px minmax(40px,1fr) 54px 48px; gap: 6px; align-items: center; color: #c6d2dd; }
+  .legendrow { display: grid; grid-template-columns: 8px minmax(40px,1fr) 54px 48px; gap: 6px; align-items: center; color: #d0d0cd; }
   .legendrow i { width: 8px; height: 8px; border-radius: 2px; }
   .legendrow .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .legendrow .num, .legendrow .pct { text-align: right; color: var(--s-muted); font-variant-numeric: tabular-nums; }
-  .donut-num { fill: #e6edf3; font-size: 19px; font-weight: 600; }
-  .donut-label { fill: #7d8794; font-size: 9px; }
+  .donut-num { fill: #e6e6e6; font-size: 19px; font-weight: 600; }
+  .donut-label { fill: #8b9097; font-size: 9px; }
 
   .darktable { width: 100%; border-collapse: collapse; }
   .darktable th {
-    background: #111820; color: var(--s-muted); font-size: 11px; font-weight: 500;
+    background: #1f1f1f; color: var(--s-muted); font-size: 11px; font-weight: 500;
     border-bottom: 1px solid var(--s-border); padding: 8px 12px; text-align: left;
   }
-  .darktable td { padding: 7px 12px; border-bottom: 1px solid #1c242e; font-size: 12px; color: #c6d2dd; }
+  .darktable td { padding: 7px 12px; border-bottom: 1px solid #2b2b2b; font-size: 12px; color: #d0d0cd; }
   .darktable tr:last-child td { border-bottom: none; }
   .darktable .mono { font-family: ui-monospace, "SF Mono", Menlo, monospace; }
   .darktable .num { text-align: right; font-variant-numeric: tabular-nums; }
   .darktable .geo { color: var(--s-muted); font-size: 11px; }
-  .darktable tbody tr:hover { background: #17202b; }
+  .darktable tbody tr:hover { background: #262626; }
   .live-dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: var(--s-green); margin-right: 6px; }
 
   .report-list { max-height: 640px; overflow-y: auto; }
   .report-item {
-    padding: 10px 14px; border-bottom: 1px solid #1c242e; cursor: pointer;
+    padding: 10px 14px; border-bottom: 1px solid #2b2b2b; cursor: pointer;
     display: flex; justify-content: space-between; gap: 10px; font-size: 12px;
   }
-  .report-item:hover { background: #17202b; }
-  .report-item.active { background: #1b2837; box-shadow: inset 2px 0 0 var(--s-accent); }
-  .report-item .date { color: #dbe6f0; font-weight: 500; }
+  .report-item:hover { background: #262626; }
+  .report-item.active { background: #2a2a2a; box-shadow: inset 2px 0 0 var(--s-accent); }
+  .report-item .date { color: #e6e6e6; font-weight: 500; }
   .report-item .sub { color: var(--s-muted); font-size: 11px; margin-top: 2px; }
   .report-item .rate { color: var(--s-red); font-variant-numeric: tabular-nums; }
   .report-body { padding: 14px; }
@@ -350,21 +350,21 @@
   .report-grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; }
 
   /* ---------- 防护大屏 ---------- */
-  .screen-overlay { position: fixed; inset: 0; z-index: 60; display: none; overflow: auto; background: #04070b; }
+  .screen-overlay { position: fixed; inset: 0; z-index: 60; display: none; overflow: auto; background: #0a0a0a; }
   .screen-overlay.show { display: block; }
   .screen-shell {
-    --sc-bg: #04070b; --sc-card: rgba(12, 21, 31, .9); --sc-border: #163040;
-    --sc-text: #e3f1fb; --sc-muted: #7f9cb3; --sc-accent: #38d6ff;
-    --sc-red: #ff6b81; --sc-green: #35e0a1;
+    --sc-bg: #0a0a0a; --sc-card: rgba(12, 21, 31, .9); --sc-border: #353535;
+    --sc-text: #e6e6e6; --sc-muted: #8b9097; --sc-accent: #f1d6bf;
+    --sc-red: #ef7a7a; --sc-green: #66d9a8;
     min-height: 100vh; color: var(--sc-text);
-    background: radial-gradient(1200px 600px at 50% -10%, #0a2030 0%, var(--sc-bg) 60%);
+    background: radial-gradient(1200px 600px at 50% -10%, #1f1f1f 0%, var(--sc-bg) 60%);
     padding: 18px 26px 26px; display: flex; flex-direction: column; gap: 14px;
   }
   .screen-shell.light {
-    --sc-bg: #eef2f6; --sc-card: #ffffff; --sc-border: #d8e2ec;
-    --sc-text: #172532; --sc-muted: #63788b; --sc-accent: #0b7fd1;
-    --sc-red: #c8443f; --sc-green: #12805c;
-    background: radial-gradient(1200px 600px at 50% -10%, #dfeaf5 0%, var(--sc-bg) 70%);
+    --sc-bg: #eef2f6; --sc-card: #ffffff; --sc-border: #ddd5cc;
+    --sc-text: #172532; --sc-muted: #63788b; --sc-accent: #8a6a4a;
+    --sc-red: #c25a56; --sc-green: #3f7a62;
+    background: radial-gradient(1200px 600px at 50% -10%, #e8e0d8 0%, var(--sc-bg) 70%);
   }
   .screen-head {
     display: flex; justify-content: space-between; align-items: center; gap: 16px;
@@ -393,17 +393,17 @@
   .screen-shell .dcard { background: var(--sc-card); border-color: var(--sc-border); }
   .screen-shell .dcard > header { border-color: var(--sc-border); }
   .screen-shell .dcard > header h2 { color: var(--sc-text); }
-  .screen-shell .chart-svg .grid { stroke: #173040; }
-  .screen-shell.light .chart-svg .grid { stroke: #dbe6f0; }
-  .screen-shell .chart-svg .axis { fill: #6f8ba1; }
-  .screen-shell.light .seg { background: #eef3f7; border-color: #d8e2ec; }
-  .screen-shell.light .seg button.on { background: #d7e7f5; color: #0b4a72; }
-  .screen-shell .map-land { fill: #1c3242; }
-  .screen-shell.light .map-land { fill: #cddcea; }
-  .screen-shell.light .darktable th { background: #f4f8fb; color: #63788b; border-color: #e2ebf3; }
-  .screen-shell.light .darktable td { color: #172532; border-color: #e8eff5; }
-  .screen-shell.light .rankrow .nm { color: #2b3a48; }
-  .screen-shell.light .rankrow .track { background: #eef3f7; }
+  .screen-shell .chart-svg .grid { stroke: #353535; }
+  .screen-shell.light .chart-svg .grid { stroke: #e6e6e6; }
+  .screen-shell .chart-svg .axis { fill: #8b9097; }
+  .screen-shell.light .seg { background: #f1ece6; border-color: #ddd5cc; }
+  .screen-shell.light .seg button.on { background: #e8dccd; color: #5a4630; }
+  .screen-shell .map-land { fill: #2f2f2f; }
+  .screen-shell.light .map-land { fill: #cdc4bb; }
+  .screen-shell.light .darktable th { background: #f5f0ea; color: #63788b; border-color: #ddd5cc; }
+  .screen-shell.light .darktable td { color: #172532; border-color: #e5ded6; }
+  .screen-shell.light .rankrow .nm { color: #2b2b2b; }
+  .screen-shell.light .rankrow .track { background: #f1ece6; }
   .screen-shell.light .rankrow .num { color: #172532; }
   .screen-shell.light .donut-num { fill: #172532; }
   @media (max-width: 1100px) {
@@ -417,8 +417,8 @@
     padding: 7px 14px; border-radius: 7px; cursor: pointer; font-size: 13px;
     color: var(--muted); border: 1px solid transparent; user-select: none;
   }
-  .sys-tabs a:hover { background: #f2f2ee; color: var(--text); }
-  .sys-tabs a.active { background: #1c2530; color: #fff; }
+  .sys-tabs a:hover { background: #232323; color: var(--text); }
+  .sys-tabs a.active { background: #2a2a2a; color: #fff; }
   .sys-panel { display: none; }
   .sys-panel.active { display: block; }
   .sys-panel .card, .sys-panel .dcard { margin-bottom: 14px; }
@@ -434,20 +434,20 @@
      ============================================================ */
   :root {
     color-scheme: dark;
-    --bg: #0b0f14;
-    --card: #141a22;
-    --card-2: #111820;
-    --border: #232c38;
-    --border-soft: #1c242e;
-    --text: #e6edf3;
-    --muted: #8b949e;
-    --accent: #4a9eda;
-    --accent-soft: rgba(74, 158, 218, 0.14);
-    --danger: #f06a6a;
-    --ok: #3ddc97;
+    --bg: #181818;
+    --card: #232323;
+    --card-2: #1f1f1f;
+    --border: #353535;
+    --border-soft: #2b2b2b;
+    --text: #e6e6e6;
+    --muted: #8b9097;
+    --accent: #f1d6bf;
+    --accent-soft: rgba(241, 214, 191, 0.12);
+    --danger: #ef7a7a;
+    --ok: #66d9a8;
     --warn: #e3b341;
-    --sidebar: #070b10;
-    --radius: 12px;
+    --sidebar: #141414;
+    --radius: 6px;
     --s-bg: var(--bg);
     --s-card: var(--card);
     --s-border: var(--border);
@@ -462,57 +462,57 @@
 
   ::-webkit-scrollbar { width: 10px; height: 10px; }
   ::-webkit-scrollbar-thumb {
-    background: #263241; border-radius: 6px; border: 2px solid var(--bg);
+    background: #3a3a3a; border-radius: 6px; border: 2px solid var(--bg);
   }
   ::-webkit-scrollbar-track { background: transparent; }
 
   body {
-    background: radial-gradient(1200px 500px at 12% -10%, #101a26 0%, var(--bg) 55%);
+    background: var(--bg);
     font-size: 13.5px;
   }
 
   /* ---------- 侧边栏 ---------- */
   .sidebar {
     width: 218px;
-    background: linear-gradient(180deg, #0a1017 0%, var(--sidebar) 100%);
-    border-right: 1px solid #161d26;
+    background: linear-gradient(180deg, #141414 0%, var(--sidebar) 100%);
+    border-right: 1px solid #262626;
   }
   .brand {
     display: flex; align-items: center; gap: 10px;
-    padding: 16px 16px 14px; border-bottom: 1px solid #161d26;
+    padding: 16px 16px 14px; border-bottom: 1px solid #262626;
     font-size: 15px; letter-spacing: 0.01em;
   }
   .brand-mark {
     width: 30px; height: 30px; flex-shrink: 0; border-radius: 9px;
     display: grid; place-items: center;
-    background: linear-gradient(135deg, #4a9eda, #24629c);
+    background: linear-gradient(135deg, #f1d6bf, #b89b82);
     color: #fff; font-size: 14px; font-weight: 700;
-    box-shadow: 0 4px 14px rgba(74, 158, 218, 0.25);
+    box-shadow: 0 4px 14px rgba(241, 214, 191, 0.18);
   }
   .brand-text { font-size: 15px; font-weight: 600; color: #fff; line-height: 1.2; }
   .brand-text small {
     display: block; margin-top: 2px; font-size: 10.5px;
-    font-weight: 400; color: #68778a; letter-spacing: 0.02em;
+    font-weight: 400; color: #7a7a77; letter-spacing: 0.02em;
   }
   .nav { padding: 10px 0 22px; }
   .nav-group { padding: 4px 0; }
   .nav-title {
     padding: 8px 18px 4px; font-size: 10.5px; letter-spacing: 0.12em;
-    color: #566375; text-transform: uppercase;
+    color: #6f6f6c; text-transform: uppercase;
   }
   .nav a {
     margin: 2px 10px; padding: 8px 12px; border-radius: 8px;
-    border-left: 0; color: #93a1b1; font-size: 13px;
+    border-left: 0; color: #a9a9a6; font-size: 13px;
     transition: background 0.15s ease, color 0.15s ease;
   }
-  .nav a:hover { background: #121a24; color: var(--text); }
+  .nav a:hover { background: #232323; color: var(--text); }
   .nav a.active {
-    background: rgba(74, 158, 218, 0.13); color: #fff;
+    background: rgba(241, 214, 191, 0.10); color: #fff;
     box-shadow: inset 2px 0 0 var(--accent);
   }
   .nav .badge {
     float: right; margin-top: 1px; padding: 0 7px;
-    background: #1b2531; color: #93a1b1; border-radius: 999px;
+    background: #2a2a2a; color: #a9a9a6; border-radius: 999px;
   }
   .nav .badge.alert { background: #3a1d22; color: #f0a0a0; }
 
@@ -528,7 +528,7 @@
   .topbar .meta { gap: 8px; }
   .topbar .meta span {
     padding: 4px 10px; border-radius: 999px;
-    background: #111820; border: 1px solid var(--border);
+    background: #1f1f1f; border: 1px solid var(--border);
     font-size: 11.5px;
   }
   .content { padding: 20px 28px 48px; }
@@ -563,38 +563,38 @@
     border-bottom: 1px solid var(--border);
   }
   td { border-bottom: 1px solid var(--border-soft); }
-  tbody tr:hover td { background: #171f2a; }
+  tbody tr:hover td { background: #262626; }
   tr:last-child td { border-bottom: none; }
-  code { color: #9fc7e8; }
+  code { color: #f1d6bf; }
 
   /* ---------- 表单与按钮 ---------- */
   button {
-    background: #18212c; border: 1px solid #2a3542; color: var(--text);
+    background: #232323; border: 1px solid #3a3a3a; color: var(--text);
     border-radius: 8px; padding: 6px 12px;
     transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
   }
-  button:hover { background: #1f2a37; border-color: #364454; }
-  button.primary { background: #2f7fc1; border-color: #2f7fc1; color: #fff; }
-  button.primary:hover { background: #3a8ed1; border-color: #3a8ed1; }
-  button.danger { background: #211417; border-color: #54282c; color: #f08a8a; }
-  button.danger:hover { background: #2c181c; border-color: #6a3438; }
+  button:hover { background: #2a2a2a; border-color: #4a4a4a; }
+  button.primary { background: #f1d6bf; border-color: #f1d6bf; color: #1a1a1a; font-weight: 600; }
+  button.primary:hover { background: #e8c9ae; border-color: #e8c9ae; }
+  button.danger { background: #2a1b1b; border-color: #5a2a2a; color: #ef7a7a; }
+  button.danger:hover { background: #332020; border-color: #6a3434; }
   button:disabled { opacity: 0.45; }
 
   input, select, textarea {
-    background: #0e151d; border: 1px solid #2a3542; color: var(--text);
+    background: #1f1f1f; border: 1px solid #3a3a3a; color: var(--text);
     border-radius: 8px;
   }
   input:focus, select:focus, textarea:focus {
     outline: none; border-color: var(--accent);
-    box-shadow: 0 0 0 3px rgba(74, 158, 218, 0.15);
+    box-shadow: 0 0 0 3px rgba(241, 214, 191, 0.18);
   }
-  select option { background: #111820; color: var(--text); }
-  ::placeholder { color: #5f6b7a; }
-  label { color: #93a1b1; }
-  .fieldset h3 { color: #93a1b1; letter-spacing: 0.04em; }
+  select option { background: #1f1f1f; color: var(--text); }
+  ::placeholder { color: #7a7a77; }
+  label { color: #a9a9a6; }
+  .fieldset h3 { color: #a9a9a6; letter-spacing: 0.04em; }
   form, .fieldset { border-bottom-color: var(--border); }
 
-  .filters select, .filters input { background: #0e151d; }
+  .filters select, .filters input { background: #1f1f1f; }
   input[type="checkbox"], input[type="radio"] { width: auto; }
   .toolbar select { width: auto; }
   .toolbar input:not([type="checkbox"]):not([type="radio"]) {
@@ -609,19 +609,19 @@
   }
 
   /* ---------- 标签与状态 ---------- */
-  .tag { background: var(--accent-soft); color: #7cc0f0; border-radius: 5px; }
+  .tag { background: var(--accent-soft); color: #f1d6bf; border-radius: 5px; }
   .tag.deny, .tag.block { background: rgba(240, 106, 106, 0.14); color: #f39a9a; }
   .tag.allow { background: rgba(61, 220, 151, 0.14); color: #6fe0b4; }
   .tag.log, .tag.observe { background: rgba(227, 179, 65, 0.14); color: #e8c06a; }
 
   .status.st-2 { background: rgba(61, 220, 151, 0.14); color: #6fe0b4; }
-  .status.st-3 { background: var(--accent-soft); color: #7cc0f0; }
+  .status.st-3 { background: var(--accent-soft); color: #f1d6bf; }
   .status.st-4 { background: rgba(227, 179, 65, 0.14); color: #e8c06a; }
   .status.st-5 { background: rgba(240, 106, 106, 0.14); color: #f39a9a; }
 
   .msg.error {
     background: rgba(240, 106, 106, 0.12);
-    border: 1px solid #4a2429; color: #f3a0a0;
+    border: 1px solid #4a2a2a; color: #f3a0a0;
   }
   .msg.ok {
     background: rgba(61, 220, 151, 0.12);
@@ -629,13 +629,13 @@
   }
 
   .logtable tbody tr:hover { background: transparent; }
-  .logtable tbody tr:hover td { background: #171f2a; }
-  .logtable .req { color: #b08ad0; }
-  .rawrow td { background: #0e151d; }
-  .rawrow pre { color: #a8b6c5; }
+  .logtable tbody tr:hover td { background: #262626; }
+  .logtable .req { color: #b8a4d0; }
+  .rawrow td { background: #1f1f1f; }
+  .rawrow pre { color: #b8b8b5; }
 
-  .trend .bar { background: #2b4a66; }
-  .catrow .track { background: #1a2430; }
+  .trend .bar { background: #6f6257; }
+  .catrow .track { background: #2a2a2a; }
 
   /* ---------- 统一页签 ---------- */
   .stats-wrap {
@@ -666,18 +666,88 @@
 
   /* ---------- KPI / 图表 ---------- */
   .kpi {
-    background: linear-gradient(160deg, #171f2a 0%, #111820 100%);
+    background: linear-gradient(160deg, #262626 0%, #1f1f1f 100%);
     border: 1px solid var(--border); border-radius: var(--radius);
     transition: border-color 0.15s ease;
   }
-  .kpi:hover { border-color: #31404f; }
+  .kpi:hover { border-color: #4a4a4a; }
   .kpi .kpi-label, .kpi .kpi-sub { color: var(--muted); }
 
   .chart-legend, .legend, .rank-h { color: var(--muted); }
   .pager { border-top: 1px solid var(--border); }
 
-  #attack-events, #events, #apps { overflow-x: auto; }
-  #attack-events table, #events table, #apps table { min-width: 680px; }
+  #attack-events, #events { overflow-x: auto; }
+  #attack-events table, #events table { min-width: 680px; }
+
+  /* ---------- 防护应用：卡片列表（对齐雷池 /sites） ---------- */
+  .app-grid {
+    display: grid; gap: 14px;
+    grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
+  }
+  .app-card {
+    display: flex; flex-direction: column; min-width: 0;
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: var(--radius); overflow: hidden;
+  }
+  .app-card.disabled { opacity: 0.6; }
+  .app-card-head {
+    display: flex; align-items: flex-start; justify-content: space-between;
+    gap: 10px; padding: 14px 16px 10px;
+  }
+  .app-name { font-size: 15px; font-weight: 600; color: #f0e9e2; line-height: 1.3; }
+  .app-name .app-id {
+    margin-left: 8px; font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 11px; font-weight: 400; color: var(--muted);
+  }
+  .app-sub { margin-top: 3px; font-size: 11.5px; color: var(--muted); }
+  .app-cols {
+    display: grid; grid-template-columns: 1fr 1fr;
+    gap: 8px 14px; padding: 0 16px 12px;
+  }
+  .app-cols .app-col { min-width: 0; }
+  .app-cols .app-col > span { display: block; font-size: 11px; color: var(--muted); }
+  .app-cols .app-col > b {
+    display: block; margin-top: 1px; font-size: 12.5px; font-weight: 500;
+    color: var(--text); word-break: break-all;
+  }
+  .app-cols .app-col code { color: var(--accent); }
+  .app-card-foot {
+    display: flex; align-items: center; flex-wrap: wrap; gap: 6px;
+    margin-top: auto; padding: 9px 16px;
+    border-top: 1px solid var(--border-soft);
+    background: rgba(255, 255, 255, 0.012);
+  }
+  .chip {
+    font-size: 11.5px; line-height: 1.6; padding: 2px 9px;
+    border-radius: 4px; border: 1px solid var(--border);
+    background: #1f1f1f; color: var(--muted);
+  }
+  .chip:hover { border-color: #4a4a4a; color: var(--text); }
+  .chip.on {
+    background: var(--accent-soft); border-color: rgba(241, 214, 191, 0.34);
+    color: var(--accent);
+  }
+  .chip.off { background: #1b1b1b; color: #75757a; }
+  .chip.muted { cursor: default; opacity: 0.55; }
+  .chip.muted:hover { border-color: var(--border); color: var(--muted); }
+  .app-card-actions { display: flex; align-items: center; gap: 6px; margin-left: auto; }
+  .app-card-actions button { font-size: 11.5px; padding: 3px 9px; }
+  .app-detail-actions {
+    display: flex; align-items: center; flex-wrap: wrap; gap: 6px;
+    padding: 10px 16px; border-bottom: 1px solid var(--border);
+    background: rgba(255, 255, 255, 0.012);
+  }
+  .app-metrics {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+    gap: 1px; background: var(--border);
+    border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden;
+  }
+  .app-metrics > div { background: var(--card-2); padding: 10px 12px; }
+  .app-metrics span { font-size: 11px; color: var(--muted); }
+  .app-metrics b { display: block; margin-top: 2px; font-size: 18px; font-variant-numeric: tabular-nums; }
+  @media (max-width: 760px) {
+    .app-grid { grid-template-columns: 1fr; }
+  }
 </style>
 </head>
 <body>
@@ -846,16 +916,12 @@
       <!-- ========== 防护应用 ========== -->
       <div class="page" data-page="apps">
         <div id="apps-list-view">
-          <section class="card">
-            <header>
-              <h2>防护应用</h2>
-              <div class="filters">
-                <input id="apps-q" placeholder="搜索应用 / 域名 / 上游" onkeydown="if(event.key==='Enter')loadApps()">
-                <button class="primary" onclick="openAppEditor(null)">+ 新建应用</button>
-              </div>
-            </header>
-            <div id="apps"></div>
-          </section>
+          <div class="toolbar">
+            <input id="apps-q" placeholder="支持搜索应用名、端口、域名" onkeydown="if(event.key==='Enter')loadApps()">
+            <button onclick="gotoPage('system');switchSystemTab('protect')">高级配置</button>
+            <button class="primary" onclick="openAppEditor(null)">添加应用</button>
+          </div>
+          <div id="apps" class="app-grid"></div>
         </div>
 
         <div id="apps-detail-view" style="display:none">
@@ -867,6 +933,7 @@
                 <button class="primary" id="app-detail-save" onclick="saveAppDetail()">保存</button>
               </div>
             </header>
+            <div id="app-detail-actions" class="app-detail-actions"></div>
             <div class="sys-tabs" id="app-tabs">
               <a data-apptab="basicInfo" class="active">基本信息</a>
               <a data-apptab="forwardingRule">转发规则</a>
@@ -1108,13 +1175,58 @@
       <!-- ========== 系统设置 ========== -->
       <div class="page" data-page="system">
         <div class="sys-tabs" id="system-tabs">
-          <a data-systemtab="basic" class="active">基本设置</a>
-          <a data-systemtab="engine">防护引擎</a>
-          <a data-systemtab="rules">规则管理</a>
-          <a data-systemtab="maintenance">数据维护</a>
+          <a data-systemtab="protect" class="active">防护配置</a>
+          <a data-systemtab="console">控制台管理</a>
+          <a data-systemtab="logs">系统日志</a>
         </div>
 
-        <div class="sys-panel active" data-systemtab="basic">
+        <div class="sys-panel active" data-systemtab="protect">
+          <section class="card">
+            <header>
+              <h2>检测引擎性能配置</h2>
+              <button class="primary" id="save-settings" onclick="saveSettings()">保存设置</button>
+            </header>
+            <div id="settings"></div>
+          </section>
+          <section class="card">
+            <header>
+              <h2>自定义规则</h2>
+              <div class="filters">
+                <button onclick="loadCustomRules()">刷新</button>
+                <button onclick="exportCustomRules()">导出（雷池格式）</button>
+                <button class="primary" onclick="document.getElementById('rules-file').click()">导入 JSON</button>
+                <input type="file" id="rules-file" accept=".json,application/json" style="display:none" onchange="readRulesFile(this)">
+              </div>
+            </header>
+            <div class="hint" style="padding:10px 16px;border-bottom:1px solid var(--border)">
+              兼容雷池（长亭）自定义规则：pattern 外层 OR、内层 AND，action 0 为白名单、1 为黑名单。
+              支持裸数组、<code>{"rules": [...]}</code> 与 <code>{"data": [...]}</code> 三种导入格式。
+            </div>
+            <div id="custom-rules"></div>
+          </section>
+          <section class="card">
+            <header><h2>配置备份与数据清理</h2></header>
+            <div class="fieldset">
+              <div class="wide hint">导出应用、全部全局设置、访问控制规则与自定义规则，可用于迁移到另一台设备。</div>
+              <div><button class="primary" onclick="downloadBackup()">下载配置备份</button></div>
+              <div><label for="sys-prune-days">事件保留天数</label>
+                <input type="number" id="sys-prune-days" min="1" max="3650" value="30"></div>
+              <div><button class="danger" onclick="pruneEvents()">清理过期事件</button></div>
+              <div class="wide hint">只删除事件表，不影响应用、规则与封禁记录。清理后统计报表的历史数据会同步减少。</div>
+            </div>
+          </section>
+          <section class="card">
+            <header><h2>关联配置</h2></header>
+            <div class="fieldset">
+              <div><button onclick="gotoPage('rules')">访问控制</button></div>
+              <div><button onclick="gotoPage('whitelist')">检测白名单</button></div>
+              <div><button onclick="gotoPage('feeds')">IP 组订阅</button></div>
+              <div><button onclick="gotoPage('rule-feeds')">规则订阅</button></div>
+            </div>
+          </section>
+        </div>
+
+        <div class="sys-panel" data-systemtab="console">
           <section class="card">
             <header>
               <h2>系统信息</h2>
@@ -1135,50 +1247,13 @@
           </section>
         </div>
 
-        <div class="sys-panel" data-systemtab="engine">
+        <div class="sys-panel" data-systemtab="logs">
           <section class="card">
-            <header>
-              <h2>防护引擎</h2>
-              <button class="primary" id="save-settings" onclick="saveSettings()">保存设置</button>
-            </header>
-            <div id="settings"></div>
-          </section>
-        </div>
-
-        <div class="sys-panel" data-systemtab="rules">
-          <section class="card">
-            <header>
-              <h2>自定义规则</h2>
-              <div class="filters">
-                <button onclick="loadCustomRules()">刷新</button>
-                <button onclick="exportCustomRules()">导出（雷池格式）</button>
-                <button class="primary" onclick="document.getElementById('rules-file').click()">导入 JSON</button>
-                <input type="file" id="rules-file" accept=".json,application/json" style="display:none" onchange="readRulesFile(this)">
-              </div>
-            </header>
-            <div class="hint" style="padding:10px 16px;border-bottom:1px solid var(--border)">
-              兼容雷池（长亭）自定义规则：pattern 外层 OR、内层 AND，action 0 为白名单、1 为黑名单。
-              支持裸数组、<code>{"rules": [...]}</code> 与 <code>{"data": [...]}</code> 三种导入格式。
-            </div>
-            <div id="custom-rules"></div>
-          </section>
-        </div>
-
-        <div class="sys-panel" data-systemtab="maintenance">
-          <section class="card">
-            <header><h2>配置备份</h2></header>
+            <header><h2>系统日志</h2></header>
             <div class="fieldset">
-              <div class="wide hint">导出应用、全部全局设置、访问控制规则与自定义规则，可用于迁移到另一台设备。</div>
-              <div><button class="primary" onclick="downloadBackup()">下载配置备份</button></div>
-            </div>
-          </section>
-          <section class="card">
-            <header><h2>事件清理</h2></header>
-            <div class="fieldset">
-              <div><label for="sys-prune-days">保留最近多少天的事件</label>
-                <input type="number" id="sys-prune-days" min="1" max="3650" value="30"></div>
-              <div><button class="danger" onclick="pruneEvents()">清理过期事件</button></div>
-              <div class="wide hint">只删除事件表，不影响应用、规则与封禁记录。清理后统计报表的历史数据会同步减少。</div>
+              <div class="wide hint">系统日志按访问日志、上游日志与事件记录分别保存，可在「日志」与「事件」页面查看完整内容。</div>
+              <div><button class="primary" onclick="gotoPage('logs')">查看访问 / 上游日志</button></div>
+              <div><button onclick="gotoPage('events')">查看事件记录</button></div>
             </div>
           </section>
         </div>
@@ -1278,12 +1353,10 @@ const PAGE_TITLES = {
 
 let currentPage = 'statistics';
 
-document.getElementById('nav').addEventListener('click', (e) => {
-  const link = e.target.closest('a[data-page]');
+function gotoPage(page) {
+  const link = document.querySelector(`#nav a[data-page="${page}"]`);
   if (!link) return;
-  const page = link.dataset.page;
   currentPage = page;
-
   document.querySelectorAll('.nav a').forEach(a => a.classList.toggle('active', a === link));
   document.querySelectorAll('.page').forEach(p => p.classList.toggle('active', p.dataset.page === page));
   document.getElementById('page-title').textContent = PAGE_TITLES[page] || page;
@@ -1293,6 +1366,12 @@ document.getElementById('nav').addEventListener('click', (e) => {
      'rule-feeds': loadRuleFeeds,
      bans: loadBans, events: loadEvents, logs: loadLogs, system: loadSystemPage,
      statistics: loadStatistics }[page] || (() => {}))();
+}
+
+document.getElementById('nav').addEventListener('click', (e) => {
+  const link = e.target.closest('a[data-page]');
+  if (!link) return;
+  gotoPage(link.dataset.page);
 });
 
 // ============================================================
@@ -2010,34 +2089,88 @@ function targetSummary(a) {
   return (a.upstreams || []).map(u => `<code>${esc(u.port ? `${u.addr}:${u.port}` : u.addr)}</code>`).join('<br>') || '—';
 }
 
+const appObserve = (a) => a?.policy?.observe_mode?.enabled === true;
+const appFeatures = (a) => ({ attack: true, cc: true, bot: false, auth: false, ...(a?.features || {}) });
+
+function appCard(a) {
+  const domains = [a.domains?.primary, ...(a.domains?.aliases || [])].filter(Boolean);
+  const ports = (a.listen_ports || []).join(' / ') || '任意';
+  const f = appFeatures(a);
+  const observing = appObserve(a);
+  const idArg = `'${String(a.id).replace(/\\/g, '\\\\').replace(/'/g, "\\'")}'`;
+  return `<article class="app-card ${a.enabled ? '' : 'disabled'}">
+    <div class="app-card-head">
+      <div>
+        <div class="app-name">${esc(a.name || a.id)}<span class="app-id">#${esc(a.id)}</span></div>
+        <div class="app-sub">${accessModeLabel(a.access_mode)}${a.group ? ' · ' + esc(a.group) : ''}</div>
+      </div>
+      <span class="tag ${a.enabled ? 'allow' : 'deny'}">${a.enabled ? '启用' : '禁用'}</span>
+    </div>
+    <div class="app-cols">
+      <div class="app-col"><span>域名</span><b>${domains.map(esc).join('<br>') || '—'}</b></div>
+      <div class="app-col"><span>监听端口</span><b>${esc(ports)}</b></div>
+      <div class="app-col"><span>上游 / 目标</span><b>${targetSummary(a)}</b></div>
+      <div class="app-col"><span>应用路由</span><b>${a.routes?.length || 0} 条</b></div>
+    </div>
+    <div class="app-card-foot">
+      <button class="chip ${a.enabled ? (observing ? 'off' : 'on') : 'off'}" onclick="toggleObserve(${idArg})" title="切换防护 / 观察模式">${a.enabled ? (observing ? '观察模式' : '防护模式') : '已禁用'}</button>
+      <button class="chip ${f.attack ? 'on' : 'off'}" onclick="toggleFeature(${idArg}, 'attack')">攻击防护 ${f.attack ? '开' : '关'}</button>
+      <button class="chip ${f.cc ? 'on' : 'off'}" onclick="toggleFeature(${idArg}, 'cc')">CC 防护 ${f.cc ? '开' : '关'}</button>
+      <button class="chip muted" disabled title="BOT 防护依赖指纹库，当前版本未启用">BOT 防护</button>
+      <span class="app-card-actions">
+        <button onclick="openAppDetail(${idArg})">详情</button>
+        <button onclick="toggleApp(${idArg}, ${a.enabled ? 'false' : 'true'})">${a.enabled ? '禁用' : '启用'}</button>
+        <button class="danger" onclick="deleteApp(${idArg})">删除</button>
+      </span>
+    </div>
+  </article>`;
+}
+
 async function loadApps() {
   const el = document.getElementById('apps');
+  if (!el) return;
   const q = (document.getElementById('apps-q')?.value || '').trim().toLowerCase();
   try {
     let apps = await api('/apps');
     if (q) {
-      apps = apps.filter(a => [a.id, a.name, a.description, a.group, a.domains.primary,
-        ...(a.domains.aliases || []), ...(a.upstreams || []).map(u => u.addr)]
-        .join(' ').toLowerCase().includes(q));
+      apps = apps.filter(a => [a.id, a.name, a.description, a.group, a.domains?.primary,
+        ...(a.domains?.aliases || []), ...(a.listen_ports || []),
+        ...(a.upstreams || []).map(u => u.addr)]
+        .filter(Boolean).join(' ').toLowerCase().includes(q));
     }
     appsCache = apps;
-    if (!apps.length) { el.innerHTML = '<div class="empty">还没有应用，点右上角新建</div>'; return; }
-    el.innerHTML = `<table>
-      <thead><tr><th>应用</th><th>域名</th><th>接入方式</th><th>上游 / 目标</th><th>状态</th><th>路由</th><th></th></tr></thead>
-      <tbody>${apps.map(a => `<tr>
-        <td><code>${esc(a.id)}</code>${a.group ? `<br><span class="sub" style="margin:0">${esc(a.group)}</span>` : ''}</td>
-        <td>${esc(a.domains.primary)}${a.domains.aliases?.length ? `<br><span class="sub" style="margin:0">+${a.domains.aliases.length} 别名</span>` : ''}</td>
-        <td><span class="tag log">${accessModeLabel(a.access_mode)}</span></td>
-        <td>${targetSummary(a)}</td>
-        <td>${a.enabled ? '<span class="tag allow">启用</span>' : '<span class="tag deny">禁用</span>'}</td>
-        <td>${a.routes?.length || 0}</td>
-        <td style="white-space:nowrap">
-          <button onclick="openAppDetail('${esc(a.id)}')">详情</button>
-          <button onclick="toggleApp('${esc(a.id)}', ${a.enabled ? 'false' : 'true'})">${a.enabled ? '禁用' : '启用'}</button>
-          <button class="danger" onclick="deleteApp('${esc(a.id)}')">删除</button>
-        </td>
-      </tr>`).join('')}</tbody></table>`;
+    el.innerHTML = apps.length
+      ? `<div class="app-grid">${apps.map(appCard).join('')}</div>`
+      : '<div class="empty">还没有应用，点右上角添加应用</div>';
   } catch (e) { el.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`; }
+}
+
+async function toggleFeature(id, key) {
+  const app = appsCache.find(a => a.id === id);
+  if (!app) return;
+  const features = appFeatures(app);
+  features[key] = !features[key];
+  try {
+    await api(`/apps/${encodeURIComponent(id)}/features`, {
+      method: 'POST', body: JSON.stringify(features),
+    });
+    showMsg(`${id} 已${features[key] ? '开启' : '关闭'}${key === 'attack' ? '攻击防护' : ' CC 防护'}`);
+    loadApps(); loadStatistics();
+  } catch (e) { showMsg('操作失败：' + e.message, 'error'); }
+}
+
+async function toggleObserve(id) {
+  const app = appsCache.find(a => a.id === id);
+  if (!app) return;
+  if (!app.enabled) return showMsg('请先启用应用', 'error');
+  const body = JSON.parse(JSON.stringify(app));
+  body.policy = body.policy || {};
+  body.policy.observe_mode = { enabled: !appObserve(app) };
+  try {
+    await api('/apps', { method: 'POST', body: JSON.stringify(body) });
+    showMsg(`${id} 已切换为${body.policy.observe_mode.enabled ? '观察' : '防护'}模式`);
+    loadApps(); loadStatistics();
+  } catch (e) { showMsg('保存失败：' + e.message, 'error'); }
 }
 
 async function toggleApp(id, enabled) {
@@ -2057,6 +2190,7 @@ function blankApp() {
     timeouts: { connect: '5s', read: '60s', write: '60s', idle: '75s', request: null },
     health_check: {}, retry: { enabled: false, attempts: 2 },
     headers: {}, websocket: false, expires_at: null,
+    features: { attack: true, cc: true, bot: false, auth: false },
     access_mode: 'proxy',
     static_site: { root: '', index: 'index.html', spa_fallback: false },
     redirect: { target: '', status: 302 },
@@ -2071,6 +2205,62 @@ function showAppDetailView() {
   document.getElementById('app-detail-save').textContent = appDetailNew ? '创建' : '保存';
   document.querySelectorAll('#app-tabs a').forEach(a => a.classList.toggle('active', a.dataset.apptab === appDetailTab));
   renderAppDetail();
+  renderAppDetailActions();
+}
+
+function renderAppDetailActions() {
+  const el = document.getElementById('app-detail-actions');
+  if (!el) return;
+  const a = currentApp;
+  if (!a || appDetailNew) {
+    el.innerHTML = '<span class="app-sub" style="margin:0">保存后可在列表使用快捷开关</span>';
+    return;
+  }
+  const f = appFeatures(a);
+  const observing = appObserve(a);
+  el.innerHTML = `
+    <span class="app-sub" style="margin:0 6px 0 0">防护模式</span>
+    <button class="chip ${a.enabled ? (observing ? 'off' : 'on') : 'off'}" onclick="detailToggleObserve()">${a.enabled ? (observing ? '观察' : '防护') : '已禁用'}</button>
+    <button class="chip ${f.attack ? 'on' : 'off'}" onclick="detailToggleFeature('attack')">攻击防护 ${f.attack ? '开' : '关'}</button>
+    <button class="chip ${f.cc ? 'on' : 'off'}" onclick="detailToggleFeature('cc')">CC 防护 ${f.cc ? '开' : '关'}</button>
+    <button class="chip muted" disabled title="依赖指纹库，当前版本未启用">BOT 防护</button>
+    <button class="chip muted" disabled title="当前版本未启用">身份认证</button>
+    <span class="app-card-actions">
+      <button onclick="detailToggleEnabled()">${a.enabled ? '禁用应用' : '启用应用'}</button>
+    </span>`;
+}
+
+async function detailToggleFeature(key) {
+  if (!currentApp || appDetailNew) return;
+  const features = appFeatures(currentApp);
+  features[key] = !features[key];
+  try {
+    await api(`/apps/${encodeURIComponent(currentApp.id)}/features`, {
+      method: 'POST', body: JSON.stringify(features),
+    });
+    currentApp.features = features;
+    renderAppDetailActions(); loadApps(); loadStatistics();
+    showMsg(`${key === 'attack' ? '攻击防护' : 'CC 防护'}已${features[key] ? '开启' : '关闭'}`);
+  } catch (e) { showMsg('操作失败：' + e.message, 'error'); }
+}
+
+async function detailToggleObserve() {
+  if (!currentApp || appDetailNew) return;
+  collectAppDetail();
+  currentApp.policy = currentApp.policy || {};
+  currentApp.policy.observe_mode = { enabled: !appObserve(currentApp) };
+  try {
+    await api('/apps', { method: 'POST', body: JSON.stringify(currentApp) });
+    renderAppDetailActions(); loadApps(); loadStatistics();
+    showMsg(`已切换为${appObserve(currentApp) ? '观察' : '防护'}模式`);
+  } catch (e) { showMsg('保存失败：' + e.message, 'error'); }
+}
+
+async function detailToggleEnabled() {
+  if (!currentApp || appDetailNew) return;
+  const id = currentApp.id;
+  await toggleApp(id, !currentApp.enabled);
+  openAppDetail(id);
 }
 
 async function openAppDetail(id) {
@@ -2131,7 +2321,15 @@ function renderAppDetail() {
         <option value="static" ${a.access_mode === 'static' ? 'selected' : ''}>静态站点</option>
         <option value="redirect" ${a.access_mode === 'redirect' ? 'selected' : ''}>重定向</option></select></div>
       <div class="wide"><label>运行状态</label><div>${health}</div></div>
-      <div class="wide hint">${appDetailStats ? `最近 24 小时：请求 ${appDetailStats.requests} · 拦截 ${appDetailStats.blocked} · 攻击 IP ${appDetailStats.attack_ips}` : '保存后可在列表查看状态'}</div>
+      <div class="wide"><label>最近 24 小时</label>
+        <div class="app-metrics">
+          <div><span>请求</span><b>${fmtNum(appDetailStats?.requests || 0)}</b></div>
+          <div><span>拦截</span><b>${fmtNum(appDetailStats?.blocked || 0)}</b></div>
+          <div><span>攻击 IP</span><b>${fmtNum(appDetailStats?.attack_ips || 0)}</b></div>
+          <div><span>独立 IP</span><b>${fmtNum(appDetailStats?.unique_ips || 0)}</b></div>
+        </div>
+      </div>
+      <div class="wide hint">${appDetailStats ? '' : '保存后可在列表查看运行状态'}</div>
     </div>`;
     return;
   }
@@ -3209,7 +3407,7 @@ async function banAttackIp(ip) {
 // ============================================================
 // 系统设置
 // ============================================================
-const SYSTEM = { tab: 'basic', info: null };
+const SYSTEM = { tab: 'protect', info: null };
 
 function loadSystemPage() {
   const tabs = document.getElementById('system-tabs');
@@ -3221,7 +3419,7 @@ function loadSystemPage() {
       switchSystemTab(a.dataset.systemtab);
     });
   }
-  switchSystemTab(SYSTEM.tab || 'basic');
+  switchSystemTab(SYSTEM.tab || 'protect');
 }
 
 function switchSystemTab(tab) {
@@ -3230,9 +3428,8 @@ function switchSystemTab(tab) {
     a.classList.toggle('active', a.dataset.systemtab === tab));
   document.querySelectorAll('.sys-panel').forEach(p =>
     p.classList.toggle('active', p.dataset.systemtab === tab));
-  if (tab === 'basic') loadSystemInfo();
-  else if (tab === 'engine') loadSettings();
-  else if (tab === 'rules') loadCustomRules();
+  if (tab === 'protect') { loadSettings(); loadCustomRules(); }
+  else if (tab === 'console') loadSystemInfo();
 }
 
 const sysField = (label, value) => `<div>

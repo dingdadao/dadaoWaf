@@ -1086,6 +1086,7 @@ mod tests {
             access_mode: Default::default(),
             static_site: Default::default(),
             redirect: Default::default(),
+            features: Default::default(),
         }
     }
 

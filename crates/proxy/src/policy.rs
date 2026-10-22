@@ -73,22 +73,28 @@ impl PolicySet {
 
         for app in apps {
             let app_layer = [&app.policy];
-            app_policies.push(resolve(
-                global_protection,
-                limits,
-                None,
-                &app_layer,
-                global_ratelimit,
+            app_policies.push(apply_features(
+                resolve(
+                    global_protection,
+                    limits,
+                    None,
+                    &app_layer,
+                    global_ratelimit,
+                ),
+                &app.features,
             ));
 
             let mut routes = Vec::with_capacity(app.routes.len());
             for route in &app.routes {
-                routes.push(resolve(
-                    global_protection,
-                    limits,
-                    Some(route),
-                    &app_layer,
-                    global_ratelimit,
+                routes.push(apply_features(
+                    resolve(
+                        global_protection,
+                        limits,
+                        Some(route),
+                        &app_layer,
+                        global_ratelimit,
+                    ),
+                    &app.features,
                 ));
             }
             route_policies.push(routes);
@@ -129,6 +135,23 @@ impl PolicySet {
     pub fn is_empty(&self) -> bool {
         self.apps.is_empty()
     }
+}
+
+/// 应用级快捷开关：关闭攻击防护即关闭全部检测分类，
+/// 关闭 CC 防护即忽略限流。只有显式关闭才生效。
+fn apply_features(
+    mut policy: EffectivePolicy,
+    features: &homewaf_config::AppFeatures,
+) -> EffectivePolicy {
+    if !features.attack {
+        for category in Category::ALL {
+            policy.scan.set(category, CategoryMode::Off);
+        }
+    }
+    if !features.cc {
+        policy.cc_mode = CategoryMode::Off;
+    }
+    policy
 }
 
 fn resolve(
@@ -348,6 +371,7 @@ mod tests {
             access_mode: Default::default(),
             static_site: Default::default(),
             redirect: Default::default(),
+            features: Default::default(),
         }
     }
 

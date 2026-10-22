@@ -87,6 +87,7 @@ pub fn router(state: Ctx) -> Router {
         .route("/api/apps", get(list_apps).post(upsert_app))
         .route("/api/apps/{id}", get(get_app).delete(delete_app))
         .route("/api/apps/{id}/enabled", post(set_app_enabled))
+        .route("/api/apps/{id}/features", post(set_app_features))
         .route("/api/rules", get(list_rules).post(upsert_rule))
         .route("/api/rules/{id}", delete(delete_rule))
         .route("/api/bans", get(list_bans).post(create_ban))
@@ -1256,6 +1257,45 @@ async fn set_app_enabled(
     }
     match reload_state(&ctx) {
         Ok(()) => Json(serde_json::json!({"ok": true, "enabled": app.enabled})).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            format!("已写入数据库，但重载失败：{e}"),
+        )
+            .into_response(),
+    }
+}
+
+/// 应用级快捷开关（攻击防护 / CC 防护）。列表卡片直接调这个接口切换，
+/// 不必整份应用配置回传。
+async fn set_app_features(
+    State(ctx): State<Ctx>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(features): Json<homewaf_config::AppFeatures>,
+) -> Response {
+    if !authorized(&ctx, &headers) {
+        return unauthorized();
+    }
+    let mut app: Application = match ctx
+        .store
+        .list_applications::<Application>()
+        .map(|apps| apps.into_iter().find(|a| a.id == id))
+    {
+        Ok(Some(app)) => app,
+        Ok(None) => return (StatusCode::NOT_FOUND, "应用不存在").into_response(),
+        Err(e) => return internal(e).into_response(),
+    };
+    app.features = features;
+
+    let now = homewaf_acl::now_unix();
+    if let Err(e) =
+        ctx.store
+            .upsert_application(&app.id, &app.domains.primary, app.enabled, &app, now)
+    {
+        return internal(e).into_response();
+    }
+    match reload_state(&ctx) {
+        Ok(()) => Json(serde_json::json!({"ok": true, "features": app.features})).into_response(),
         Err(e) => (
             StatusCode::BAD_REQUEST,
             format!("已写入数据库，但重载失败：{e}"),
@@ -2998,6 +3038,7 @@ mod tests {
             access_mode: Default::default(),
             static_site: Default::default(),
             redirect: Default::default(),
+            features: Default::default(),
         }
     }
 
