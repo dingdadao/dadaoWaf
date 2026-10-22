@@ -159,8 +159,10 @@
 - **规则求值**：`crates/proxy/src/custom_rule.rs` 支持 `src_ip`（CIDR）、`website`、`host`、`path`、`url`、
   `query`、`method`、`user_agent`、`content_type`、`cookie`、`header`（`sub_k`）等条件键，算子覆盖
   eq/ne/contain/prefix/suffix/regex；白名单命中放行并跳过检测、限流与自动封禁，黑名单命中直接 403 并记事件。
-- **验证**：workspace 测试全绿，clippy 零警告；导入雷池格式规则后热重载成功，`User-Agent: sqlmap` 请求被 403
-  拦截并记录「自定义黑名单」事件，清空规则后恢复正常；浏览器逐页验证三页签无 JS 报错。
+- **验证**：workspace 全量测试通过，clippy 零警告；导入雷池格式规则后热重载成功，`User-Agent: sqlmap` 请求被 403
+  拦截并记录「自定义黑名单」事件，清空规则后恢复正常；浏览器逐页验证防护应用（列表与详情四页签切换）、
+  攻击防护（KPI/趋势/分布/事件表与范围切换）、系统设置（基本设置/规则管理/防护引擎页签）均正常，console 无报错。
+- **提交**：`66c0dc5` 已推送 `origin/master`。
 
 ---
 
