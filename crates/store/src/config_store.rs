@@ -44,6 +44,22 @@ pub struct WhitelistRow {
     pub note: Option<String>,
 }
 
+/// 一张 TLS 证书。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CertificateRow {
+    pub id: i64,
+    pub name: String,
+    pub cert_pem: String,
+    pub key_pem: String,
+    /// 逗号分隔的域名（含 SAN 与 CN）
+    pub domains: String,
+    pub not_before: i64,
+    pub not_after: i64,
+    pub is_default: bool,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
 impl super::Store {
     // ============================================================
     // 应用
@@ -442,6 +458,126 @@ impl super::Store {
                 |r| r.get(0),
             )?;
             Ok(n as usize)
+        })
+    }
+
+    // ============================================================
+    // TLS 证书
+    // ============================================================
+
+    fn cert_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CertificateRow> {
+        Ok(CertificateRow {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            cert_pem: row.get(2)?,
+            key_pem: row.get(3)?,
+            domains: row.get(4)?,
+            not_before: row.get(5)?,
+            not_after: row.get(6)?,
+            is_default: row.get::<_, i64>(7)? != 0,
+            created_at: row.get(8)?,
+            updated_at: row.get(9)?,
+        })
+    }
+
+    const CERT_COLS: &str =
+        "id, name, cert_pem, key_pem, domains, not_before, not_after, is_default, created_at, updated_at";
+
+    pub fn list_certificates(&self) -> Result<Vec<CertificateRow>, StoreError> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {} FROM certificates ORDER BY id",
+                Self::CERT_COLS
+            ))?;
+            let rows = stmt.query_map([], Self::cert_from_row)?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        })
+    }
+
+    pub fn get_certificate(&self, id: i64) -> Result<Option<CertificateRow>, StoreError> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {} FROM certificates WHERE id = ?1",
+                Self::CERT_COLS
+            ))?;
+            let mut rows = stmt.query_map(params![id], Self::cert_from_row)?;
+            match rows.next() {
+                Some(r) => Ok(Some(r?)),
+                None => Ok(None),
+            }
+        })
+    }
+
+    /// 新增证书，返回自增 id。
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_certificate(
+        &self,
+        name: &str,
+        cert_pem: &str,
+        key_pem: &str,
+        domains: &str,
+        not_before: i64,
+        not_after: i64,
+        now: i64,
+    ) -> Result<i64, StoreError> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO certificates
+                 (name, cert_pem, key_pem, domains, not_before, not_after, is_default, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?7)",
+                params![name, cert_pem, key_pem, domains, not_before, not_after, now],
+            )?;
+            Ok(conn.last_insert_rowid())
+        })
+    }
+
+    /// 覆盖已有证书。`id` 不存在时返回 `false`。
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_certificate(
+        &self,
+        id: i64,
+        name: &str,
+        cert_pem: &str,
+        key_pem: &str,
+        domains: &str,
+        not_before: i64,
+        not_after: i64,
+        now: i64,
+    ) -> Result<bool, StoreError> {
+        self.with_conn(|conn| {
+            let n = conn.execute(
+                "UPDATE certificates
+                 SET name = ?2, cert_pem = ?3, key_pem = ?4, domains = ?5,
+                     not_before = ?6, not_after = ?7, updated_at = ?8
+                 WHERE id = ?1",
+                params![id, name, cert_pem, key_pem, domains, not_before, not_after, now],
+            )?;
+            Ok(n > 0)
+        })
+    }
+
+    pub fn delete_certificate(&self, id: i64) -> Result<bool, StoreError> {
+        self.with_conn(|conn| {
+            let n = conn.execute("DELETE FROM certificates WHERE id = ?1", params![id])?;
+            Ok(n > 0)
+        })
+    }
+
+    /// 把指定证书设为默认证书（其它证书取消默认）。
+    pub fn set_default_certificate(&self, id: i64) -> Result<bool, StoreError> {
+        self.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute("UPDATE certificates SET is_default = 0", [])?;
+            let n = tx.execute(
+                "UPDATE certificates SET is_default = 1 WHERE id = ?1",
+                params![id],
+            )?;
+            tx.commit()?;
+            Ok(n > 0)
         })
     }
 }

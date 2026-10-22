@@ -25,3 +25,7 @@ maxminddb = "0.32.0"
 # 默认地理信息库下载（jsDelivr 提供 .gz，需要本地解压）
 ureq = "3"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+# 证书域名 / 有效期解析
+x509-parser = "0.16"
+# 远程部署 API Token 的安全随机数
+ring = "0.17"

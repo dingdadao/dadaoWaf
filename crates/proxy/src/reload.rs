@@ -88,6 +88,8 @@ pub struct RuntimeState {
     pub server: homewaf_config::ServerConfig,
     /// 仅用于日志展示；TLS 监听器在启动时绑定，证书变更需要重启
     pub tls: TlsConfig,
+    /// 多证书 SNI 索引。热重载时重建，握手阶段按 SNI 实时读取
+    pub tls_certs: crate::tls::CertMap,
     /// 订阅加载失败的组，用于状态展示
     pub feed_failures: Vec<(String, String)>,
     /// 规则包订阅状态，用于控制台展示
@@ -131,6 +133,8 @@ impl RuntimeState {
             config.ratelimit,
             &config.limits,
         );
+        // 文件模式没有证书库，只可能有全局单证书
+        let tls_certs = crate::tls::build_cert_map(&[], &config.applications, &config.tls)?;
         let router =
             Router::build(config.applications, allow_regex).map_err(|e| e.to_string())?;
 
@@ -155,6 +159,7 @@ impl RuntimeState {
             ipv6_prefix: config.acl.ipv6_prefix_match,
             server: config.server,
             tls: config.tls,
+            tls_certs,
             feed_failures,
             rule_feeds: rule_feeds.statuses,
             custom_rules: config.custom_rules,
@@ -202,6 +207,8 @@ pub fn load_state_from_db_with(
         .list_applications::<homewaf_config::Application>()
         .map_err(|e| format!("读取应用失败：{e}"))?;
     let app_ids: Vec<String> = applications.iter().map(|a| a.id.clone()).collect();
+    // 证书映射需要在 applications 移进 Router 之前拿到应用列表
+    let tls_applications = applications.clone();
 
     let mut config = Config {
         applications,
@@ -307,6 +314,13 @@ pub fn load_state_from_db_with(
             note: w.note,
         })
         .collect();
+
+    // 证书库。证书解析失败要让重载失败，避免带着旧证书静默运行
+    let cert_rows = store
+        .list_certificates()
+        .map_err(|e| format!("读取证书失败：{e}"))?;
+    state.tls_certs =
+        crate::tls::build_cert_map(&cert_rows, &tls_applications, &state.tls)?;
 
     // 网页防篡改基线。按应用 id 归组后，按 Router 顺序对齐成 Vec。
     let mut by_app: std::collections::HashMap<String, Vec<(String, u64, String)>> =

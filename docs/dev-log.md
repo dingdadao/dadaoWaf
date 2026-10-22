@@ -231,6 +231,29 @@
 - 验证：实测下载返回 `{"ok":true,"path":"/tmp/GeoLite2-City.mmdb","enabled":true}`，文件 49MB，
   `/api/settings/geoip_db` 已写入新路径；全量测试与 clippy 均通过。
 
+### 23:10 — 证书管理 / 多证书 SNI / 远程部署 API
+
+- 新增 `certificates` 表（名称、证书与私钥 PEM、域名、有效期、默认标记），证书成为数据库配置的一部分，
+  不再依赖 `tls.cert` / `tls.key` 两个文件路径。
+- 代理新增 `crates/proxy/src/tls.rs`：`CertMap` 按精确域名与通配符（`*.example.com`，只匹配一级）建索引，
+  `SniResolver` 实现 `ResolvesServerCert`，每次握手读取当前 `SharedState`，因此上传/更新/删除证书后
+  热重载即生效，无需重启；应用在 `tls.mode = manual` 且绑定 `cert_id` 时覆盖应用域名。
+- HTTPS 监听改为 `TlsSettings::with_callbacks` + `set_cert_resolver`；空证书库也允许启动（握手会失败并告警），
+  上传证书后立即恢复。
+- 证书解析用 `x509-parser` 读取 SAN / CN、`not_before` / `not_after`、issuer 与序列号；上传前用 rustls
+  校验证书与私钥匹配，不匹配直接拒绝，避免把坏证书写进库导致整站握手失败。
+- 控制台新增「证书管理」页：列表（域名、有效期、过期标记、默认标记）、上传/更新、删除、设为默认；
+  应用详情「高级配置」中的证书 ID 文本框改为证书下拉，选中证书自动切换为手动指定。
+- 远程部署：新增 `api_token` 设置项与控制台生成/轮换按钮（32 字节系统随机数），兼容雷池接口：
+  `GET /api/CertAPI`、`DELETE /api/CertAPI`、`POST /api/UploadSSLCertAPI`（multipart：
+  `crt_file` / `key_file` / `name` / `id`），鉴权头 `X-SLCE-API-Token`；未配置 token 时一律 401。
+  离线环境没有 `multer`，multipart 用自写的 boundary 切分解析。
+- 验证：全量测试 534 项通过、clippy 零警告；实测上传 `a.test.local`、`b.test.local`、`default.test.local`
+  三张自签证书后，`openssl s_client -servername` 分别返回对应证书，未知 SNI 回落默认证书；应用绑定
+  `app.test.local → 证书 #2` 后握手返回 `b.test.local`；进程不重启上传新证书立即生效；HTTPS 请求经
+  代理到后端返回 200；雷池兼容接口完成带 token 的列表、multipart 上传、按 id 更新与删除，错误 token 返回 401；
+  浏览器验证证书页列表/编辑器/API Token、应用详情证书下拉均正常，无 JS 报错。
+
 ---
 
 ## 下一步开发任务
@@ -245,11 +268,12 @@
 | #15 | 验证与文档 | 全量测试、浏览器逐页验证四页签、README/差距分析/功能规格/日志更新 | ✅ |
 | #16 | 防护应用 / 攻击防护 / 系统设置 | 应用列表+详情四页签与静态/重定向、攻击概览与筛选分页封禁、系统信息/备份/清理、雷池自定义规则导入导出与热重载 | ✅ |
 | #17 | 网页防篡改 | 应用级基线（SHA-256）、静态请求实时拦截与事件记录、手动扫描修改/新增/删除、控制台页签 | ✅ |
+| #18 | 证书管理 | 证书库与 CRUD、SNI 多证书、应用绑定、默认证书、雷池兼容远程部署 API（`X-SLCE-API-Token`） | ✅ |
 
 ### 远期遗留（差距分析中未排期）
 
 - 控制台登录鉴权、多用户
-- ACME 自动证书、多证书 SNI
+- ACME 自动证书（多证书 SNI 已在 #18 实现）
 - 告警通知（Webhook/邮件）
 - Bot 识别 / JA4 指纹
 - 静态资源缓存
@@ -258,4 +282,4 @@
 
 ### 当前进度估计
 
-基线（初始提交）→ 防护增强 → 规则订阅 → 指标底座 → GeoIP → 统计 API → 深色四页签控制台与防护大屏 → 防护应用 / 攻击防护 / 系统设置 → 网页防篡改，任务 #12–#17 已全部入库。整体功能完成度约 **78%**（对照差距分析）。
+基线（初始提交）→ 防护增强 → 规则订阅 → 指标底座 → GeoIP → 统计 API → 深色四页签控制台与防护大屏 → 防护应用 / 攻击防护 / 系统设置 → 网页防篡改 → 证书管理 / 多证书 SNI / 远程部署 API，任务 #12–#18 已全部入库。整体功能完成度约 **80%**（对照差距分析）。

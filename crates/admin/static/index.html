@@ -767,6 +767,7 @@
       <div class="nav-group">
         <div class="nav-title">防护</div>
         <a data-page="apps">防护应用</a>
+        <a data-page="certs">证书管理</a>
         <a data-page="rules">访问控制</a>
         <a data-page="whitelist">检测白名单</a>
       </div>
@@ -944,6 +945,57 @@
             <div id="app-detail"></div>
           </section>
         </div>
+      </div>
+
+      <!-- ========== 证书管理 ========== -->
+      <div class="page" data-page="certs">
+        <section class="card">
+          <header>
+            <h2>证书列表</h2>
+            <div class="filters">
+              <button onclick="loadCerts()">刷新</button>
+              <button class="primary" onclick="openCertEditor()">上传证书</button>
+            </div>
+          </header>
+          <div class="hint" style="padding:10px 16px;border-bottom:1px solid var(--border)">
+            证书按域名（SAN / CN）自动匹配 SNI，未匹配的请求使用默认证书。HTTPS 监听需要至少一张证书。
+          </div>
+          <div id="certs"></div>
+        </section>
+
+        <section class="card" id="cert-editor-card" style="display:none">
+          <header>
+            <h2 id="cert-editor-title">上传证书</h2>
+            <div class="filters">
+              <button onclick="closeCertEditor()">取消</button>
+              <button class="primary" onclick="saveCert()">保存证书</button>
+            </div>
+          </header>
+          <div class="fieldset">
+            <div><label for="cert-name">名称</label><input id="cert-name" placeholder="可选，默认取首个域名"></div>
+            <div class="wide"><label for="cert-pem">证书链（PEM）</label>
+              <textarea id="cert-pem" rows="8" placeholder="-----BEGIN CERTIFICATE-----"></textarea></div>
+            <div class="wide"><label for="cert-key">私钥（PEM）</label>
+              <textarea id="cert-key" rows="8" placeholder="-----BEGIN PRIVATE KEY-----"></textarea></div>
+            <input type="hidden" id="cert-edit-id">
+            <div class="wide hint">支持 RSA / ECDSA。私钥只保存在本机数据库，不会通过列表接口返回。编辑时私钥留空表示沿用原私钥。</div>
+          </div>
+        </section>
+
+        <section class="card">
+          <header><h2>第三方远程部署（雷池兼容）</h2></header>
+          <div class="fieldset">
+            <div class="wide hint">
+              <code>POST /api/UploadSSLCertAPI</code>（multipart：crt_file / key_file / name / id）、
+              <code>GET /api/CertAPI</code>、<code>DELETE /api/CertAPI</code>，
+              请求头 <code>X-SLCE-API-Token</code>。
+            </div>
+            <div class="wide"><label for="api-token">API Token</label>
+              <input id="api-token" readonly placeholder="尚未生成"></div>
+            <div><button class="primary" onclick="rotateApiToken()">生成新 Token</button></div>
+            <div class="wide hint">重新生成后旧 Token 立即失效。第三方脚本只需把证书与私钥 POST 到本机管理端口即可完成部署。</div>
+          </div>
+        </section>
       </div>
 
       <!-- ========== 攻击防护 ========== -->
@@ -1347,7 +1399,7 @@ const durationToSecs = (d) => {
 // 页面切换
 // ============================================================
 const PAGE_TITLES = {
-  statistics: '统计报表', apps: '防护应用', attack: '攻击防护', rules: '访问控制',
+  statistics: '统计报表', apps: '防护应用', certs: '证书管理', attack: '攻击防护', rules: '访问控制',
   whitelist: '检测白名单', feeds: 'IP 组订阅', 'rule-feeds': '规则订阅',
   bans: '封禁', events: '事件', logs: '日志', system: '系统设置',
 };
@@ -1363,7 +1415,7 @@ function gotoPage(page) {
   document.getElementById('page-title').textContent = PAGE_TITLES[page] || page;
 
   // 切换时按需加载
-  ({ apps: loadApps, attack: loadAttackPage, rules: loadRules, whitelist: loadWhitelist, feeds: loadFeeds,
+  ({ apps: loadApps, certs: loadCerts, attack: loadAttackPage, rules: loadRules, whitelist: loadWhitelist, feeds: loadFeeds,
      'rule-feeds': loadRuleFeeds,
      bans: loadBans, events: loadEvents, logs: loadLogs, system: loadSystemPage,
      statistics: loadStatistics }[page] || (() => {}))();
@@ -2132,6 +2184,8 @@ async function loadApps() {
   if (!el) return;
   const q = (document.getElementById('apps-q')?.value || '').trim().toLowerCase();
   try {
+    // 详情页的证书下拉需要完整列表
+    await ensureCerts(true);
     let apps = await api('/apps');
     if (q) {
       apps = apps.filter(a => [a.id, a.name, a.description, a.group, a.domains?.primary,
@@ -2382,9 +2436,13 @@ function renderAppDetail() {
     el.innerHTML = `<div class="fieldset">
       <h3>TLS</h3>
       <div><label for="ad-tls">证书模式</label><select id="ad-tls">
-        ${[['auto', '自动'], ['manual', '手动'], ['off', '关闭']].map(([v, n]) => `<option value="${v}" ${a.tls?.mode === v ? 'selected' : ''}>${n}</option>`).join('')}
+        ${[['auto', '自动（按域名匹配）'], ['manual', '手动指定'], ['off', '关闭']].map(([v, n]) => `<option value="${v}" ${a.tls?.mode === v ? 'selected' : ''}>${n}</option>`).join('')}
       </select></div>
-      <div><label for="ad-cert">证书 ID</label><input id="ad-cert" value="${esc(a.tls?.cert_id || '')}" placeholder="可选"></div>
+      <div><label for="ad-cert">绑定证书</label><select id="ad-cert">
+        <option value="">跟随默认证书</option>
+        ${certsCache.map(c => `<option value="${c.id}" ${String(a.tls?.cert_id || '') === String(c.id) ? 'selected' : ''}>${esc(c.name)}（${esc((c.domains || []).join(', '))}）</option>`).join('')}
+      </select></div>
+      <div class="wide hint">选择证书后自动切换为「手动指定」。证书在「证书管理」页上传，保存后 TLS 立即热加载。</div>
       <h3>超时</h3>
       <div><label for="ad-connect">连接</label><input id="ad-connect" value="${esc(t.connect || '5s')}"></div>
       <div><label for="ad-read">读取</label><input id="ad-read" value="${esc(t.read || '60s')}"></div>
@@ -2510,7 +2568,13 @@ function collectAppDetail() {
     return;
   }
   if (appDetailTab === 'proxyConfig') {
-    a.tls = { ...(a.tls || {}), mode: val('ad-tls') || 'auto', cert_id: val('ad-cert').trim() || null };
+    const certId = val('ad-cert').trim() || null;
+    a.tls = {
+      ...(a.tls || {}),
+      // 选了具体证书就按手动指定生效，避免模式仍是 auto 导致绑定被忽略
+      mode: certId && (val('ad-tls') || 'auto') === 'auto' ? 'manual' : (val('ad-tls') || 'auto'),
+      cert_id: certId,
+    };
     a.timeouts = {
       ...(a.timeouts || {}),
       connect: val('ad-connect').trim() || '5s',
@@ -3197,6 +3261,119 @@ const toggleSelect = (id, val) => `
     <option value="monitor" ${val === 'monitor' ? 'selected' : ''}>仅记录</option>
     <option value="block" ${val === 'block' ? 'selected' : ''}>拦截</option>
   </select>`;
+
+// ============================================================
+// 证书管理
+// ============================================================
+let certsCache = [];
+
+async function ensureCerts(force = false) {
+  if (certsCache.length && !force) return certsCache;
+  try {
+    const data = await api('/certs');
+    certsCache = data.certs || [];
+  } catch { certsCache = []; }
+  return certsCache;
+}
+
+async function loadCerts() {
+  const el = document.getElementById('certs');
+  if (!el) return;
+  await ensureCerts(true);
+  if (!certsCache.length) {
+    el.innerHTML = '<div class="empty">还没有证书，点右上角上传</div>';
+  } else {
+    el.innerHTML = `<table>
+      <thead><tr><th>ID</th><th>名称</th><th>域名</th><th>有效期</th><th>签发者</th><th>默认</th><th></th></tr></thead>
+      <tbody>${certsCache.map(c => `<tr>
+        <td><code>${c.id}</code></td>
+        <td>${esc(c.name)}</td>
+        <td>${(c.domains || []).map(esc).join('<br>') || '<span class="sub" style="margin:0">–</span>'}</td>
+        <td>${fmtTime(c.not_before)} ~ ${fmtTime(c.not_after)}
+          ${c.expired ? '<span class="tag deny">已过期</span>' : ''}</td>
+        <td>${esc(c.issuer || '')}</td>
+        <td>${c.is_default ? '<span class="tag allow">默认</span>' : `<button onclick="setDefaultCert(${c.id})">设为默认</button>`}</td>
+        <td>
+          <button onclick="openCertEditor(${c.id})">更新</button>
+          <button class="danger" onclick="deleteCert(${c.id})">删除</button>
+        </td>
+      </tr>`).join('')}</tbody></table>`;
+  }
+  loadApiToken();
+}
+
+function openCertEditor(id = null) {
+  const card = document.getElementById('cert-editor-card');
+  card.style.display = '';
+  document.getElementById('cert-editor-title').textContent = id ? `更新证书 #${id}` : '上传证书';
+  document.getElementById('cert-edit-id').value = id || '';
+  document.getElementById('cert-name').value = '';
+  document.getElementById('cert-pem').value = '';
+  document.getElementById('cert-key').value = '';
+  if (id) {
+    const c = certsCache.find(x => x.id === id);
+    if (c) document.getElementById('cert-name').value = c.name || '';
+  }
+  card.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+function closeCertEditor() {
+  document.getElementById('cert-editor-card').style.display = 'none';
+}
+
+async function saveCert() {
+  const id = document.getElementById('cert-edit-id').value;
+  const certPem = document.getElementById('cert-pem').value;
+  if (!certPem.trim()) return showMsg('请粘贴证书 PEM', 'error');
+  const body = {
+    name: document.getElementById('cert-name').value.trim() || null,
+    cert_pem: certPem,
+    key_pem: document.getElementById('cert-key').value,
+  };
+  try {
+    await api(id ? `/certs/${id}` : '/certs', { method: id ? 'PUT' : 'POST', body: JSON.stringify(body) });
+    showMsg(id ? '证书已更新，TLS 已热加载' : '证书已上传，TLS 已热加载');
+    closeCertEditor();
+    loadCerts();
+  } catch (e) { showMsg('保存失败：' + e.message, 'error'); }
+}
+
+async function deleteCert(id) {
+  if (!confirm(`删除证书 #${id}？绑定该证书的域名会回落到默认证书。`)) return;
+  try {
+    await api(`/certs/${id}`, { method: 'DELETE' });
+    showMsg('证书已删除');
+    loadCerts();
+  } catch (e) { showMsg('删除失败：' + e.message, 'error'); }
+}
+
+async function setDefaultCert(id) {
+  try {
+    await api(`/certs/${id}/default`, { method: 'POST' });
+    showMsg(`证书 #${id} 已设为默认`);
+    loadCerts();
+  } catch (e) { showMsg('设置失败：' + e.message, 'error'); }
+}
+
+async function loadApiToken() {
+  const el = document.getElementById('api-token');
+  if (!el) return;
+  try {
+    const d = await api('/api-token');
+    el.value = d.token || '';
+    el.placeholder = d.configured ? '' : '尚未生成';
+  } catch { /* 忽略：证书页之外的调用 */ }
+}
+
+async function rotateApiToken() {
+  if (!confirm('重新生成后旧 Token 立即失效，第三方部署脚本需要同步更新。继续？')) return;
+  try {
+    const d = await api('/api-token', { method: 'POST' });
+    showMsg('已生成新 Token');
+    loadApiToken();
+    if (navigator.clipboard) navigator.clipboard.writeText(d.token).catch(() => {});
+  } catch (e) { showMsg('生成失败：' + e.message, 'error'); }
+}
 
 async function loadSettings() {
   const el = document.getElementById('settings');

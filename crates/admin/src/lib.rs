@@ -5,6 +5,7 @@
 //! - **认证用 Bearer token**，未配置 token 时只允许回环访问（家用默认安全）
 //! - **写操作后显式触发重载**，这是 DB 模式补回热重载的唯一途径
 
+pub mod certs;
 pub mod geoip;
 
 use std::net::IpAddr;
@@ -12,16 +13,17 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::{
+    body::Bytes,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse, Response},
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
     Json, Router,
 };
 use homewaf_acl::BanTable;
 use homewaf_config::Application;
 use homewaf_proxy::{RuntimeState, SharedState, TrafficMetrics};
-use homewaf_store::{AclRuleRow, Store};
+use homewaf_store::{AclRuleRow, CertificateRow, Store};
 use serde::{Deserialize, Serialize};
 
 /// 管理服务的共享状态。
@@ -115,6 +117,13 @@ pub fn router(state: Ctx) -> Router {
         )
         .route("/api/whitelist", get(list_whitelist).post(upsert_whitelist))
         .route("/api/whitelist/{id}", delete(delete_whitelist))
+        .route("/api/certs", get(list_certs).post(create_cert))
+        .route("/api/certs/{id}", put(update_cert).delete(delete_cert))
+        .route("/api/certs/{id}/default", post(set_default_cert))
+        .route("/api/api-token", get(get_api_token).post(rotate_api_token))
+        // 兼容长亭雷池的远程证书部署接口（第三方用 X-SLCE-API-Token 鉴权）
+        .route("/api/CertAPI", get(slce_list_certs).delete(slce_delete_cert))
+        .route("/api/UploadSSLCertAPI", post(slce_upload_cert))
         .route("/api/settings", get(get_all_settings))
         .route("/api/settings/{key}", get(get_setting).put(put_setting))
         .route("/api/system/info", get(system_info))
@@ -2297,6 +2306,11 @@ fn check_setting_type(key: &str, value: &serde_json::Value) -> Result<(), String
                 .ok_or_else(|| "geoip_db 必须是字符串路径".to_string())?;
             geoip::validate_db(path)
         }
+        // 第三方证书部署 token，必须是字符串
+        "api_token" => value
+            .as_str()
+            .map(|_| ())
+            .ok_or_else(|| "api_token 必须是字符串".to_string()),
         // 未知 key 直接拒绝，避免往库里塞垃圾
         other => Err(format!("未知的设置项 `{other}`")),
     }
@@ -3096,6 +3110,471 @@ async fn delete_whitelist(
 }
 
 // ============================================================
+// 证书管理
+// ============================================================
+
+/// 远程部署 API Token 的设置键。第三方用 `X-SLCE-API-Token` 请求头携带。
+const API_TOKEN_KEY: &str = "api_token";
+
+#[derive(Debug, Serialize)]
+struct CertView {
+    id: i64,
+    name: String,
+    domains: Vec<String>,
+    not_before: i64,
+    not_after: i64,
+    is_default: bool,
+    issuer: String,
+    serial: String,
+    created_at: i64,
+    updated_at: i64,
+    expired: bool,
+}
+
+fn split_domains(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect()
+}
+
+fn cert_view(row: &CertificateRow) -> CertView {
+    // issuer / serial 不单独存列，展示时从 PEM 现算（证书数量很少）
+    let info = certs::parse_cert(&row.cert_pem).ok();
+    let domains = if row.domains.trim().is_empty() {
+        info.as_ref()
+            .map(|i| split_domains(&i.domains))
+            .unwrap_or_default()
+    } else {
+        split_domains(&row.domains)
+    };
+    let (issuer, serial) = info
+        .map(|i| (i.issuer, i.serial))
+        .unwrap_or_default();
+    CertView {
+        id: row.id,
+        name: row.name.clone(),
+        domains,
+        not_before: row.not_before,
+        not_after: row.not_after,
+        is_default: row.is_default,
+        issuer,
+        serial,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+        expired: row.not_after > 0 && row.not_after <= homewaf_acl::now_unix(),
+    }
+}
+
+async fn list_certs(State(ctx): State<Ctx>, headers: HeaderMap) -> Response {
+    if !authorized(&ctx, &headers) {
+        return unauthorized();
+    }
+    match ctx.store.list_certificates() {
+        Ok(rows) => {
+            let views: Vec<CertView> = rows.iter().map(cert_view).collect();
+            Json(serde_json::json!({"total": views.len(), "certs": views})).into_response()
+        }
+        Err(e) => internal(e).into_response(),
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct CertUploadBody {
+    name: Option<String>,
+    cert_pem: Option<String>,
+    key_pem: Option<String>,
+    /// 第三方常见命名
+    cert: Option<String>,
+    key: Option<String>,
+}
+
+async fn create_cert(
+    State(ctx): State<Ctx>,
+    headers: HeaderMap,
+    Json(body): Json<CertUploadBody>,
+) -> Response {
+    if !authorized(&ctx, &headers) {
+        return unauthorized();
+    }
+    match save_cert(&ctx, None, body) {
+        Ok(id) => Json(serde_json::json!({"ok": true, "id": id})).into_response(),
+        Err((status, msg)) => (status, msg).into_response(),
+    }
+}
+
+async fn update_cert(
+    State(ctx): State<Ctx>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Json(body): Json<CertUploadBody>,
+) -> Response {
+    if !authorized(&ctx, &headers) {
+        return unauthorized();
+    }
+    match save_cert(&ctx, Some(id), body) {
+        Ok(id) => Json(serde_json::json!({"ok": true, "id": id})).into_response(),
+        Err((status, msg)) => (status, msg).into_response(),
+    }
+}
+
+async fn delete_cert(
+    State(ctx): State<Ctx>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Response {
+    if !authorized(&ctx, &headers) {
+        return unauthorized();
+    }
+    match delete_cert_inner(&ctx, id) {
+        Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
+        Err((status, msg)) => (status, msg).into_response(),
+    }
+}
+
+async fn set_default_cert(
+    State(ctx): State<Ctx>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Response {
+    if !authorized(&ctx, &headers) {
+        return unauthorized();
+    }
+    match ctx.store.set_default_certificate(id) {
+        Ok(true) => match reload_state(&ctx) {
+            Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
+            Err(e) => (
+                StatusCode::BAD_REQUEST,
+                format!("已设置默认证书，但重载失败：{e}"),
+            )
+                .into_response(),
+        },
+        Ok(false) => (StatusCode::NOT_FOUND, "证书不存在").into_response(),
+        Err(e) => internal(e).into_response(),
+    }
+}
+
+fn delete_cert_inner(ctx: &AdminState, id: i64) -> Result<(), ApiError> {
+    match ctx.store.delete_certificate(id).map_err(internal)? {
+        true => {
+            // 删掉的正好是默认证书时，重新指定一张，避免没有兜底证书
+            let rows = ctx.store.list_certificates().map_err(internal)?;
+            if !rows.iter().any(|r| r.is_default) {
+                if let Some(first) = rows.first() {
+                    let _ = ctx.store.set_default_certificate(first.id);
+                }
+            }
+            reload_state(ctx)
+                .map_err(|e| (StatusCode::BAD_REQUEST, format!("已删除，但重载失败：{e}")))
+        }
+        false => Err((StatusCode::NOT_FOUND, "证书不存在".to_string())),
+    }
+}
+
+/// 校验并保存一张证书。`id` 为 `Some` 时更新，否则新增。
+fn save_cert(
+    ctx: &AdminState,
+    id: Option<i64>,
+    body: CertUploadBody,
+) -> Result<i64, ApiError> {
+    let existing = match id {
+        Some(i) => ctx.store.get_certificate(i).map_err(internal)?,
+        None => None,
+    };
+    if id.is_some() && existing.is_none() {
+        return Err((StatusCode::NOT_FOUND, "证书不存在".to_string()));
+    }
+
+    let cert_pem = body
+        .cert_pem
+        .or(body.cert)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if cert_pem.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "缺少证书 PEM".to_string()));
+    }
+
+    // 更新时允许不传私钥，沿用原来的
+    let key_pem = match body.key_pem.or(body.key) {
+        Some(k) if !k.trim().is_empty() => k.trim().to_string(),
+        _ => existing
+            .as_ref()
+            .map(|r| r.key_pem.clone())
+            .unwrap_or_default(),
+    };
+    if key_pem.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "缺少私钥 PEM".to_string()));
+    }
+
+    // 先验证证书与私钥匹配：不匹配的证书进了库，只会让整站 TLS 握手失败
+    homewaf_proxy::tls::load_certified_key(&cert_pem, &key_pem)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let info = certs::parse_cert(&cert_pem).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+
+    let name = body
+        .name
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| existing.as_ref().map(|r| r.name.clone()))
+        .or_else(|| {
+            info.domains
+                .split(',')
+                .next()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or_else(|| "未命名证书".to_string());
+
+    let now = homewaf_acl::now_unix();
+    let saved_id = match id {
+        Some(i) => {
+            let updated = ctx
+                .store
+                .update_certificate(
+                    i,
+                    &name,
+                    &cert_pem,
+                    &key_pem,
+                    &info.domains,
+                    info.not_before,
+                    info.not_after,
+                    now,
+                )
+                .map_err(internal)?;
+            if !updated {
+                return Err((StatusCode::NOT_FOUND, "证书不存在".to_string()));
+            }
+            i
+        }
+        None => ctx
+            .store
+            .insert_certificate(
+                &name,
+                &cert_pem,
+                &key_pem,
+                &info.domains,
+                info.not_before,
+                info.not_after,
+                now,
+            )
+            .map_err(internal)?,
+    };
+
+    // 第一张证书自动成为默认证书：客户端不带 SNI 时要有兜底
+    let rows = ctx.store.list_certificates().map_err(internal)?;
+    if !rows.iter().any(|r| r.is_default) {
+        ctx.store
+            .set_default_certificate(saved_id)
+            .map_err(internal)?;
+    }
+
+    reload_state(ctx).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("证书已保存，但重载失败：{e}"),
+        )
+    })?;
+
+    Ok(saved_id)
+}
+
+// ============================================================
+// 远程部署 API Token
+// ============================================================
+
+async fn get_api_token(State(ctx): State<Ctx>, headers: HeaderMap) -> Response {
+    if !authorized(&ctx, &headers) {
+        return unauthorized();
+    }
+    let token = ctx
+        .store
+        .get_setting::<String>(API_TOKEN_KEY)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    Json(serde_json::json!({
+        "token": token,
+        "configured": !token.trim().is_empty(),
+    }))
+    .into_response()
+}
+
+async fn rotate_api_token(State(ctx): State<Ctx>, headers: HeaderMap) -> Response {
+    if !authorized(&ctx, &headers) {
+        return unauthorized();
+    }
+    let token = random_token();
+    match ctx
+        .store
+        .set_setting(API_TOKEN_KEY, &token, homewaf_acl::now_unix())
+    {
+        Ok(()) => Json(serde_json::json!({"ok": true, "token": token})).into_response(),
+        Err(e) => internal(e).into_response(),
+    }
+}
+
+fn random_token() -> String {
+    use ring::rand::{SecureRandom, SystemRandom};
+    let mut buf = [0u8; 32];
+    if SystemRandom::new().fill(&mut buf).is_err() {
+        // 系统随机数不可用属于极端情况，用时间戳兜底而不是写入空 token
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        return format!("{nanos:032x}");
+    }
+    buf.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// 校验第三方请求头里的 API Token。
+fn api_token_ok(state: &AdminState, headers: &HeaderMap) -> bool {
+    let Ok(Some(expected)) = state.store.get_setting::<String>(API_TOKEN_KEY) else {
+        return false;
+    };
+    let expected = expected.trim();
+    if expected.is_empty() {
+        return false;
+    }
+    headers
+        .get("x-slce-api-token")
+        .and_then(|v| v.to_str().ok())
+        .map(|t| t.trim() == expected)
+        .unwrap_or(false)
+}
+
+fn slce_ok(data: serde_json::Value) -> Response {
+    Json(serde_json::json!({"err": null, "msg": "success", "data": data})).into_response()
+}
+
+fn slce_err(status: StatusCode, msg: impl Into<String>) -> Response {
+    let msg = msg.into();
+    (
+        status,
+        Json(serde_json::json!({"err": msg.clone(), "msg": msg, "data": null})),
+    )
+        .into_response()
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct SlcePageQuery {
+    page: Option<usize>,
+    page_size: Option<usize>,
+}
+
+/// 雷池兼容：`GET /api/CertAPI`
+async fn slce_list_certs(
+    State(ctx): State<Ctx>,
+    headers: HeaderMap,
+    Query(q): Query<SlcePageQuery>,
+) -> Response {
+    if !api_token_ok(&ctx, &headers) {
+        return slce_err(StatusCode::UNAUTHORIZED, "invalid api token");
+    }
+    let rows = match ctx.store.list_certificates() {
+        Ok(r) => r,
+        Err(e) => return slce_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+    let views: Vec<CertView> = rows.iter().map(cert_view).collect();
+    let total = views.len();
+    let page = q.page.unwrap_or(1).max(1);
+    let size = q.page_size.unwrap_or(20).clamp(1, 200);
+    let list: Vec<CertView> = views
+        .into_iter()
+        .skip((page - 1).saturating_mul(size))
+        .take(size)
+        .collect();
+    slce_ok(serde_json::json!({
+        "total": total,
+        "list": list,
+        "page": page,
+        "page_size": size,
+    }))
+}
+
+/// 雷池兼容：`DELETE /api/CertAPI`，请求体 `{"id": 1}`
+async fn slce_delete_cert(
+    State(ctx): State<Ctx>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    if !api_token_ok(&ctx, &headers) {
+        return slce_err(StatusCode::UNAUTHORIZED, "invalid api token");
+    }
+    let Some(id) = body.get("id").and_then(|v| v.as_i64()) else {
+        return slce_err(StatusCode::BAD_REQUEST, "缺少 id");
+    };
+    match delete_cert_inner(&ctx, id) {
+        Ok(()) => slce_ok(serde_json::Value::Null),
+        Err((status, msg)) => slce_err(status, msg),
+    }
+}
+
+struct ParsedUpload {
+    id: Option<i64>,
+    body: CertUploadBody,
+}
+
+/// 雷池兼容：`POST /api/UploadSSLCertAPI`（multipart 或 JSON）
+async fn slce_upload_cert(
+    State(ctx): State<Ctx>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if !api_token_ok(&ctx, &headers) {
+        return slce_err(StatusCode::UNAUTHORIZED, "invalid api token");
+    }
+    let upload = match parse_cert_upload(&headers, &body) {
+        Ok(u) => u,
+        Err(e) => return slce_err(StatusCode::BAD_REQUEST, e),
+    };
+    match save_cert(&ctx, upload.id, upload.body) {
+        Ok(id) => slce_ok(serde_json::json!({"id": id})),
+        Err((status, msg)) => slce_err(status, msg),
+    }
+}
+
+fn parse_cert_upload(headers: &HeaderMap, body: &[u8]) -> Result<ParsedUpload, String> {
+    let content_type = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    if let Some(boundary) = certs::boundary_from_content_type(content_type) {
+        let parts = certs::parse_multipart(body, &boundary)?;
+        let mut out = CertUploadBody::default();
+        let mut id = None;
+        for part in &parts {
+            match part.name.as_str() {
+                "name" => out.name = Some(part.text()?),
+                "id" => id = part.text()?.parse::<i64>().ok(),
+                "crt_file" | "cert_file" | "cert" | "crt" | "cert_pem" => {
+                    out.cert_pem = Some(part.text()?)
+                }
+                "key_file" | "private_key" | "key" | "key_pem" => out.key_pem = Some(part.text()?),
+                _ => {}
+            }
+        }
+        return Ok(ParsedUpload { id, body: out });
+    }
+
+    #[derive(Deserialize)]
+    struct JsonUpload {
+        id: Option<i64>,
+        #[serde(flatten)]
+        body: CertUploadBody,
+    }
+    let parsed: JsonUpload =
+        serde_json::from_slice(body).map_err(|e| format!("请求体解析失败：{e}"))?;
+    Ok(ParsedUpload {
+        id: parsed.id,
+        body: parsed.body,
+    })
+}
+
+// ============================================================
 // 重载
 // ============================================================
 
@@ -3166,6 +3645,7 @@ mod tests {
             ipv6_prefix: 64,
             server: Default::default(),
             tls: Default::default(),
+            tls_certs: Default::default(),
             feed_failures: Vec::new(),
             rule_feeds: Vec::new(),
             custom_rules: Vec::new(),

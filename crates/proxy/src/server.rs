@@ -1670,6 +1670,13 @@ fn spawn_health_checker(state: SharedState, interval: std::time::Duration) {
         .expect("启动健康检查线程失败");
 }
 
+/// 空 TLS 回调。rustls 后端不需要 openssl 式的 certificate_callback，
+/// 证书由 [`crate::tls::SniResolver`] 在 `ClientHello` 阶段选择。
+struct NoTlsCallbacks;
+
+#[async_trait]
+impl pingora::listeners::TlsAccept for NoTlsCallbacks {}
+
 /// 启动代理服务。
 pub fn run(state: SharedState, settings: ProxySettings) -> anyhow::Result<()> {
     if settings.listen.is_empty() && settings.tls_listen.is_empty() {
@@ -1815,23 +1822,22 @@ pub fn run(state: SharedState, settings: ProxySettings) -> anyhow::Result<()> {
     }
 
     if !settings.tls_listen.is_empty() {
-        let cert = settings
-            .tls
-            .cert
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("配置了 tls_listen 但缺少 tls.cert"))?;
-        let key = settings
-            .tls
-            .key
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("配置了 tls_listen 但缺少 tls.key"))?;
+        // 证书来自证书库（或全局 tls.cert/tls.key 兜底）。空证书库也允许启动：
+        // 监听器先起来，用户在控制台上传证书后由解析器热生效，无需重启。
+        if state.load().tls_certs.is_empty() {
+            tracing::warn!(
+                "配置了 tls_listen 但当前没有证书，握手会失败；请在控制台「证书管理」上传"
+            );
+        }
 
-        // TlsSettings 不实现 Clone，每个监听地址各自构造一次（证书通常只读 1-2 次）
+        // 证书解析器每次握手都读当前状态，因此证书更新是热生效的
+        let resolver = Arc::new(crate::tls::SniResolver::new(state.clone()));
         let want_h2 = settings.tls.alpn.iter().any(|p| p == "h2");
 
         for addr in &settings.tls_listen {
-            let mut tls_settings = TlsSettings::intermediate(cert, key)
-                .map_err(|e| anyhow::anyhow!("加载 TLS 证书失败（{cert} / {key}）: {e}"))?;
+            let mut tls_settings = TlsSettings::with_callbacks(Box::new(NoTlsCallbacks))
+                .map_err(|e| anyhow::anyhow!("初始化 TLS 失败：{e}"))?;
+            tls_settings.set_cert_resolver(resolver.clone());
             if want_h2 {
                 tls_settings.enable_h2();
             }

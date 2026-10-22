@@ -14,7 +14,7 @@ use rusqlite::{params, Connection};
 
 mod config_store;
 
-pub use config_store::{AclRuleRow, IpGroupRow, WhitelistRow};
+pub use config_store::{AclRuleRow, CertificateRow, IpGroupRow, WhitelistRow};
 
 /// 存储层错误。
 #[derive(Debug, thiserror::Error)]
@@ -323,6 +323,20 @@ impl Store {
                 digest     TEXT NOT NULL,
                 updated_at INTEGER NOT NULL,
                 PRIMARY KEY (app_id, path)
+            );
+
+            -- TLS 证书：PEM 原文入库，由控制台与代理共享
+            CREATE TABLE IF NOT EXISTS certificates (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                name       TEXT NOT NULL,
+                cert_pem   TEXT NOT NULL,
+                key_pem    TEXT NOT NULL,
+                domains    TEXT NOT NULL DEFAULT '',
+                not_before INTEGER NOT NULL,
+                not_after  INTEGER NOT NULL,
+                is_default INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
             );
 
             -- 检测白名单（误报豁免）
@@ -1553,6 +1567,35 @@ mod tests {
         let apps: Vec<DemoApp> = s.list_applications().unwrap();
         assert_eq!(apps.len(), 1, "同 id 不应产生两行");
         assert_eq!(apps[0].name, "v2");
+    }
+
+    #[test]
+    fn certificate_crud_and_default() {
+        let s = store();
+        let a = s
+            .insert_certificate("a", "CERT-A", "KEY-A", "a.test", 0, 100, NOW)
+            .unwrap();
+        let b = s
+            .insert_certificate("b", "CERT-B", "KEY-B", "b.test", 0, 200, NOW)
+            .unwrap();
+        assert_eq!(s.list_certificates().unwrap().len(), 2);
+
+        assert!(s
+            .update_certificate(a, "a2", "CERT-A2", "KEY-A2", "a.test,www.a.test", 0, 300, NOW + 1)
+            .unwrap());
+        let got = s.get_certificate(a).unwrap().unwrap();
+        assert_eq!(got.name, "a2");
+        assert_eq!(got.domains, "a.test,www.a.test");
+        assert_eq!(got.not_after, 300);
+
+        assert!(s.set_default_certificate(b).unwrap());
+        let certs = s.list_certificates().unwrap();
+        assert!(certs.iter().find(|c| c.id == b).unwrap().is_default);
+        assert!(!certs.iter().find(|c| c.id == a).unwrap().is_default);
+
+        assert!(s.delete_certificate(b).unwrap());
+        assert!(!s.delete_certificate(b).unwrap());
+        assert_eq!(s.list_certificates().unwrap().len(), 1);
     }
 
     #[test]

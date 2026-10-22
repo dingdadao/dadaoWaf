@@ -963,11 +963,13 @@ dependencies = [
  "homewaf-store",
  "ipnet",
  "maxminddb",
+ "ring",
  "serde",
  "serde_json",
  "tokio",
  "tracing",
  "ureq",
+ "x509-parser",
 ]
 
 [[package]]
@@ -1020,6 +1022,8 @@ dependencies = [
  "pingora",
  "regex",
  "ring",
+ "rustls",
+ "rustls-pemfile",
  "serde",
  "serde_json",
  "thiserror 2.0.21",

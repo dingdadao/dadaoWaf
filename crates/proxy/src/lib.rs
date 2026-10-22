@@ -16,6 +16,7 @@ pub mod reload;
 pub mod rulefeed;
 mod server;
 pub mod tamper;
+pub mod tls;
 pub mod upstream;
 
 pub use challenge::{ChallengeService, CHALLENGE_PATH, COOKIE_NAME};
