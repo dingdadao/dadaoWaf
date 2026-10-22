@@ -9,14 +9,29 @@
 //! “未启用地理位置”，不影响其它功能。
 
 use std::collections::HashMap;
+use std::io::Read;
 use std::net::IpAddr;
+use std::path::{Path, PathBuf};
 use std::sync::RwLock;
+use std::time::Duration;
 
 use maxminddb::Reader;
 use serde::Serialize;
 
 /// 设置项键名：mmdb 文件路径。
 pub const GEOIP_SETTING: &str = "geoip_db";
+
+/// 默认下载源：jsDelivr 上的 GeoLite2-City 压缩包。
+pub const DEFAULT_DOWNLOAD_URL: &str =
+    "https://cdn.jsdelivr.net/npm/geolite2-city/GeoLite2-City.mmdb.gz";
+
+/// 下载后保存的文件名。
+pub const DEFAULT_DB_FILE: &str = "GeoLite2-City.mmdb";
+
+/// 压缩包大小上限，防止异常响应打爆内存。
+const MAX_DOWNLOAD_BYTES: u64 = 256 * 1024 * 1024;
+/// 解压后的大小上限。
+const MAX_DB_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// 缓存 IP 数量上限。超过后整体清空，按需重新查询。
 const CACHE_CAP: usize = 8192;
@@ -277,6 +292,60 @@ pub fn validate_db(path: &str) -> Result<(), String> {
     Reader::open_readfile(path.trim())
         .map(|_| ())
         .map_err(|e| format!("GeoIP 数据库无法加载：{e}"))
+}
+
+/// 从默认下载源拉取 GeoLite2-City，解压后保存到 `dir`，返回文件路径。
+///
+/// 阻塞调用，控制台需要在 `spawn_blocking` 里执行。先写临时文件再 rename，
+/// 避免下载中断留下半截 mmdb；写盘后用 [`validate_db`] 做一次可加载校验。
+pub fn download_default(dir: &Path) -> Result<PathBuf, String> {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(180)))
+        .build()
+        .into();
+
+    let response = agent
+        .get(DEFAULT_DOWNLOAD_URL)
+        .call()
+        .map_err(|e| format!("下载 {DEFAULT_DOWNLOAD_URL} 失败：{e}"))?;
+
+    let mut gz = Vec::new();
+    response
+        .into_body()
+        .into_reader()
+        .take(MAX_DOWNLOAD_BYTES + 1)
+        .read_to_end(&mut gz)
+        .map_err(|e| format!("读取下载内容失败：{e}"))?;
+    if gz.len() as u64 > MAX_DOWNLOAD_BYTES {
+        return Err(format!("下载内容超过上限 {MAX_DOWNLOAD_BYTES} 字节"));
+    }
+    if gz.is_empty() {
+        return Err("下载内容为空".to_string());
+    }
+
+    let mut db = Vec::new();
+    flate2::read::GzDecoder::new(&gz[..])
+        .take(MAX_DB_BYTES + 1)
+        .read_to_end(&mut db)
+        .map_err(|e| format!("解压 GeoIP 数据库失败：{e}"))?;
+    if db.len() as u64 > MAX_DB_BYTES {
+        return Err(format!("解压后数据库超过上限 {MAX_DB_BYTES} 字节"));
+    }
+
+    std::fs::create_dir_all(dir).map_err(|e| format!("创建目录 {} 失败：{e}", dir.display()))?;
+    let target = dir.join(DEFAULT_DB_FILE);
+    let tmp = dir.join(format!(".{DEFAULT_DB_FILE}.tmp"));
+    if let Err(e) = std::fs::write(&tmp, &db) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("写入 {} 失败：{e}", tmp.display()));
+    }
+    if let Err(e) = std::fs::rename(&tmp, &target) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("保存 {} 失败：{e}", target.display()));
+    }
+
+    validate_db(&target.display().to_string())?;
+    Ok(target)
 }
 
 fn from_city(city: &maxminddb::geoip2::City<'_>) -> GeoInfo {

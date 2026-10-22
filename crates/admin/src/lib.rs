@@ -37,6 +37,8 @@ pub struct AdminState {
     pub token: Option<String>,
     /// 日志根目录，用于控制台的日志查看
     pub log_dir: std::path::PathBuf,
+    /// 数据目录，GeoIP 默认库下载到这里
+    pub data_dir: std::path::PathBuf,
     /// 进程启动时间（Unix 秒），用于系统页展示运行时长
     pub started_at: i64,
 }
@@ -84,6 +86,7 @@ pub fn router(state: Ctx) -> Router {
         .route("/api/screen", get(screen))
         .route("/api/attack/overview", get(attack_overview))
         .route("/api/geoip", get(geoip_status))
+        .route("/api/geoip/download", post(download_geoip))
         .route("/api/apps", get(list_apps).post(upsert_app))
         .route("/api/apps/{id}", get(get_app).delete(delete_app))
         .route("/api/apps/{id}/enabled", post(set_app_enabled))
@@ -190,8 +193,13 @@ pub fn spawn(state: AdminState, listen: String) -> anyhow::Result<()> {
 // 页面
 // ============================================================
 
-async fn index() -> Html<&'static str> {
-    Html(include_str!("../static/index.html"))
+/// 控制台单页。禁止缓存，升级二进制后浏览器才会拿到新界面。
+async fn index() -> Response {
+    (
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        Html(include_str!("../static/index.html")),
+    )
+        .into_response()
 }
 
 // ============================================================
@@ -440,6 +448,46 @@ async fn geoip_status(State(ctx): State<Ctx>, headers: HeaderMap) -> Response {
         return unauthorized();
     }
     Json(ctx.geoip.status()).into_response()
+}
+
+/// 下载默认地理信息库（jsDelivr 上的 GeoLite2-City.gz），解压后写入设置。
+///
+/// 下载与解压都是阻塞 IO，放到 `spawn_blocking`，不占控制台的异步线程。
+async fn download_geoip(State(ctx): State<Ctx>, headers: HeaderMap) -> Response {
+    if !authorized(&ctx, &headers) {
+        return unauthorized();
+    }
+
+    let dir = ctx.data_dir.clone();
+    let downloaded = tokio::task::spawn_blocking(move || geoip::download_default(&dir)).await;
+    let path = match downloaded {
+        Ok(Ok(path)) => path,
+        Ok(Err(e)) => return (StatusCode::BAD_GATEWAY, e).into_response(),
+        Err(e) => return internal(e).into_response(),
+    };
+    let path = path.display().to_string();
+
+    if let Err(e) = ctx.store.set_setting(
+        geoip::GEOIP_SETTING,
+        &serde_json::Value::String(path.clone()),
+        homewaf_acl::now_unix(),
+    ) {
+        return internal(e).into_response();
+    }
+
+    ctx.geoip.load(&path);
+    let status = ctx.geoip.status();
+    if let Some(err) = status.error {
+        return (StatusCode::BAD_REQUEST, err).into_response();
+    }
+
+    Json(serde_json::json!({
+        "ok": true,
+        "path": path,
+        "source": geoip::DEFAULT_DOWNLOAD_URL,
+        "status": status,
+    }))
+    .into_response()
 }
 
 /// 把指标快照里的 IP 批量解析成国家/城市/经纬度。
@@ -3135,6 +3183,7 @@ mod tests {
             allow_regex: false,
             token: None,
             log_dir: std::env::temp_dir(),
+            data_dir: std::env::temp_dir(),
             started_at: 0,
         }
     }

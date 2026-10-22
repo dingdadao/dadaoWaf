@@ -3282,8 +3282,10 @@ function renderSettings(s) {
     <div class="fieldset">
       <h3>地理信息（GeoIP）</h3>
       <div class="wide"><label for="set-geoip">GeoLite2-City.mmdb 路径</label>
-        <input id="set-geoip" placeholder="/path/to/GeoLite2-City.mmdb（留空禁用）" value="${esc(s.geoip_db || '')}"></div>
-      <div class="hint">用于统计报表与防护大屏的访问来源地图。只在控制台聚合时查询，不影响代理转发；留空时地图显示「未启用地理位置」。</div>
+        <div class="row"><input id="set-geoip" style="flex:1" placeholder="/path/to/GeoLite2-City.mmdb（留空禁用）" value="${esc(s.geoip_db || '')}">
+          <button id="set-geoip-download" onclick="downloadGeoip()">下载默认库</button></div></div>
+      <div class="hint">用于统计报表与防护大屏的访问来源地图。只在控制台聚合时查询，不影响代理转发；留空时地图显示「未启用地理位置」。<br>
+        默认下载源 <code>https://cdn.jsdelivr.net/npm/geolite2-city/GeoLite2-City.mmdb.gz</code>，下载后自动解压到数据目录、写入路径并立即生效。</div>
     </div>`;
 }
 
@@ -3334,6 +3336,18 @@ async function saveSettings() {
     showMsg('保存失败：' + e.message, 'error');
     loadSettings();
   } finally { btn.disabled = false; btn.textContent = '保存设置'; }
+}
+
+async function downloadGeoip() {
+  const btn = document.getElementById('set-geoip-download');
+  btn.disabled = true; btn.textContent = '下载中…';
+  try {
+    const r = await api('/geoip/download', { method: 'POST' });
+    showMsg(`地理信息库已就绪：${r.path}`);
+    loadSettings(); loadStatistics();
+  } catch (e) {
+    showMsg('下载失败：' + e.message, 'error');
+  } finally { btn.disabled = false; btn.textContent = '下载默认库'; }
 }
 
 // ============================================================

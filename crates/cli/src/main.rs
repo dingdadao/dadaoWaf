@@ -444,6 +444,10 @@ fn cmd_serve(
             allow_regex,
             token,
             log_dir: std::path::PathBuf::from(&logging_cfg.dir),
+            data_dir: std::path::Path::new(db)
+                .parent()
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_else(|| std::path::PathBuf::from(".")),
             started_at: homewaf_acl::now_unix(),
         };
         match homewaf_admin::spawn(admin_state, admin_listen.clone()) {

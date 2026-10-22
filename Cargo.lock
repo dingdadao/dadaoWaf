@@ -953,6 +953,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "flate2",
  "homewaf-acl",
  "homewaf-config",
  "homewaf-detect",
@@ -966,6 +967,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "ureq",
 ]
 
 [[package]]

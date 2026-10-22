@@ -22,3 +22,6 @@ serde.workspace = true
 serde_json.workspace = true
 tracing = "0.1"
 maxminddb = "0.32.0"
+# 默认地理信息库下载（jsDelivr 提供 .gz，需要本地解压）
+ureq = "3"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }

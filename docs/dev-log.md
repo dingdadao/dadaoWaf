@@ -219,6 +219,18 @@
   控制台错误均符合预期。
 - 限制：反向代理应用不做请求级实时校验（仅手动检查）；变更文件只拦截、不回滚，未做自动恢复备份。
 
+### 22:35 — 地理信息默认下载
+
+- 系统设置「地理信息（GeoIP）」增加「下载默认库」按钮，默认下载源为
+  `https://cdn.jsdelivr.net/npm/geolite2-city/GeoLite2-City.mmdb.gz`。
+- 新增 `POST /api/geoip/download`：在 `spawn_blocking` 中下载并解压（`flate2`，单次上限：压缩包
+  256MB、解压后 1GB），先写临时文件再 rename，落盘后用 `validate_db` 校验可加载，随后写入
+  `geoip_db` 设置并立即换库，无需重启。
+- 保存目录为数据库所在目录（默认 `./data/GeoLite2-City.mmdb`，`--db /tmp/x.db` 时为 `/tmp/GeoLite2-City.mmdb`）。
+- 控制台首页改为 `Cache-Control: no-store`，升级二进制后浏览器不会再继续使用旧界面。
+- 验证：实测下载返回 `{"ok":true,"path":"/tmp/GeoLite2-City.mmdb","enabled":true}`，文件 49MB，
+  `/api/settings/geoip_db` 已写入新路径；全量测试与 clippy 均通过。
+
 ---
 
 ## 下一步开发任务
