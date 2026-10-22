@@ -139,10 +139,7 @@ pub fn build_cert_map(
         if let Some(key) = load_global_cert(global)? {
             map.default = Some(key);
         } else {
-            map.default = certs
-                .first()
-                .and_then(|row| by_id.get(&row.id))
-                .cloned();
+            map.default = certs.first().and_then(|row| by_id.get(&row.id)).cloned();
         }
     }
 
@@ -211,7 +208,10 @@ mod tests {
 
     #[test]
     fn normalize_domain_variants() {
-        assert_eq!(normalize_domain(" Example.COM. ").as_deref(), Some("example.com"));
+        assert_eq!(
+            normalize_domain(" Example.COM. ").as_deref(),
+            Some("example.com")
+        );
         assert_eq!(normalize_domain(""), None);
         assert_eq!(normalize_domain("bad/domain"), None);
     }
@@ -240,9 +240,17 @@ mod tests {
         let key = dir.join("key.pem");
         let status = Command::new("openssl")
             .args([
-                "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
-                "-subj", "/CN=test.local",
-                "-addext", "subjectAltName=DNS:test.local,DNS:*.test.local",
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-days",
+                "1",
+                "-subj",
+                "/CN=test.local",
+                "-addext",
+                "subjectAltName=DNS:test.local,DNS:*.test.local",
                 "-keyout",
             ])
             .arg(&key)
@@ -280,8 +288,14 @@ mod tests {
         let map = build_cert_map(&[row], &[], &TlsConfig::default()).unwrap();
         assert!(!map.is_empty());
         assert!(map.resolve(Some("test.local")).is_some());
-        assert!(map.resolve(Some("a.test.local")).is_some(), "通配符应命中一级子域");
-        assert!(map.resolve(Some("a.b.test.local")).is_some(), "未命中时回落默认证书");
+        assert!(
+            map.resolve(Some("a.test.local")).is_some(),
+            "通配符应命中一级子域"
+        );
+        assert!(
+            map.resolve(Some("a.b.test.local")).is_some(),
+            "未命中时回落默认证书"
+        );
         assert!(map.resolve(None).is_some(), "无 SNI 时用默认证书");
     }
 

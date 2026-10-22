@@ -52,6 +52,10 @@ struct Slot {
     active: AtomicUsize,
     /// 标记 down 的时间（Unix 毫秒），用于半开恢复
     down_since_ms: AtomicU64,
+    /// 连续主动探测成功次数
+    active_ok: AtomicU32,
+    /// 连续主动探测失败次数
+    active_fail: AtomicU32,
 }
 
 impl Slot {
@@ -91,6 +95,8 @@ impl Slot {
             successes: AtomicU32::new(0),
             active: AtomicUsize::new(0),
             down_since_ms: AtomicU64::new(0),
+            active_ok: AtomicU32::new(0),
+            active_fail: AtomicU32::new(0),
         })
     }
 
@@ -212,11 +218,23 @@ impl UpstreamSet {
     }
 
     fn select(&self, client_ip: IpAddr, now_ms: u64, hc: &PassiveHealthCheck) -> Option<Selection> {
+        self.select_avoiding(client_ip, now_ms, hc, &[])
+    }
+
+    /// 与 [`select`] 相同，但跳过 `avoid` 里的槽位。
+    fn select_avoiding(
+        &self,
+        client_ip: IpAddr,
+        now_ms: u64,
+        hc: &PassiveHealthCheck,
+        avoid: &[usize],
+    ) -> Option<Selection> {
         let available: Vec<usize> = self
             .slots
             .iter()
             .enumerate()
             .filter(|(_, s)| s.is_available(now_ms, hc))
+            .filter(|(i, _)| !avoid.contains(i))
             .map(|(i, _)| i)
             .collect();
 
@@ -312,6 +330,30 @@ impl UpstreamPool {
             .unwrap_or(&app.default);
 
         set.select(client_ip, now_ms, &app.health)
+    }
+
+    /// 选一个上游，并跳过本次请求已经试过的上游。
+    ///
+    /// 重试时用：坏上游 + 好上游的场景下，第一次尝试的槽位即使还没被
+    /// 被动健康检查标记为 down，也不应该再选中一次。
+    pub fn select_retry(
+        &self,
+        app_index: usize,
+        route_index: Option<usize>,
+        client_ip: IpAddr,
+        now_ms: u64,
+        tried: &[usize],
+    ) -> Option<Selection> {
+        let app = self.apps.get(app_index)?;
+        let set = route_index
+            .and_then(|i| app.routes.get(i))
+            .and_then(|o| o.as_ref())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&app.default);
+
+        // 先排除已试过的；都试过了再退回普通选择，至少再试一次
+        set.select_avoiding(client_ip, now_ms, &app.health, tried)
+            .or_else(|| set.select(client_ip, now_ms, &app.health))
     }
 
     /// 标记某次请求失败（连接失败或 5xx）。
@@ -437,13 +479,27 @@ impl UpstreamPool {
         let Some(s) = app.default.slots.get(slot) else {
             return;
         };
+        // 连续阈值：单次探测抖动（例如负载下的 3s 超时）不应该直接摘除应用
+        let (ok_need, fail_need) = match &app.active {
+            Some(hc) => (hc.healthy_threshold.max(1), hc.unhealthy_threshold.max(1)),
+            None => (1, 1),
+        };
 
         if healthy {
-            s.state.store(HEALTHY, Ordering::Relaxed);
-            s.failures.store(0, Ordering::Relaxed);
+            s.active_fail.store(0, Ordering::Relaxed);
+            let ok = s.active_ok.fetch_add(1, Ordering::Relaxed) + 1;
+            if ok >= ok_need {
+                s.state.store(HEALTHY, Ordering::Relaxed);
+                s.failures.store(0, Ordering::Relaxed);
+                s.active_ok.store(0, Ordering::Relaxed);
+            }
         } else {
-            s.state.store(DOWN, Ordering::Relaxed);
-            s.down_since_ms.store(now_ms(), Ordering::Relaxed);
+            s.active_ok.store(0, Ordering::Relaxed);
+            let fail = s.active_fail.fetch_add(1, Ordering::Relaxed) + 1;
+            if fail >= fail_need {
+                s.state.store(DOWN, Ordering::Relaxed);
+                s.down_since_ms.store(now_ms(), Ordering::Relaxed);
+            }
         }
     }
 
@@ -526,11 +582,22 @@ pub fn probe(t: &ProbeTarget) -> bool {
     let agent: ureq::Agent = builder.build().into();
 
     match agent.get(&url).call() {
-        Ok(resp) => {
-            let code = resp.status().as_u16();
-            t.expect_status.is_empty() || t.expect_status.contains(&code)
-        }
+        Ok(resp) => healthy_status(resp.status().as_u16(), &t.expect_status),
+        // ureq 把 4xx/5xx 当成 Err(StatusCode)，不能一律判成不可达——
+        // 上游返回 404 说明它活着，只是没有这个路径。
+        Err(ureq::Error::StatusCode(code)) => healthy_status(code, &t.expect_status),
         Err(_) => false,
+    }
+}
+
+/// 探测拿到状态码后是否算健康。
+///
+/// `expect_status` 为空表示"任意非 5xx 都算可达"；配置了列表就严格比对。
+fn healthy_status(code: u16, expect: &[u16]) -> bool {
+    if expect.is_empty() {
+        code < 500
+    } else {
+        expect.contains(&code)
     }
 }
 
@@ -931,5 +998,58 @@ mod tests {
             snap.iter().any(|(addr, _)| addr == "nas.lan:443"),
             "https 默认 443，实际: {snap:?}"
         );
+    }
+
+    #[test]
+    fn probe_status_semantics() {
+        // 空列表 = 任意非 5xx 都算可达（雷池同步来的上游常只有 404 首页）
+        assert!(healthy_status(404, &[]));
+        assert!(healthy_status(200, &[]));
+        assert!(!healthy_status(500, &[]));
+        // 显式配置了列表就严格比对
+        assert!(healthy_status(404, &[404]));
+        assert!(!healthy_status(200, &[404]));
+    }
+
+    #[test]
+    fn active_probe_honors_thresholds() {
+        let mut app = app_with(vec![upstream("10.0.0.1", 80)], LbAlgorithm::RoundRobin);
+        app.health_check.active = Some(homewaf_config::ActiveHealthCheck {
+            enabled: true,
+            interval: homewaf_config::Duration::from_secs(5),
+            timeout: homewaf_config::Duration::from_secs(3),
+            path: "/".to_string(),
+            method: "GET".to_string(),
+            expect_status: Vec::new(),
+            healthy_threshold: 2,
+            unhealthy_threshold: 3,
+        });
+        let pool = UpstreamPool::build(&[app]);
+
+        // 连续两次失败还不够下线
+        pool.set_active_health(0, 0, false);
+        pool.set_active_health(0, 0, false);
+        assert_eq!(pool.down_count(0), 0, "未达 unhealthy_threshold 不该下线");
+        pool.set_active_health(0, 0, false);
+        assert_eq!(pool.down_count(0), 1, "达到阈值应下线");
+
+        // 恢复同样要连续两次成功
+        pool.set_active_health(0, 0, true);
+        assert_eq!(pool.down_count(0), 1, "未达 healthy_threshold 不该恢复");
+        pool.set_active_health(0, 0, true);
+        assert_eq!(pool.down_count(0), 0, "达到阈值应恢复");
+    }
+
+    #[test]
+    fn retry_selection_skips_tried_slot() {
+        let pool = UpstreamPool::build(&[app_with(
+            vec![upstream("10.0.0.1", 80), upstream("10.0.0.2", 80)],
+            LbAlgorithm::RoundRobin,
+        )]);
+        let first = pool.select(0, None, ip(), NOW).unwrap();
+        let second = pool
+            .select_retry(0, None, ip(), NOW, &[first.slot])
+            .unwrap();
+        assert_ne!(first.addr, second.addr, "重试应换一个上游");
     }
 }

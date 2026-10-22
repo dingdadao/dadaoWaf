@@ -23,8 +23,8 @@ pub use challenge::{ChallengeService, CHALLENGE_PATH, COOKIE_NAME};
 pub use custom_rule::{evaluate as evaluate_custom_rules, CustomDecision, RuleRequest};
 pub use headers::ForwardedCtx;
 pub use metrics::{
-    BucketSnapshot, Count as TrafficCount, DashboardData as TrafficDashboard, Point as TrafficPoint,
-    TrafficMetrics, TrafficSample,
+    BucketSnapshot, Count as TrafficCount, DashboardData as TrafficDashboard,
+    Point as TrafficPoint, TrafficMetrics, TrafficSample,
 };
 pub use policy::{EffectivePolicy, PolicySet};
 pub use realip::{ClientIp, IpSource};

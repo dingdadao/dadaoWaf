@@ -168,10 +168,7 @@ impl PathMatcher {
 /// 4. 处理 `.` 与 `..`（`..` 在栈空时忽略，不能跳出根）
 /// 5. 重新拼接，保留尾斜杠
 pub fn normalize_path(raw: &str) -> String {
-    let path_part = raw
-        .split(['?', '#'])
-        .next()
-        .unwrap_or("");
+    let path_part = raw.split(['?', '#']).next().unwrap_or("");
 
     let decoded = percent_decode(path_part);
     let trailing_slash = decoded.len() > 1 && decoded.ends_with('/');
@@ -353,7 +350,10 @@ mod tests {
     #[test]
     fn no_regex_prefix_beats_regex() {
         let m = PathMatcher::build(&[route("~ \\.php$"), route("^~ /static")], true).unwrap();
-        assert_eq!(m.lookup("/static/a.php"), Some((1, MatchKind::PrefixNoRegex)));
+        assert_eq!(
+            m.lookup("/static/a.php"),
+            Some((1, MatchKind::PrefixNoRegex))
+        );
     }
 
     #[test]

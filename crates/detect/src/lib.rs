@@ -19,9 +19,7 @@ use std::sync::Arc;
 pub use body::{should_inspect_content_type, BodyBuffer, DEFAULT_MAX_INSPECT_BYTES};
 pub use matcher::{Matcher, MatcherError};
 pub use normalize::{normalize, Normalized, MAX_DECODE_ROUNDS};
-pub use rule::{
-    Action, Category, Rule, RuleMeta, RuleSource, Severity, Target, BUILTIN_RULES,
-};
+pub use rule::{Action, Category, Rule, RuleMeta, RuleSource, Severity, Target, BUILTIN_RULES};
 pub use whitelist::{Exemption, WhitelistRule};
 
 /// 单个攻击分类的处置模式。
@@ -418,11 +416,18 @@ mod tests {
     fn header_injection_detected() {
         let v = engine().inspect(&InspectionInput {
             path: "/".to_string(),
-            headers: vec![("x-forwarded-for".to_string(), "1 union select 1".to_string())],
+            headers: vec![(
+                "x-forwarded-for".to_string(),
+                "1 union select 1".to_string(),
+            )],
             ..Default::default()
         });
         // 该规则目标不含 header，不应误判
-        assert!(v.is_clean(), "规则不覆盖 header 时不该命中: {:?}", v.rule_ids());
+        assert!(
+            v.is_clean(),
+            "规则不覆盖 header 时不该命中: {:?}",
+            v.rule_ids()
+        );
     }
 
     #[test]
@@ -487,7 +492,11 @@ mod tests {
         let mut policy = ScanPolicy::default();
         policy.set(Category::Sqli, CategoryMode::Off);
 
-        let v = engine().inspect_with_policy(&query("id=1 union select 1"), &Exemption::default(), &policy);
+        let v = engine().inspect_with_policy(
+            &query("id=1 union select 1"),
+            &Exemption::default(),
+            &policy,
+        );
         assert!(v.is_clean(), "关闭分类后不应记录: {:?}", v.rule_ids());
         assert!(!v.blocked);
     }
@@ -497,7 +506,11 @@ mod tests {
         let mut policy = ScanPolicy::default();
         policy.set(Category::Sqli, CategoryMode::Monitor);
 
-        let v = engine().inspect_with_policy(&query("id=1 union select 1"), &Exemption::default(), &policy);
+        let v = engine().inspect_with_policy(
+            &query("id=1 union select 1"),
+            &Exemption::default(),
+            &policy,
+        );
         assert!(!v.is_clean(), "监控模式仍要记录");
         assert!(v.score > 0);
         assert_eq!(v.blocking_score, 0, "监控模式不计入拦截分");
@@ -509,7 +522,11 @@ mod tests {
         let mut policy = ScanPolicy::default();
         policy.set(Category::Xss, CategoryMode::Off);
 
-        let v = engine().inspect_with_policy(&query("id=1 union select 1"), &Exemption::default(), &policy);
+        let v = engine().inspect_with_policy(
+            &query("id=1 union select 1"),
+            &Exemption::default(),
+            &policy,
+        );
         assert!(v.blocked, "关闭 XSS 不应影响 SQL 注入检测");
     }
 
@@ -520,7 +537,11 @@ mod tests {
             ..Default::default()
         };
 
-        let v = engine().inspect_with_policy(&query("id=1 union select 1"), &Exemption::default(), &policy);
+        let v = engine().inspect_with_policy(
+            &query("id=1 union select 1"),
+            &Exemption::default(),
+            &policy,
+        );
         assert!(!v.blocked);
         assert!(v.observe);
     }
@@ -530,7 +551,11 @@ mod tests {
         let mut policy = ScanPolicy::all_block(200);
         policy.observe = false;
 
-        let v = engine().inspect_with_policy(&query("id=1 union select 1"), &Exemption::default(), &policy);
+        let v = engine().inspect_with_policy(
+            &query("id=1 union select 1"),
+            &Exemption::default(),
+            &policy,
+        );
         assert!(!v.blocked, "阈值 200 时单条 High 不拦");
     }
 
@@ -541,7 +566,11 @@ mod tests {
             policy.set(c, CategoryMode::Off);
         }
         assert!(policy.all_off());
-        let v = engine().inspect_with_policy(&query("id=1 union select 1"), &Exemption::default(), &policy);
+        let v = engine().inspect_with_policy(
+            &query("id=1 union select 1"),
+            &Exemption::default(),
+            &policy,
+        );
         assert!(v.is_clean());
     }
 

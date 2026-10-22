@@ -276,18 +276,15 @@ fn convert_rule(def: RuleDefinition, feed_name: &str) -> Result<RuleMeta, RuleFe
         .ok_or_else(|| invalid(&id, format!("未知分类 `{}`", def.category)))?;
     let severity = Severity::parse(&def.severity)
         .ok_or_else(|| invalid(&id, format!("未知级别 `{}`", def.severity)))?;
-    let action =
-        Action::parse(&def.action).ok_or_else(|| invalid(&id, format!("未知动作 `{}`", def.action)))?;
+    let action = Action::parse(&def.action)
+        .ok_or_else(|| invalid(&id, format!("未知动作 `{}`", def.action)))?;
 
     let pattern = def.pattern.trim().to_string();
     if pattern.is_empty() {
         return Err(invalid(&id, "pattern 不能为空".to_string()));
     }
     if pattern.chars().count() > MAX_PATTERN_LEN {
-        return Err(invalid(
-            &id,
-            format!("pattern 超过 {MAX_PATTERN_LEN} 字符"),
-        ));
+        return Err(invalid(&id, format!("pattern 超过 {MAX_PATTERN_LEN} 字符")));
     }
     regex::Regex::new(&pattern).map_err(|e| invalid(&id, format!("正则非法：{e}")))?;
 
@@ -304,10 +301,7 @@ fn convert_rule(def: RuleDefinition, feed_name: &str) -> Result<RuleMeta, RuleFe
     }
 
     if def.keywords.len() > MAX_KEYWORDS {
-        return Err(invalid(
-            &id,
-            format!("keywords 超过 {MAX_KEYWORDS} 个"),
-        ));
+        return Err(invalid(&id, format!("keywords 超过 {MAX_KEYWORDS} 个")));
     }
     let mut keywords = Vec::with_capacity(def.keywords.len());
     for keyword in &def.keywords {
@@ -316,10 +310,7 @@ fn convert_rule(def: RuleDefinition, feed_name: &str) -> Result<RuleMeta, RuleFe
             return Err(invalid(&id, "keywords 不能包含空字符串".to_string()));
         }
         if keyword.chars().count() > MAX_KEYWORD_LEN {
-            return Err(invalid(
-                &id,
-                format!("关键词超过 {MAX_KEYWORD_LEN} 字符"),
-            ));
+            return Err(invalid(&id, format!("关键词超过 {MAX_KEYWORD_LEN} 字符")));
         }
         if !keywords.contains(&keyword) {
             keywords.push(keyword);
@@ -469,10 +460,7 @@ mod tests {
     }
 
     fn public_key_config(key: &Ed25519KeyPair) -> String {
-        format!(
-            "ed25519:{}",
-            encode_base64(key.public_key().as_ref())
-        )
+        format!("ed25519:{}", encode_base64(key.public_key().as_ref()))
     }
 
     fn signed_body(key: &Ed25519KeyPair, payload: &str) -> String {
@@ -573,12 +561,8 @@ rules:
         let (signature, _) = split_signature(&body).unwrap();
         let signature = signature.unwrap();
         let tampered = DOC.replace("evil-", "good-");
-        let err = verify_signature(
-            &public_key_config(&key),
-            tampered.as_bytes(),
-            &signature,
-        )
-        .unwrap_err();
+        let err = verify_signature(&public_key_config(&key), tampered.as_bytes(), &signature)
+            .unwrap_err();
         assert_eq!(err, RuleFeedError::BadSignature);
     }
 

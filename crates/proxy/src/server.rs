@@ -55,6 +55,10 @@ pub struct RequestCtx {
     pub route_index: Option<usize>,
     /// 选中的上游下标（用于回写健康状态）
     pub upstream_slot: Option<usize>,
+    /// 本次请求已经尝试过的上游下标，重试选路时跳过
+    pub tried_slots: Vec<usize>,
+    /// `upstream_peer` 被调用的次数（0 是首次，>0 表示重试）
+    pub upstream_attempts: u32,
     /// 是否选中的是备份上游
     pub upstream_backup: bool,
     /// 已解析的上游地址 `host:port`
@@ -344,6 +348,7 @@ impl ProxyHttp for WafProxy {
             cookie_header,
             content_type,
             content_length,
+            inspect_headers,
         ) = {
             let req = session.req_header();
             (
@@ -371,6 +376,23 @@ impl ProxyHttp for WafProxy {
                     .get("content-length")
                     .and_then(|v| v.to_str().ok())
                     .and_then(|v| v.parse::<u64>().ok()),
+                // 其余请求头交给 Header 类规则（Log4j、Shellshock 等都可能藏在任意头里）。
+                // host/cookie/user-agent 已单独作为检测目标，这里排除避免重复命中。
+                req.headers
+                    .iter()
+                    .filter(|(name, _)| {
+                        !matches!(
+                            name.as_str(),
+                            "host" | "cookie" | "user-agent" | "content-length"
+                        )
+                    })
+                    .map(|(name, value)| {
+                        (
+                            name.as_str().to_string(),
+                            String::from_utf8_lossy(value.as_bytes()).into_owned(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
             )
         };
 
@@ -409,6 +431,25 @@ impl ProxyHttp for WafProxy {
             return write_empty(session, 500).await;
         };
         ctx.app_id = app.id.clone();
+
+        // 规范化后的路径不应含控制字符。`%0d%0a` 之类会被解码出来，
+        // 继续转发时无法构造合法 URI（Pingora 报 invalid normalized uri），
+        // 最终以 500 结束——对外应明确拒绝成 400。
+        if hit
+            .normalized_path
+            .bytes()
+            .any(|b| b < 0x20 || b == 0x7f)
+        {
+            tracing::warn!(
+                target: "homewaf.security",
+
+                req = %ctx.request_id,
+                path = %hit.normalized_path,
+                "请求路径包含控制字符，拒绝"
+            );
+            ctx.blocked = true;
+            return write_empty(session, 400).await;
+        }
 
         // ACL：用还原后的真实 IP 判定，而不是直连 IP
         if let Some(ip) = ctx.client_ip {
@@ -836,9 +877,10 @@ impl ProxyHttp for WafProxy {
                 &homewaf_detect::InspectionInput {
                     path: hit.normalized_path.clone(),
                     query: query.clone(),
+                    body: None,
                     user_agent,
                     cookie: cookie_header,
-                    ..Default::default()
+                    headers: inspect_headers,
                 },
                 &exemption,
                 &policy.scan,
@@ -986,6 +1028,7 @@ impl ProxyHttp for WafProxy {
         };
 
         state.pool.acquire(hit.app_index, hit.route_index, sel.slot);
+        ctx.tried_slots.push(sel.slot);
 
         ctx.app_index = Some(hit.app_index);
         ctx.route_index = hit.route_index;
@@ -1130,11 +1173,47 @@ impl ProxyHttp for WafProxy {
     }
 
     /// 选择上游。
+    ///
+    /// 首次由 `request_filter` 选好；重试时这里重新选一个"本次请求还没试过"
+    /// 的上游。否则坏上游 + 好上游的场景会一直打同一个坏上游。
     async fn upstream_peer(
         &self,
         _session: &mut Session,
         ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
+        if ctx.upstream_attempts > 0 {
+            if let (Some(state), Some(app)) = (ctx.state.as_ref(), ctx.app_index) {
+                // 释放上一次占用的槽位，避免活跃连接数虚高影响 least_conn
+                if let Some(slot) = ctx.upstream_slot {
+                    state.pool.release(app, ctx.route_index, slot);
+                }
+                let client_ip = ctx
+                    .client_ip
+                    .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+                if let Some(sel) = state.pool.select_retry(
+                    app,
+                    ctx.route_index,
+                    client_ip,
+                    upstream::now_ms(),
+                    &ctx.tried_slots,
+                ) {
+                    state.pool.acquire(app, ctx.route_index, sel.slot);
+                    ctx.tried_slots.push(sel.slot);
+                    ctx.upstream_slot = Some(sel.slot);
+                    ctx.upstream_backup = sel.backup;
+                    ctx.upstream = Some(sel.addr);
+                    ctx.upstream_tls = sel.tls;
+                    ctx.upstream_sni = sel.sni;
+                    ctx.upstream_verify = sel.verify;
+                } else if let Some(last) = ctx.tried_slots.last().copied() {
+                    // 没有可选上游了，保留最后一个槽位，交给上层返回错误
+                    ctx.upstream_slot = Some(last);
+                    state.pool.acquire(app, ctx.route_index, last);
+                }
+            }
+        }
+        ctx.upstream_attempts += 1;
+
         let addr = ctx
             .upstream
             .clone()
@@ -1150,21 +1229,42 @@ impl ProxyHttp for WafProxy {
         Ok(Box::new(peer))
     }
 
-    /// 上游连接失败：只记日志，失败计数统一在 `logging` 里做。
+    /// 上游连接失败：记日志，并按应用的重试策略决定是否换一个上游重试。
     ///
-    /// 两个钩子都会在连接失败时触发，若各记一次会让 `fail_threshold` 实际减半。
+    /// 失败计数统一在 `logging` 里做：两个钩子都会在连接失败时触发，
+    /// 若各记一次会让 `fail_threshold` 实际减半。
+    ///
+    /// Pingora 的连接类错误默认不可重试（`RetryType` 取决于复用状态），
+    /// 这里必须显式 `set_retry(true)`，否则坏上游 + 好上游的配置会永远 502。
     fn fail_to_connect(
         &self,
-        _session: &mut Session,
+        session: &mut Session,
         _peer: &HttpPeer,
         ctx: &mut Self::CTX,
-        e: Box<pingora::Error>,
+        mut e: Box<pingora::Error>,
     ) -> Box<pingora::Error> {
         tracing::warn!(
             upstream = ctx.upstream.as_deref().unwrap_or("-"),
             error = %e,
             "上游连接失败"
         );
+
+        let retry = ctx
+            .app_index
+            .and_then(|i| ctx.state.as_ref()?.router.app(i))
+            .map(|app| {
+                let r = &app.retry;
+                let method = session.req_header().method.as_str();
+                r.enabled
+                    && r.on.contains(&homewaf_config::RetryCondition::ConnectError)
+                    && r.methods.iter().any(|m| m.eq_ignore_ascii_case(method))
+                    && ctx.upstream_attempts < r.attempts
+            })
+            .unwrap_or(false);
+
+        if retry {
+            e.set_retry(true);
+        }
         e
     }
 
@@ -1192,14 +1292,14 @@ impl ProxyHttp for WafProxy {
             (ctx.state.as_ref(), ctx.app_index, ctx.upstream_slot)
         {
             state.pool.release(app, ctx.route_index, slot);
-            let failed = e.is_some() || status >= 500;
-            if failed {
+            if counts_as_upstream_failure(e, status) {
                 state
                     .pool
                     .mark_failure(app, ctx.route_index, slot, upstream::now_ms());
-            } else {
+            } else if e.is_none() && status < 500 {
                 state.pool.mark_success(app, ctx.route_index, slot);
             }
+            // 其余（如上游提前关闭连接）：失败但不算上游不可用，不改变健康度
         }
 
         // 反代日志：只记真正走了上游的请求，含耗时与失败原因。
@@ -1265,6 +1365,30 @@ impl ProxyHttp for WafProxy {
             latency_us = elapsed_us,
             "request"
         );
+    }
+}
+
+/// 这次失败是否应计入上游健康度。
+///
+/// 只统计"上游真的不可用"：连接建立失败、TLS 握手失败、读写超时，
+/// 以及上游返回的 502/503/504。`ConnectionClosed` 常出现在上游对超大
+/// 请求体提前应答并断开连接时（例如直接回 404），把它算作不健康会让
+/// 整个应用被摘除一个 `window`，属于误杀。
+fn counts_as_upstream_failure(e: Option<&pingora::Error>, status: u16) -> bool {
+    match e {
+        Some(err) => matches!(
+            err.etype(),
+            pingora::ErrorType::ConnectTimedout
+                | pingora::ErrorType::ConnectRefused
+                | pingora::ErrorType::ConnectNoRoute
+                | pingora::ErrorType::ConnectError
+                | pingora::ErrorType::TLSHandshakeFailure
+                | pingora::ErrorType::TLSHandshakeTimedout
+                | pingora::ErrorType::InvalidCert
+                | pingora::ErrorType::ReadTimedout
+                | pingora::ErrorType::WriteTimedout
+        ),
+        None => status == 502 || status == 503 || status == 504,
     }
 }
 

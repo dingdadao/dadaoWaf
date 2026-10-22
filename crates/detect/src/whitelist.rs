@@ -88,7 +88,12 @@ pub fn compute(rules: &[WhitelistRule], app: &str, path: &str) -> Exemption {
 mod tests {
     use super::*;
 
-    fn rule(id: &str, app: Option<&str>, path: Option<&str>, rule_id: Option<&str>) -> WhitelistRule {
+    fn rule(
+        id: &str,
+        app: Option<&str>,
+        path: Option<&str>,
+        rule_id: Option<&str>,
+    ) -> WhitelistRule {
         WhitelistRule {
             id: id.to_string(),
             app: app.map(|s| s.to_string()),

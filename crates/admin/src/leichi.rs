@@ -14,9 +14,9 @@ use std::io::Read;
 use std::time::{Duration as StdDuration, Instant};
 
 use homewaf_config::{
-    AccessMode, ActiveHealthCheck, Application, CustomRule, Domains, HealthCheckConfig, LbAlgorithm,
-    LbConfig, ObserveMode, Policy, RuleCondition, Scheme, TlsMode, TlsModeConfig, Upstream,
-    UpstreamTlsConfig,
+    AccessMode, ActiveHealthCheck, Application, CustomRule, Domains, HealthCheckConfig,
+    LbAlgorithm, LbConfig, ObserveMode, Policy, RuleCondition, Scheme, TlsMode, TlsModeConfig,
+    Upstream, UpstreamTlsConfig,
 };
 use homewaf_store::Store;
 use serde::{Deserialize, Serialize};
@@ -176,12 +176,21 @@ pub fn sync(store: &Store, req: &SyncRequest) -> Result<SyncReport, String> {
 
     // 2. 证书（只有手动上传的才带私钥）
     let mut new_certs: Vec<NewCert> = Vec::new();
-    let certs = fetch_certs(&client, store, &mut report, req.preview, &mut new_certs, now);
+    let certs = fetch_certs(
+        &client,
+        store,
+        &mut report,
+        req.preview,
+        &mut new_certs,
+        now,
+    );
 
     // 3. 应用
-    let sites = client
-        .get("/open/site")
-        .and_then(|v| v.get("data").cloned().ok_or_else(|| "应用列表缺少 data".to_string()))?;
+    let sites = client.get("/open/site").and_then(|v| {
+        v.get("data")
+            .cloned()
+            .ok_or_else(|| "应用列表缺少 data".to_string())
+    })?;
     let sites = sites.as_array().cloned().unwrap_or_default();
     report.apps.total = sites.len();
     let mut apps: Vec<Application> = Vec::new();
@@ -213,9 +222,11 @@ pub fn sync(store: &Store, req: &SyncRequest) -> Result<SyncReport, String> {
     }
 
     // 4. 自定义规则
-    let policies = client
-        .get("/open/policy")
-        .and_then(|v| v.get("data").cloned().ok_or_else(|| "规则列表缺少 data".to_string()))?;
+    let policies = client.get("/open/policy").and_then(|v| {
+        v.get("data")
+            .cloned()
+            .ok_or_else(|| "规则列表缺少 data".to_string())
+    })?;
     let policies = policies.as_array().cloned().unwrap_or_default();
     report.rules.total = policies.len();
     let mut rules: Vec<CustomRule> = Vec::new();
@@ -225,7 +236,11 @@ pub fn sync(store: &Store, req: &SyncRequest) -> Result<SyncReport, String> {
                 report.items.push(format!(
                     "规则 {}（{}）",
                     rule.name,
-                    if rule.is_whitelist() { "白名单" } else { "黑名单" }
+                    if rule.is_whitelist() {
+                        "白名单"
+                    } else {
+                        "黑名单"
+                    }
                 ));
                 report.rules.imported += 1;
                 rules.push(rule);
@@ -338,7 +353,9 @@ fn fetch_ip_groups(client: &Client, report: &mut SyncReport) -> HashMap<i64, Vec
         let detail = match client.get(&format!("/open/ipgroup/detail?id={id}")) {
             Ok(v) => v,
             Err(e) => {
-                report.warnings.push(format!("读取 IP 组 {id} 详情失败：{e}"));
+                report
+                    .warnings
+                    .push(format!("读取 IP 组 {id} 详情失败：{e}"));
                 continue;
             }
         };
@@ -492,7 +509,10 @@ fn map_app(site: &Value) -> Result<Application, String> {
         return Err("没有域名".to_string());
     };
     if site.get("type").and_then(|v| v.as_i64()).unwrap_or(0) != 0
-        || site.get("static").and_then(|v| v.as_bool()).unwrap_or(false)
+        || site
+            .get("static")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
     {
         return Err("静态站点 / 重定向类型暂不支持自动同步".to_string());
     }
@@ -567,7 +587,10 @@ fn map_app(site: &Value) -> Result<Application, String> {
     }
 
     let mode = site.get("mode").and_then(|v| v.as_i64()).unwrap_or(0);
-    let enabled = site.get("is_enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+    let enabled = site
+        .get("is_enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
     let observe = if mode == 2 {
         ObserveMode {
             enabled: true,
@@ -581,7 +604,10 @@ fn map_app(site: &Value) -> Result<Application, String> {
         .and_then(|v| v.as_u64())
         .unwrap_or(60)
         .max(5);
-    let health = site.get("health_check").and_then(|v| v.as_bool()).unwrap_or(true);
+    let health = site
+        .get("health_check")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
     let load_type = site
         .get("load_balance")
         .and_then(|v| v.get("balance_type"))
@@ -595,7 +621,10 @@ fn map_app(site: &Value) -> Result<Application, String> {
     };
 
     Ok(Application {
-        id: format!("lei-{}", site.get("id").and_then(|v| v.as_i64()).unwrap_or(0)),
+        id: format!(
+            "lei-{}",
+            site.get("id").and_then(|v| v.as_i64()).unwrap_or(0)
+        ),
         name: site
             .get("title")
             .and_then(|v| v.as_str())
@@ -632,7 +661,10 @@ fn map_app(site: &Value) -> Result<Application, String> {
                     timeout: homewaf_config::Duration::from_secs(3),
                     path: "/".to_string(),
                     method: "GET".to_string(),
-                    expect_status: vec![200, 204, 301, 302],
+                    // 雷池自身把"能建立连接并返回任意非 5xx"视为健康，
+                    // 这里留空表示同样的语义；写死 200/204 会把只提供 404
+                    // 首页的上游误判为不健康。
+                    expect_status: Vec::new(),
                     healthy_threshold: 2,
                     unhealthy_threshold: 3,
                 }),

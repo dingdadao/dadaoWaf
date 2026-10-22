@@ -157,14 +157,10 @@ impl ScopeRules {
     /// 返回 Some 表示命中（白或黑），None 表示无规则。
     fn check(&self, ip: IpAddr) -> Option<Decision> {
         if let Some(r) = self.allow.lookup(ip) {
-            return Some(Decision::Allow(Reason::ManualAllow {
-                rule: r.id.clone(),
-            }));
+            return Some(Decision::Allow(Reason::ManualAllow { rule: r.id.clone() }));
         }
         if let Some(r) = self.deny.lookup(ip) {
-            return Some(Decision::Deny(Reason::ManualDeny {
-                rule: r.id.clone(),
-            }));
+            return Some(Decision::Deny(Reason::ManualDeny { rule: r.id.clone() }));
         }
         None
     }

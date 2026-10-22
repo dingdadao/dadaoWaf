@@ -120,7 +120,9 @@ mod tests {
     #[test]
     fn inspects_text_content_types() {
         assert!(should_inspect_content_type(Some("application/json")));
-        assert!(should_inspect_content_type(Some("application/x-www-form-urlencoded")));
+        assert!(should_inspect_content_type(Some(
+            "application/x-www-form-urlencoded"
+        )));
         assert!(should_inspect_content_type(Some("text/plain")));
         assert!(should_inspect_content_type(Some("application/xml")));
         assert!(should_inspect_content_type(None));
@@ -128,8 +130,12 @@ mod tests {
 
     #[test]
     fn skips_binary_content_types() {
-        assert!(!should_inspect_content_type(Some("multipart/form-data; boundary=x")));
-        assert!(!should_inspect_content_type(Some("application/octet-stream")));
+        assert!(!should_inspect_content_type(Some(
+            "multipart/form-data; boundary=x"
+        )));
+        assert!(!should_inspect_content_type(Some(
+            "application/octet-stream"
+        )));
         assert!(!should_inspect_content_type(Some("image/png")));
         assert!(!should_inspect_content_type(Some("video/mp4")));
         assert!(!should_inspect_content_type(Some("application/zip")));

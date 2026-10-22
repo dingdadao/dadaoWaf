@@ -35,11 +35,12 @@ impl DomainMatcher {
                 continue;
             }
             for domain in std::iter::once(&app.domains.primary).chain(app.domains.aliases.iter()) {
-                let normalized = normalize_host(domain).ok_or_else(|| BuildError::InvalidDomain {
-                    app: app.id.clone(),
-                    domain: domain.clone(),
-                    reason: "不是合法的域名".to_string(),
-                })?;
+                let normalized =
+                    normalize_host(domain).ok_or_else(|| BuildError::InvalidDomain {
+                        app: app.id.clone(),
+                        domain: domain.clone(),
+                        reason: "不是合法的域名".to_string(),
+                    })?;
 
                 if let Some(suffix) = normalized.strip_prefix("*.") {
                     wildcard.push((suffix.to_string(), index));
@@ -256,7 +257,10 @@ mod tests {
     #[test]
     fn exact_beats_wildcard() {
         let m = DomainMatcher::build(
-            &[app("wild", "*.home.lan", &[]), app("exact", "nas.home.lan", &[])],
+            &[
+                app("wild", "*.home.lan", &[]),
+                app("exact", "nas.home.lan", &[]),
+            ],
             false,
         )
         .unwrap();

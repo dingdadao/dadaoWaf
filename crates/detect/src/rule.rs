@@ -332,7 +332,7 @@ pub const BUILTIN_RULES: &[Rule] = &[
         name: "SQL 布尔恒真",
         category: Category::Sqli,
         severity: Severity::High,
-        pattern: r"\b(or|and)\b\s+\d+\s*=\s*\d+",
+        pattern: r#"(?i)\b(or|and)\b\s+['"]?\d{1,4}['"]?\s*=\s*['"]?\d{1,4}['"]?"#,
         targets: &[Target::Query, Target::Body],
         keywords: &["or", "and"],
         action: Action::Block,
@@ -377,7 +377,6 @@ pub const BUILTIN_RULES: &[Rule] = &[
         keywords: &["--", "#"],
         action: Action::Block,
     },
-
     // ==================== XSS ====================
     Rule {
         id: "xss-script-tag",
@@ -419,7 +418,6 @@ pub const BUILTIN_RULES: &[Rule] = &[
         keywords: &["<iframe", "<object", "<embed", "<svg"],
         action: Action::Block,
     },
-
     // ==================== 命令注入 ====================
     Rule {
         id: "cmdi-shell-separator",
@@ -441,7 +439,33 @@ pub const BUILTIN_RULES: &[Rule] = &[
         keywords: &["$("],
         action: Action::Block,
     },
-
+    // ==================== 已知 RCE 特征 ====================
+    Rule {
+        id: "log4j-jndi",
+        name: "Log4j JNDI 注入",
+        category: Category::CmdInjection,
+        severity: Severity::Critical,
+        pattern: r"(?i)\$\{jndi:(ldap|ldaps|rmi|dns|nis|http|iiop|corba|nds)s?://",
+        targets: &[
+            Target::Path,
+            Target::Query,
+            Target::Body,
+            Target::Header,
+            Target::UserAgent,
+        ],
+        keywords: &["${jndi:"],
+        action: Action::Block,
+    },
+    Rule {
+        id: "shellshock",
+        name: "Shellshock 环境变量注入",
+        category: Category::CmdInjection,
+        severity: Severity::Critical,
+        pattern: r"\(\s*\)\s*\{[^}]{0,80};",
+        targets: &[Target::Header, Target::UserAgent],
+        keywords: &["()"],
+        action: Action::Block,
+    },
     // ==================== 路径穿越 ====================
     Rule {
         id: "traversal-dotdot",
@@ -463,7 +487,6 @@ pub const BUILTIN_RULES: &[Rule] = &[
         keywords: &["passwd", "shadow", "win.ini", "boot.ini"],
         action: Action::Block,
     },
-
     // ==================== SSRF ====================
     Rule {
         id: "ssrf-cloud-metadata",
@@ -525,7 +548,6 @@ pub const BUILTIN_RULES: &[Rule] = &[
         keywords: &[".internal", ".local"],
         action: Action::Block,
     },
-
     // ==================== XXE ====================
     Rule {
         id: "xxe-doctype-system",
@@ -567,7 +589,6 @@ pub const BUILTIN_RULES: &[Rule] = &[
         keywords: &["php://"],
         action: Action::Block,
     },
-
     // ==================== Webshell ====================
     Rule {
         id: "webshell-eval-superglobal",
@@ -609,7 +630,6 @@ pub const BUILTIN_RULES: &[Rule] = &[
         keywords: &[".php", ".phtml", ".jsp", ".asp", ".cgi"],
         action: Action::Log,
     },
-
     // ==================== SSTI ====================
     Rule {
         id: "ssti-python-dunder",
@@ -618,7 +638,13 @@ pub const BUILTIN_RULES: &[Rule] = &[
         severity: Severity::Critical,
         pattern: r"\{\{[^}]{0,80}(__class__|__mro__|__subclasses__|__globals__|__builtins__|__import__)",
         targets: &[Target::Query, Target::Body],
-        keywords: &["__class__", "__mro__", "__subclasses__", "__globals__", "__import__"],
+        keywords: &[
+            "__class__",
+            "__mro__",
+            "__subclasses__",
+            "__globals__",
+            "__import__",
+        ],
         action: Action::Block,
     },
     Rule {
@@ -641,7 +667,6 @@ pub const BUILTIN_RULES: &[Rule] = &[
         keywords: &["${"],
         action: Action::Block,
     },
-
     // ==================== NoSQL 注入 ====================
     Rule {
         id: "nosql-where",
@@ -673,7 +698,6 @@ pub const BUILTIN_RULES: &[Rule] = &[
         keywords: &["$function", "$accumulator"],
         action: Action::Block,
     },
-
     // ==================== LDAP / XPath ====================
     Rule {
         id: "ldap-injection",
@@ -705,7 +729,6 @@ pub const BUILTIN_RULES: &[Rule] = &[
         keywords: &["]|//"],
         action: Action::Block,
     },
-
     // ==================== 文件包含 ====================
     Rule {
         id: "lfi-stream-wrapper",
@@ -727,7 +750,6 @@ pub const BUILTIN_RULES: &[Rule] = &[
         keywords: &["etc/passwd", "proc/self", "win.ini"],
         action: Action::Block,
     },
-
     // ==================== 反序列化 ====================
     Rule {
         id: "deser-php-object",
@@ -739,7 +761,6 @@ pub const BUILTIN_RULES: &[Rule] = &[
         keywords: &["O:"],
         action: Action::Block,
     },
-
     // ==================== 扫描器 ====================
     Rule {
         id: "scanner-user-agent",
@@ -789,7 +810,11 @@ mod tests {
     fn every_rule_has_targets_and_keywords() {
         for rule in BUILTIN_RULES {
             assert!(!rule.targets.is_empty(), "规则 {} 缺少检测目标", rule.id);
-            assert!(!rule.keywords.is_empty(), "规则 {} 缺少预过滤关键词", rule.id);
+            assert!(
+                !rule.keywords.is_empty(),
+                "规则 {} 缺少预过滤关键词",
+                rule.id
+            );
         }
     }
 }

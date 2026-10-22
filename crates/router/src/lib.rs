@@ -231,7 +231,9 @@ mod tests {
         )
         .unwrap();
 
-        let hit = router.resolve("nas.home.lan", 443, "/jellyfin/web").unwrap();
+        let hit = router
+            .resolve("nas.home.lan", 443, "/jellyfin/web")
+            .unwrap();
         assert_eq!(hit.app_index, 0);
         assert_eq!(hit.route_index, Some(1));
         assert_eq!(hit.normalized_path, "/jellyfin/web");
@@ -260,7 +262,9 @@ mod tests {
             false,
         )
         .unwrap();
-        let hit = router.resolve("nas.home.lan", 443, "//api/../admin/x").unwrap();
+        let hit = router
+            .resolve("nas.home.lan", 443, "//api/../admin/x")
+            .unwrap();
         assert_eq!(hit.normalized_path, "/admin/x");
         assert_eq!(hit.match_kind, Some(MatchKind::PrefixNoRegex));
     }

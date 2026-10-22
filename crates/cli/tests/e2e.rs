@@ -81,11 +81,8 @@ impl Proxy {
         let port = free_port();
 
         // 先把 YAML 导入临时数据库，再以数据库为唯一配置源启动
-        let db_path = std::env::temp_dir().join(format!(
-            "homewaf-e2e-{}-{}.db",
-            std::process::id(),
-            port
-        ));
+        let db_path =
+            std::env::temp_dir().join(format!("homewaf-e2e-{}-{}.db", std::process::id(), port));
         let _ = std::fs::remove_file(&db_path);
         let db = db_path.to_string_lossy().into_owned();
 
@@ -174,11 +171,8 @@ fn body_of(resp: &str) -> &str {
 
 /// 写一份临时配置，返回路径。
 fn write_config(name: &str, content: &str) -> String {
-    let path = std::env::temp_dir().join(format!(
-        "homewaf-e2e-{}-{}.yaml",
-        std::process::id(),
-        name
-    ));
+    let path =
+        std::env::temp_dir().join(format!("homewaf-e2e-{}-{}.yaml", std::process::id(), name));
     std::fs::write(&path, content).expect("写临时配置失败");
     path.to_string_lossy().into_owned()
 }

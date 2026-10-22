@@ -41,10 +41,7 @@ pub enum GuardOutcome {
     /// 全部通过
     Accepted(Vec<IpNet>),
     /// 部分条目因前缀过短被丢弃，其余可用
-    PartiallyAccepted {
-        entries: Vec<IpNet>,
-        dropped: usize,
-    },
+    PartiallyAccepted { entries: Vec<IpNet>, dropped: usize },
     /// 整批拒绝，应保留上一次的数据
     Rejected(String),
 }
@@ -184,9 +181,7 @@ pub fn apply_guards(
     let dropped = before - entries.len();
 
     if entries.is_empty() {
-        return GuardOutcome::Rejected(format!(
-            "过滤后无有效条目（{dropped} 条前缀过短被丢弃）"
-        ));
+        return GuardOutcome::Rejected(format!("过滤后无有效条目（{dropped} 条前缀过短被丢弃）"));
     }
 
     if entries.len() > guards.max_entries {
@@ -229,10 +224,7 @@ pub fn apply_guards(
 /// - `log` → 不产生规则（只记录，不拦截）
 ///
 /// 订阅的 `scope` 为空表示全局；否则每个应用各生成一份规则。
-pub fn rules_from_group(
-    group: &homewaf_config::IpGroup,
-    entries: &[IpNet],
-) -> Vec<AclRule> {
+pub fn rules_from_group(group: &homewaf_config::IpGroup, entries: &[IpNet]) -> Vec<AclRule> {
     use homewaf_config::IpGroupAction;
 
     let action = match group.action {
@@ -413,11 +405,7 @@ mod tests {
     fn guards_reject_oversized_feed() {
         let mut g = guards();
         g.max_entries = 2;
-        let entries = vec![
-            net("1.2.3.0/24"),
-            net("4.5.6.0/24"),
-            net("7.8.9.0/24"),
-        ];
+        let entries = vec![net("1.2.3.0/24"), net("4.5.6.0/24"), net("7.8.9.0/24")];
         let outcome = apply_guards(entries, &[], &g);
         assert!(outcome.is_rejected());
         let msg = match outcome {
@@ -509,7 +497,11 @@ mod tests {
     // 订阅 → ACL 规则
     // ============================================================
 
-    fn group(name: &str, action: homewaf_config::IpGroupAction, scope: &[&str]) -> homewaf_config::IpGroup {
+    fn group(
+        name: &str,
+        action: homewaf_config::IpGroupAction,
+        scope: &[&str],
+    ) -> homewaf_config::IpGroup {
         use homewaf_config::*;
         IpGroup {
             name: name.to_string(),

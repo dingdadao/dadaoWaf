@@ -44,6 +44,10 @@ pub struct AdminState {
     pub data_dir: std::path::PathBuf,
     /// 进程启动时间（Unix 秒），用于系统页展示运行时长
     pub started_at: i64,
+    /// 实际生效的明文监听地址（命令行覆盖后的值）
+    pub listen: Vec<String>,
+    /// 实际生效的 TLS 监听地址（命令行覆盖后的值）
+    pub tls_listen: Vec<String>,
 }
 
 type Ctx = Arc<AdminState>;
@@ -95,7 +99,10 @@ pub fn router(state: Ctx) -> Router {
         .route("/api/apps/{id}/enabled", post(set_app_enabled))
         .route("/api/apps/{id}/features", post(set_app_features))
         .route("/api/apps/{id}/tamper", get(get_app_tamper))
-        .route("/api/apps/{id}/tamper/baseline", post(build_app_tamper_baseline))
+        .route(
+            "/api/apps/{id}/tamper/baseline",
+            post(build_app_tamper_baseline),
+        )
         .route("/api/apps/{id}/tamper/scan", post(scan_app_tamper))
         .route("/api/rules", get(list_rules).post(upsert_rule))
         .route("/api/rules/{id}", delete(delete_rule))
@@ -112,10 +119,7 @@ pub fn router(state: Ctx) -> Router {
             get(list_rule_feeds).post(upsert_rule_feed),
         )
         .route("/api/rule-feeds/{name}", delete(delete_rule_feed))
-        .route(
-            "/api/rule-feeds/{name}/refresh",
-            post(refresh_rule_feed),
-        )
+        .route("/api/rule-feeds/{name}/refresh", post(refresh_rule_feed))
         .route("/api/whitelist", get(list_whitelist).post(upsert_whitelist))
         .route("/api/whitelist/{id}", delete(delete_whitelist))
         .route("/api/certs", get(list_certs).post(create_cert))
@@ -123,7 +127,10 @@ pub fn router(state: Ctx) -> Router {
         .route("/api/certs/{id}/default", post(set_default_cert))
         .route("/api/api-token", get(get_api_token).post(rotate_api_token))
         // 兼容长亭雷池的远程证书部署接口（第三方用 X-SLCE-API-Token 鉴权）
-        .route("/api/CertAPI", get(slce_list_certs).delete(slce_delete_cert))
+        .route(
+            "/api/CertAPI",
+            get(slce_list_certs).delete(slce_delete_cert),
+        )
         .route("/api/UploadSSLCertAPI", post(slce_upload_cert))
         .route("/api/settings", get(get_all_settings))
         .route("/api/settings/{key}", get(get_setting).put(put_setting))
@@ -384,10 +391,13 @@ fn attack_categories(
         .unwrap_or_default()
     {
         for rule in rules.split(',').filter(|s| !s.is_empty()) {
-            let category = rule_categories
-                .get(rule)
-                .copied()
-                .unwrap_or_else(|| if rule.starts_with("cc-") { "cc" } else { "other" });
+            let category = rule_categories.get(rule).copied().unwrap_or_else(|| {
+                if rule.starts_with("cc-") {
+                    "cc"
+                } else {
+                    "other"
+                }
+            });
             *counts.entry(category).or_insert(0) += 1;
         }
     }
@@ -527,7 +537,8 @@ async fn geo_stats(
             .unwrap_or_default();
         geo_stats_from(&ctx.geoip, &pairs)
     } else {
-        ctx.geoip.resolve(&ctx.metrics.dashboard(range, app, now).ips)
+        ctx.geoip
+            .resolve(&ctx.metrics.dashboard(range, app, now).ips)
     };
     Json(stats).into_response()
 }
@@ -756,11 +767,7 @@ async fn attack_overview(
         .event_series_counts(since, until, group)
         .unwrap_or_default()
         .into_iter()
-        .map(|(ts, total, blocked)| AttackPoint {
-            ts,
-            total,
-            blocked,
-        })
+        .map(|(ts, total, blocked)| AttackPoint { ts, total, blocked })
         .collect::<Vec<_>>();
     let actions = ctx
         .store
@@ -987,7 +994,11 @@ async fn report_csv(
 
     let mut out = String::with_capacity(4_096);
     out.push('\u{feff}');
-    out.push_str(&format!("防护报告,{},{}\r\n\r\n", r.date, r.app.as_deref().unwrap_or("全部应用")));
+    out.push_str(&format!(
+        "防护报告,{},{}\r\n\r\n",
+        r.date,
+        r.app.as_deref().unwrap_or("全部应用")
+    ));
     out.push_str("指标,值\r\n");
     out.push_str(&format!("请求数,{}\r\n", r.totals.requests));
     out.push_str(&format!("页面浏览量,{}\r\n", r.totals.pv));
@@ -1058,10 +1069,7 @@ async fn report_csv(
                 axum::http::header::CONTENT_DISPOSITION,
                 format!("attachment; filename=\"{filename}\""),
             ),
-            (
-                axum::http::header::CACHE_CONTROL,
-                "no-store".to_string(),
-            ),
+            (axum::http::header::CACHE_CONTROL, "no-store".to_string()),
         ],
         out,
     )
@@ -1157,11 +1165,7 @@ async fn screen(State(ctx): State<Ctx>, headers: HeaderMap) -> Response {
         .traffic_series(since_30d, now + 86_400, None, 86_400)
         .unwrap_or_default();
     let mut daily: std::collections::BTreeMap<i64, usize> = std::collections::BTreeMap::new();
-    for (day, _kind, n) in ctx
-        .store
-        .daily_event_counts(since_30d)
-        .unwrap_or_default()
-    {
+    for (day, _kind, n) in ctx.store.daily_event_counts(since_30d).unwrap_or_default() {
         *daily.entry(day).or_insert(0) += n;
     }
     let attack_trend: Vec<NameCount> = daily
@@ -1234,11 +1238,7 @@ async fn list_apps(State(ctx): State<Ctx>, headers: HeaderMap) -> Response {
 }
 
 /// 单个应用详情：完整配置 + 上游健康状态 + 最近 24 小时概况。
-async fn get_app(
-    State(ctx): State<Ctx>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-) -> Response {
+async fn get_app(State(ctx): State<Ctx>, headers: HeaderMap, Path(id): Path<String>) -> Response {
     if !authorized(&ctx, &headers) {
         return unauthorized();
     }
@@ -1429,11 +1429,10 @@ async fn build_app_tamper_baseline(
         Ok(v) => v,
         Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
     };
-    if let Err(e) = ctx.store.replace_tamper_baseline(
-        &id,
-        &entries,
-        homewaf_acl::now_unix(),
-    ) {
+    if let Err(e) = ctx
+        .store
+        .replace_tamper_baseline(&id, &entries, homewaf_acl::now_unix())
+    {
         return internal(e).into_response();
     }
     if let Err(e) = reload_state(&ctx) {
@@ -1486,12 +1485,16 @@ async fn scan_app_tamper(
         if !homewaf_proxy::tamper::should_record(&id, &change.path) {
             continue;
         }
-        let event = homewaf_store::Event::new(homewaf_acl::now_unix(), homewaf_store::EventKind::Detect, "")
-            .with_app(id.clone())
-            .with_path(change.path.clone())
-            .with_rules(format!("tamper-{}", change.kind))
-            .with_score(100)
-            .with_action(action.to_string());
+        let event = homewaf_store::Event::new(
+            homewaf_acl::now_unix(),
+            homewaf_store::EventKind::Detect,
+            "",
+        )
+        .with_app(id.clone())
+        .with_path(change.path.clone())
+        .with_rules(format!("tamper-{}", change.kind))
+        .with_score(100)
+        .with_action(action.to_string());
         if let Err(e) = ctx.store.insert_event(&event) {
             tracing::warn!(error = %e, "写入防篡改扫描事件失败");
         }
@@ -1516,6 +1519,14 @@ async fn upsert_app(
     }
 
     let now = homewaf_acl::now_unix();
+    // 回滚用的旧快照：reload 失败说明这份配置会让整体加载不了，
+    // 留在库里会污染后续每一次热重载，必须恢复原状。
+    let previous = ctx
+        .store
+        .list_applications::<Application>()
+        .ok()
+        .and_then(|list| list.into_iter().find(|a| a.id == app.id));
+
     if let Err(e) =
         ctx.store
             .upsert_application(&app.id, &app.domains.primary, app.enabled, &app, now)
@@ -1525,11 +1536,28 @@ async fn upsert_app(
 
     match reload_state(&ctx) {
         Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            format!("已写入数据库，但重载失败：{e}"),
-        )
-            .into_response(),
+        Err(e) => {
+            let rollback = match previous {
+                Some(prev) => ctx.store.upsert_application(
+                    &prev.id,
+                    &prev.domains.primary,
+                    prev.enabled,
+                    &prev,
+                    now,
+                ),
+                None => ctx.store.delete_application(&app.id).map(|_| ()),
+            };
+            // 回滚后再加载一次，尽量让运行态回到可用配置
+            let restore = reload_state(&ctx).err();
+            let mut msg = format!("配置无效，已回滚：{e}");
+            if let Err(re) = rollback {
+                msg.push_str(&format!("；回滚失败：{re}"));
+            }
+            if let Some(re) = restore {
+                msg.push_str(&format!("；回滚后重载失败：{re}"));
+            }
+            (StatusCode::BAD_REQUEST, msg).into_response()
+        }
     }
 }
 
@@ -1556,8 +1584,7 @@ fn validate_app(ctx: &AdminState, app: &Application) -> Result<(), String> {
         return Err("别名域名最多 10 个".into());
     }
     for (i, alias) in app.domains.aliases.iter().enumerate() {
-        homewaf_config::validate_domain(alias)
-            .map_err(|e| format!("别名 {} 非法：{e}", i + 1))?;
+        homewaf_config::validate_domain(alias).map_err(|e| format!("别名 {} 非法：{e}", i + 1))?;
     }
 
     if app.listen_ports.contains(&0) {
@@ -1584,7 +1611,10 @@ fn validate_app(ctx: &AdminState, app: &Application) -> Result<(), String> {
             }
             let root = std::path::Path::new(app.static_site.root.trim());
             if !root.is_dir() {
-                return Err(format!("静态站点根目录不存在或不是目录：{}", root.display()));
+                return Err(format!(
+                    "静态站点根目录不存在或不是目录：{}",
+                    root.display()
+                ));
             }
         }
         homewaf_config::AccessMode::Redirect => {
@@ -1623,18 +1653,18 @@ fn validate_app(ctx: &AdminState, app: &Application) -> Result<(), String> {
     Ok(())
 }
 
-async fn delete_app(State(ctx): State<Ctx>, headers: HeaderMap, Path(id): Path<String>) -> Response {
+async fn delete_app(
+    State(ctx): State<Ctx>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
     if !authorized(&ctx, &headers) {
         return unauthorized();
     }
     match ctx.store.delete_application(&id) {
         Ok(true) => match reload_state(&ctx) {
             Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
-            Err(e) => (
-                StatusCode::BAD_REQUEST,
-                format!("已删除，但重载失败：{e}"),
-            )
-                .into_response(),
+            Err(e) => (StatusCode::BAD_REQUEST, format!("已删除，但重载失败：{e}")).into_response(),
         },
         Ok(false) => (StatusCode::NOT_FOUND, "应用不存在").into_response(),
         Err(e) => internal(e).into_response(),
@@ -1696,7 +1726,11 @@ async fn upsert_rule(
                     "相同规则已存在（{}）：{} → {}",
                     dup.id,
                     dup.cidr,
-                    if dup.action == "allow" { "放行" } else { "拒绝" }
+                    if dup.action == "allow" {
+                        "放行"
+                    } else {
+                        "拒绝"
+                    }
                 ),
             )
                 .into_response();
@@ -1724,11 +1758,7 @@ async fn upsert_rule(
 
     match reload_state(&ctx) {
         Ok(()) => Json(serde_json::json!({"ok": true, "id": row.id})).into_response(),
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            format!("已写入，但重载失败：{e}"),
-        )
-            .into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, format!("已写入，但重载失败：{e}")).into_response(),
     }
 }
 
@@ -1743,11 +1773,7 @@ async fn delete_rule(
     match ctx.store.delete_acl_rule(&id) {
         Ok(true) => match reload_state(&ctx) {
             Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
-            Err(e) => (
-                StatusCode::BAD_REQUEST,
-                format!("已删除，但重载失败：{e}"),
-            )
-                .into_response(),
+            Err(e) => (StatusCode::BAD_REQUEST, format!("已删除，但重载失败：{e}")).into_response(),
         },
         Ok(false) => (StatusCode::NOT_FOUND, "规则不存在").into_response(),
         Err(e) => internal(e).into_response(),
@@ -1986,10 +2012,7 @@ async fn export_events(
                 axum::http::header::CONTENT_DISPOSITION,
                 format!("attachment; filename=\"{filename}\""),
             ),
-            (
-                axum::http::header::CACHE_CONTROL,
-                "no-store".to_string(),
-            ),
+            (axum::http::header::CACHE_CONTROL, "no-store".to_string()),
         ],
         out,
     )
@@ -2073,7 +2096,9 @@ async fn list_logs(
 
     let kind = match q.kind.as_str() {
         "access" | "upstream" | "security" | "error" => q.kind.as_str(),
-        other => return (StatusCode::BAD_REQUEST, format!("未知日志类型 `{other}`")).into_response(),
+        other => {
+            return (StatusCode::BAD_REQUEST, format!("未知日志类型 `{other}`")).into_response()
+        }
     };
 
     // 找该类型下最新的日志文件（按文件名倒序，文件名带日期）
@@ -2261,11 +2286,7 @@ async fn put_setting(
             } else {
                 "回滚失败，请手动检查数据库"
             };
-            (
-                StatusCode::BAD_REQUEST,
-                format!("配置不合法，{hint}：{e}"),
-            )
-                .into_response()
+            (StatusCode::BAD_REQUEST, format!("配置不合法，{hint}：{e}")).into_response()
         }
     }
 }
@@ -2372,8 +2393,8 @@ async fn system_info(State(ctx): State<Ctx>, headers: HeaderMap) -> Response {
         "started_at": ctx.started_at,
         "now": now,
         "uptime_secs": (now - ctx.started_at).max(0),
-        "listen": state.server.listen,
-        "tls_listen": state.server.tls_listen,
+        "listen": &ctx.listen,
+        "tls_listen": &ctx.tls_listen,
         "admin_listen": state.server.admin.listen,
         "workers": state.server.workers,
         "apps": apps,
@@ -2556,7 +2577,10 @@ async fn import_custom_rules(
         if rule.action > 1 {
             return (
                 StatusCode::BAD_REQUEST,
-                format!("第 {} 条规则的 action 只能是 0（白名单）或 1（黑名单）", i + 1),
+                format!(
+                    "第 {} 条规则的 action 只能是 0（白名单）或 1（黑名单）",
+                    i + 1
+                ),
             )
                 .into_response();
         }
@@ -2810,11 +2834,7 @@ async fn delete_feed(
     match ctx.store.delete_ip_group(&name) {
         Ok(true) => match reload_state(&ctx) {
             Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
-            Err(e) => (
-                StatusCode::BAD_REQUEST,
-                format!("已删除，但重载失败：{e}"),
-            )
-                .into_response(),
+            Err(e) => (StatusCode::BAD_REQUEST, format!("已删除，但重载失败：{e}")).into_response(),
         },
         Ok(false) => (StatusCode::NOT_FOUND, "订阅不存在").into_response(),
         Err(e) => internal(e).into_response(),
@@ -2981,11 +3001,7 @@ async fn delete_rule_feed(
         Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
         Err(e) => {
             let _ = save_rule_feed_configs(&ctx, &old);
-            (
-                StatusCode::BAD_REQUEST,
-                format!("已删除，但重载失败：{e}"),
-            )
-                .into_response()
+            (StatusCode::BAD_REQUEST, format!("已删除，但重载失败：{e}")).into_response()
         }
     }
 }
@@ -3151,11 +3167,7 @@ async fn upsert_whitelist(
 
     match reload_state(&ctx) {
         Ok(()) => Json(serde_json::json!({"ok": true, "id": row.id})).into_response(),
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            format!("已保存，但重载失败：{e}"),
-        )
-            .into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, format!("已保存，但重载失败：{e}")).into_response(),
     }
 }
 
@@ -3170,11 +3182,7 @@ async fn delete_whitelist(
     match ctx.store.delete_whitelist(&id) {
         Ok(true) => match reload_state(&ctx) {
             Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
-            Err(e) => (
-                StatusCode::BAD_REQUEST,
-                format!("已删除，但重载失败：{e}"),
-            )
-                .into_response(),
+            Err(e) => (StatusCode::BAD_REQUEST, format!("已删除，但重载失败：{e}")).into_response(),
         },
         Ok(false) => (StatusCode::NOT_FOUND, "白名单不存在").into_response(),
         Err(e) => internal(e).into_response(),
@@ -3221,9 +3229,7 @@ fn cert_view(row: &CertificateRow) -> CertView {
     } else {
         split_domains(&row.domains)
     };
-    let (issuer, serial) = info
-        .map(|i| (i.issuer, i.serial))
-        .unwrap_or_default();
+    let (issuer, serial) = info.map(|i| (i.issuer, i.serial)).unwrap_or_default();
     CertView {
         id: row.id,
         name: row.name.clone(),
@@ -3291,11 +3297,7 @@ async fn update_cert(
     }
 }
 
-async fn delete_cert(
-    State(ctx): State<Ctx>,
-    headers: HeaderMap,
-    Path(id): Path<i64>,
-) -> Response {
+async fn delete_cert(State(ctx): State<Ctx>, headers: HeaderMap, Path(id): Path<i64>) -> Response {
     if !authorized(&ctx, &headers) {
         return unauthorized();
     }
@@ -3345,11 +3347,7 @@ fn delete_cert_inner(ctx: &AdminState, id: i64) -> Result<(), ApiError> {
 }
 
 /// 校验并保存一张证书。`id` 为 `Some` 时更新，否则新增。
-fn save_cert(
-    ctx: &AdminState,
-    id: Option<i64>,
-    body: CertUploadBody,
-) -> Result<i64, ApiError> {
+fn save_cert(ctx: &AdminState, id: Option<i64>, body: CertUploadBody) -> Result<i64, ApiError> {
     let existing = match id {
         Some(i) => ctx.store.get_certificate(i).map_err(internal)?,
         None => None,
@@ -3590,11 +3588,7 @@ struct ParsedUpload {
 }
 
 /// 雷池兼容：`POST /api/UploadSSLCertAPI`（multipart 或 JSON）
-async fn slce_upload_cert(
-    State(ctx): State<Ctx>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
+async fn slce_upload_cert(State(ctx): State<Ctx>, headers: HeaderMap, body: Bytes) -> Response {
     if !api_token_ok(&ctx, &headers) {
         return slce_err(StatusCode::UNAUTHORIZED, "invalid api token");
     }
@@ -3693,7 +3687,7 @@ fn reload_state_with(ctx: &AdminState, force_rule_feeds: bool) -> Result<(), Str
 mod tests {
     use super::*;
     use homewaf_config::{
-        AclConfig, AutoBanConfig, Application, Domains, Duration, FeedChannel, RealIpConfig,
+        AclConfig, Application, AutoBanConfig, Domains, Duration, FeedChannel, RealIpConfig,
         RuleFeed, Scheme, Size, TlsModeConfig, Upstream,
     };
 
@@ -3737,6 +3731,8 @@ mod tests {
             log_dir: std::env::temp_dir(),
             data_dir: std::env::temp_dir(),
             started_at: 0,
+            listen: vec!["0.0.0.0:80".to_string()],
+            tls_listen: Vec::new(),
         }
     }
 
@@ -3862,7 +3858,13 @@ mod tests {
     fn duplicate_domain_rejected() {
         let st = state();
         st.store
-            .upsert_application("other", "nas.home.lan", true, &app("other", "nas.home.lan"), 0)
+            .upsert_application(
+                "other",
+                "nas.home.lan",
+                true,
+                &app("other", "nas.home.lan"),
+                0,
+            )
             .unwrap();
 
         let err = validate_app(&st, &app("nas", "nas.home.lan")).unwrap_err();
@@ -3874,7 +3876,9 @@ mod tests {
         let st = state();
         let mut other = app("other", "other.lan");
         other.domains.aliases = vec!["shared.lan".to_string()];
-        st.store.upsert_application("other", "other.lan", true, &other, 0).unwrap();
+        st.store
+            .upsert_application("other", "other.lan", true, &other, 0)
+            .unwrap();
 
         let mut mine = app("nas", "nas.lan");
         mine.domains.aliases = vec!["shared.lan".to_string()];
@@ -3886,7 +3890,9 @@ mod tests {
     fn self_update_does_not_conflict() {
         let st = state();
         let a = app("nas", "nas.home.lan");
-        st.store.upsert_application("nas", "nas.home.lan", true, &a, 0).unwrap();
+        st.store
+            .upsert_application("nas", "nas.home.lan", true, &a, 0)
+            .unwrap();
         // 更新自己时不应报域名冲突
         assert!(validate_app(&st, &a).is_ok());
     }
@@ -3951,9 +3957,7 @@ mod tests {
             max_size: Size::from_bytes(4 * 1024 * 1024),
             headers: std::collections::BTreeMap::new(),
             require_signature: true,
-            public_key: Some(
-                "ed25519:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string(),
-            ),
+            public_key: Some("ed25519:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string()),
             shadow_period: None,
             rollback_on_error: true,
             pinned_version: None,
@@ -4030,7 +4034,10 @@ mod tests {
     fn feed_action_parsed() {
         let mut f = feed("x", "https://a.com/l");
         f.action = Some("log".to_string());
-        assert_eq!(build_group(&f).unwrap().action, homewaf_config::IpGroupAction::Log);
+        assert_eq!(
+            build_group(&f).unwrap().action,
+            homewaf_config::IpGroupAction::Log
+        );
 
         f.action = Some("challenge".to_string());
         assert_eq!(
@@ -4226,7 +4233,10 @@ mod tests {
             ])
             .unwrap();
 
-        assert_eq!(build_report(&st, day, Some("nas")).unwrap().totals.requests, 5);
+        assert_eq!(
+            build_report(&st, day, Some("nas")).unwrap().totals.requests,
+            5
+        );
         assert_eq!(build_report(&st, day, None).unwrap().totals.requests, 12);
     }
 }

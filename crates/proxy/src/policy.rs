@@ -7,8 +7,8 @@
 //! 不应该把应用的检测开关和限流阈值一起丢掉。
 
 use homewaf_config::{
-    Application, LimitsConfig, Policy, Preset, ProtectionConfig, RateLimitAction,
-    RateLimitConfig, Toggle,
+    Application, LimitsConfig, Policy, Preset, ProtectionConfig, RateLimitAction, RateLimitConfig,
+    Toggle,
 };
 use homewaf_detect::{Category, CategoryMode, ScanPolicy};
 use ipnet::IpNet;
@@ -116,7 +116,11 @@ impl PolicySet {
     }
 
     /// 命中的路由策略；未命中路由时回退到应用默认策略。
-    pub fn resolve(&self, app_index: usize, route_index: Option<usize>) -> Option<&EffectivePolicy> {
+    pub fn resolve(
+        &self,
+        app_index: usize,
+        route_index: Option<usize>,
+    ) -> Option<&EffectivePolicy> {
         let app = self.apps.get(app_index)?;
         match route_index {
             Some(i) => self
@@ -318,9 +322,7 @@ fn toggle_for(p: &ProtectionConfig, category: Category) -> Option<Toggle> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use homewaf_config::{
-        Domains, Policy, Route, Size, TlsModeConfig, Upstream,
-    };
+    use homewaf_config::{Domains, Policy, Route, Size, TlsModeConfig, Upstream};
 
     fn upstream() -> Upstream {
         Upstream {
@@ -412,7 +414,11 @@ mod tests {
         );
         let p = set.app(0).unwrap();
         assert_eq!(p.scan.mode(Category::Sqli), CategoryMode::Off);
-        assert_eq!(p.scan.mode(Category::Xss), CategoryMode::Block, "其他分类继承全局");
+        assert_eq!(
+            p.scan.mode(Category::Xss),
+            CategoryMode::Block,
+            "其他分类继承全局"
+        );
     }
 
     #[test]
@@ -442,7 +448,10 @@ mod tests {
             &LimitsConfig::default(),
         );
 
-        assert_eq!(set.app(0).unwrap().scan.mode(Category::Sqli), CategoryMode::Off);
+        assert_eq!(
+            set.app(0).unwrap().scan.mode(Category::Sqli),
+            CategoryMode::Off
+        );
         assert_eq!(
             set.resolve(0, Some(0)).unwrap().scan.mode(Category::Sqli),
             CategoryMode::Block,

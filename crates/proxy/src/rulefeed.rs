@@ -118,8 +118,7 @@ pub fn load_rule_feeds(
 ) -> RuleFeedLoad {
     let mut rules = Vec::new();
     let mut statuses = Vec::new();
-    let mut used_ids: HashSet<String> =
-        BUILTIN_RULES.iter().map(|r| r.id.to_string()).collect();
+    let mut used_ids: HashSet<String> = BUILTIN_RULES.iter().map(|r| r.id.to_string()).collect();
 
     for feed in feeds {
         let cached = cache.load(&feed.name);
@@ -298,15 +297,18 @@ pub fn load_rule_feeds(
 
 /// 是否有启用的订阅到了检查时间。调度器用它避免无意义的重载。
 pub fn rule_feeds_due(feeds: &[RuleFeed], cache: &dyn RuleFeedCache, now: i64) -> bool {
-    feeds.iter().filter(|f| f.enabled && f.auto_update).any(|f| {
-        let Some(cached) = cache.load(&f.name) else {
-            return true;
-        };
-        let next = cached
-            .fetched_at
-            .saturating_add(f.check_interval.as_secs() as i64);
-        now >= next && within_update_window(now, f.update_window.as_deref())
-    })
+    feeds
+        .iter()
+        .filter(|f| f.enabled && f.auto_update)
+        .any(|f| {
+            let Some(cached) = cache.load(&f.name) else {
+                return true;
+            };
+            let next = cached
+                .fetched_at
+                .saturating_add(f.check_interval.as_secs() as i64);
+            now >= next && within_update_window(now, f.update_window.as_deref())
+        })
 }
 
 /// 从数据库读取订阅配置。
@@ -323,10 +325,7 @@ struct FetchedPackage {
     signature_ok: bool,
 }
 
-fn fetch_package(
-    feed: &RuleFeed,
-    fetcher: &dyn RuleFeedFetcher,
-) -> Result<FetchedPackage, String> {
+fn fetch_package(feed: &RuleFeed, fetcher: &dyn RuleFeedFetcher) -> Result<FetchedPackage, String> {
     let raw = fetcher.fetch(feed)?;
     let (signature, payload) = feed::split_signature(&raw).map_err(|e| e.to_string())?;
 
@@ -377,9 +376,7 @@ fn check_release(feed: &RuleFeed, parsed: &feed::ParsedRuleFeed) -> Result<(), S
         Some("stable") => Ok(()),
         Some("beta") if feed.channel == FeedChannel::Beta => Ok(()),
         Some("beta") => Err("远端是 beta 通道，稳定通道订阅不会自动升级".to_string()),
-        Some(other) if !other.is_empty() => {
-            Err(format!("远端声明了未知通道 `{other}`"))
-        }
+        Some(other) if !other.is_empty() => Err(format!("远端声明了未知通道 `{other}`")),
         _ => Ok(()),
     }
 }
@@ -579,8 +576,7 @@ mod tests {
         let loaded = load_rule_feeds(&[f], &cache, &fetcher, true, NOW);
         assert!(loaded.rules.is_empty());
         assert_eq!(loaded.statuses[0].source, "none");
-        assert!(loaded
-            .statuses[0]
+        assert!(loaded.statuses[0]
             .error
             .as_deref()
             .unwrap()
@@ -607,7 +603,13 @@ mod tests {
     fn fetch_failure_rolls_back_to_cache() {
         let (f, body, _) = signed_feed("official", "1.0", "rule-a");
         let cache = MemCache::default();
-        load_rule_feeds(std::slice::from_ref(&f), &cache, &Fetcher::ok(body), true, NOW);
+        load_rule_feeds(
+            std::slice::from_ref(&f),
+            &cache,
+            &Fetcher::ok(body),
+            true,
+            NOW,
+        );
 
         let loaded = load_rule_feeds(&[f], &cache, &Fetcher::fail("timeout"), true, NOW + 60);
         assert_eq!(loaded.rules.len(), 1, "应回退到缓存规则");
@@ -623,7 +625,13 @@ mod tests {
     fn rollback_disabled_drops_rules_on_failure() {
         let (mut f, body, _) = signed_feed("official", "1.0", "rule-a");
         let cache = MemCache::default();
-        load_rule_feeds(std::slice::from_ref(&f), &cache, &Fetcher::ok(body), true, NOW);
+        load_rule_feeds(
+            std::slice::from_ref(&f),
+            &cache,
+            &Fetcher::ok(body),
+            true,
+            NOW,
+        );
 
         f.rollback_on_error = false;
         let loaded = load_rule_feeds(&[f], &cache, &Fetcher::fail("timeout"), true, NOW + 60);
@@ -635,7 +643,13 @@ mod tests {
     fn check_interval_skips_fetch() {
         let (f, body, _) = signed_feed("official", "1.0", "rule-a");
         let cache = MemCache::default();
-        load_rule_feeds(std::slice::from_ref(&f), &cache, &Fetcher::ok(body), true, NOW);
+        load_rule_feeds(
+            std::slice::from_ref(&f),
+            &cache,
+            &Fetcher::ok(body),
+            true,
+            NOW,
+        );
 
         let fetcher = Fetcher::fail("should not be called");
         let loaded = load_rule_feeds(&[f], &cache, &fetcher, false, NOW + 60);
@@ -650,7 +664,13 @@ mod tests {
         // 2023-11-14 22:13:20 UTC
         f.update_window = Some("03:00-05:00".to_string());
         let cache = MemCache::default();
-        load_rule_feeds(std::slice::from_ref(&f), &cache, &Fetcher::ok(body), true, NOW);
+        load_rule_feeds(
+            std::slice::from_ref(&f),
+            &cache,
+            &Fetcher::ok(body),
+            true,
+            NOW,
+        );
 
         let fetcher = Fetcher::fail("should not be called");
         let loaded = load_rule_feeds(&[f], &cache, &fetcher, false, NOW + 86_400);
@@ -663,7 +683,13 @@ mod tests {
         let (mut f, body, _) = signed_feed("official", "1.0", "rule-a");
         f.shadow_period = Some(Duration::from_secs(3_600));
         let cache = MemCache::default();
-        let loaded = load_rule_feeds(std::slice::from_ref(&f), &cache, &Fetcher::ok(body), true, NOW);
+        let loaded = load_rule_feeds(
+            std::slice::from_ref(&f),
+            &cache,
+            &Fetcher::ok(body),
+            true,
+            NOW,
+        );
         assert!(loaded.rules[0].shadow, "新规则应处于影子期");
         assert_eq!(loaded.statuses[0].shadow_until, Some(NOW + 3_600));
 
@@ -682,7 +708,13 @@ mod tests {
         let (mut f, body, key) = signed_feed("official", "1.0", "rule-a");
         f.shadow_period = Some(Duration::from_secs(3_600));
         let cache = MemCache::default();
-        load_rule_feeds(std::slice::from_ref(&f), &cache, &Fetcher::ok(body), true, NOW);
+        load_rule_feeds(
+            std::slice::from_ref(&f),
+            &cache,
+            &Fetcher::ok(body),
+            true,
+            NOW,
+        );
 
         let new_body = signed(&key, &doc("1.1", "rule-a"));
         let loaded = load_rule_feeds(&[f], &cache, &Fetcher::ok(new_body), true, NOW + 600);
@@ -710,29 +742,19 @@ mod tests {
         let (mut f, body, _) = signed_feed("official", "1.0", "rule-a");
         f.channel = FeedChannel::Pinned;
         f.pinned_version = Some("1.0".to_string());
-        let loaded = load_rule_feeds(
-            &[f],
-            &MemCache::default(),
-            &Fetcher::ok(body),
-            true,
-            NOW,
-        );
+        let loaded = load_rule_feeds(&[f], &MemCache::default(), &Fetcher::ok(body), true, NOW);
         assert_eq!(loaded.rules.len(), 1);
     }
 
     #[test]
     fn stable_feed_rejects_beta_document() {
         let (f, _, key) = signed_feed("official", "1.0", "rule-a");
-        let beta_doc = doc("1.0", "rule-a")
-            .replace(r#""version": "1.0","#, r#""version": "1.0", "channel": "beta","#);
-        let body = signed(&key, &beta_doc);
-        let loaded = load_rule_feeds(
-            &[f],
-            &MemCache::default(),
-            &Fetcher::ok(body),
-            true,
-            NOW,
+        let beta_doc = doc("1.0", "rule-a").replace(
+            r#""version": "1.0","#,
+            r#""version": "1.0", "channel": "beta","#,
         );
+        let body = signed(&key, &beta_doc);
+        let loaded = load_rule_feeds(&[f], &MemCache::default(), &Fetcher::ok(body), true, NOW);
         assert!(loaded.rules.is_empty());
         assert!(loaded.statuses[0]
             .error

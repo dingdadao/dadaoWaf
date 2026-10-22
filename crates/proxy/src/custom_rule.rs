@@ -76,18 +76,14 @@ fn condition_matches(cond: &RuleCondition, req: &RuleRequest<'_>) -> bool {
     match op.as_str() {
         "eq" | "equal" | "is" | "in" => cond.v.iter().any(|v| compare(cond, &actual, v)),
         "ne" | "not_eq" | "not" => cond.v.iter().all(|v| !compare(cond, &actual, v)),
-        "contain" | "contains" | "like" => {
-            cond.v.iter().any(|v| actual.contains(v.as_str()))
-        }
+        "contain" | "contains" | "like" => cond.v.iter().any(|v| actual.contains(v.as_str())),
         "not_contain" | "not_contains" | "not_like" => {
             cond.v.iter().all(|v| !actual.contains(v.as_str()))
         }
         "prefix" | "start_with" | "starts_with" => {
             cond.v.iter().any(|v| actual.starts_with(v.as_str()))
         }
-        "suffix" | "end_with" | "ends_with" => {
-            cond.v.iter().any(|v| actual.ends_with(v.as_str()))
-        }
+        "suffix" | "end_with" | "ends_with" => cond.v.iter().any(|v| actual.ends_with(v.as_str())),
         "regex" | "match" | "re" => cond.v.iter().any(|v| {
             Regex::new(v)
                 .map(|re| re.is_match(&actual))

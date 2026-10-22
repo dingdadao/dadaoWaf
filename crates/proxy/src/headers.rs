@@ -93,10 +93,7 @@ mod tests {
         apply(&mut req, &ctx(false));
 
         assert_eq!(get(&req, "x-real-ip").as_deref(), Some("203.0.113.9"));
-        assert_eq!(
-            get(&req, "x-forwarded-for").as_deref(),
-            Some("203.0.113.9")
-        );
+        assert_eq!(get(&req, "x-forwarded-for").as_deref(), Some("203.0.113.9"));
         assert_eq!(get(&req, "x-forwarded-proto").as_deref(), Some("https"));
         assert_eq!(
             get(&req, "x-forwarded-host").as_deref(),
@@ -110,10 +107,7 @@ mod tests {
         let mut req = req_with_headers(&[("x-forwarded-for", "1.1.1.1")]);
         apply(&mut req, &ctx(false));
         // 伪造的 1.1.1.1 必须消失
-        assert_eq!(
-            get(&req, "x-forwarded-for").as_deref(),
-            Some("203.0.113.9")
-        );
+        assert_eq!(get(&req, "x-forwarded-for").as_deref(), Some("203.0.113.9"));
     }
 
     #[test]
@@ -150,10 +144,7 @@ mod tests {
         c.client_ip = "2001:db8::1".parse().unwrap();
         apply(&mut req, &c);
         assert_eq!(get(&req, "x-real-ip").as_deref(), Some("2001:db8::1"));
-        assert_eq!(
-            get(&req, "x-forwarded-for").as_deref(),
-            Some("2001:db8::1")
-        );
+        assert_eq!(get(&req, "x-forwarded-for").as_deref(), Some("2001:db8::1"));
     }
 
     #[test]

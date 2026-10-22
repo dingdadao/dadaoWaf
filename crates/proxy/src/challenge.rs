@@ -256,8 +256,7 @@ fn truncate(s: &str, max_bytes: usize) -> &str {
 
 /// URL 安全的 Base64，无填充。
 fn b64url_encode(input: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
     for chunk in input.chunks(3) {
         let b0 = chunk[0] as u32;
@@ -476,7 +475,13 @@ mod tests {
         let issued = svc.issue(&cfg(), "nas", Some(ip("192.168.1.9")), "/", 1_000);
         let nonce = solve(&issued.token, issued.difficulty);
         assert_eq!(
-            svc.verify(&issued.token, &nonce, "nas", Some(ip("192.168.1.10")), 1_001),
+            svc.verify(
+                &issued.token,
+                &nonce,
+                "nas",
+                Some(ip("192.168.1.10")),
+                1_001
+            ),
             Err(ChallengeError::WrongClient)
         );
     }
@@ -487,7 +492,13 @@ mod tests {
         let issued = svc.issue(&cfg(), "nas", Some(ip("192.168.1.9")), "/", 1_000);
         let nonce = solve(&issued.token, issued.difficulty);
         assert_eq!(
-            svc.verify(&issued.token, &nonce, "blog", Some(ip("192.168.1.9")), 1_001),
+            svc.verify(
+                &issued.token,
+                &nonce,
+                "blog",
+                Some(ip("192.168.1.9")),
+                1_001
+            ),
             Err(ChallengeError::WrongClient)
         );
     }
@@ -525,7 +536,13 @@ mod tests {
         let svc = ChallengeService::new();
         let issued = svc.issue(&cfg(), "nas", Some(ip("192.168.1.9")), "/", 1_000);
         assert_eq!(
-            svc.verify(&issued.token, "not-a-number", "nas", Some(ip("192.168.1.9")), 1_001),
+            svc.verify(
+                &issued.token,
+                "not-a-number",
+                "nas",
+                Some(ip("192.168.1.9")),
+                1_001
+            ),
             Err(ChallengeError::BadProof)
         );
     }

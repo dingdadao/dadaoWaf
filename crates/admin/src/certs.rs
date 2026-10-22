@@ -98,7 +98,8 @@ pub fn parse_multipart(body: &[u8], boundary: &str) -> Result<Vec<FormPart>, Str
     let marker = marker.as_bytes();
     let mut parts = Vec::new();
 
-    let mut pos = find(body, marker, 0).ok_or_else(|| "multipart 格式错误：缺少 boundary".to_string())?;
+    let mut pos =
+        find(body, marker, 0).ok_or_else(|| "multipart 格式错误：缺少 boundary".to_string())?;
     pos += marker.len();
 
     while pos < body.len() {
@@ -136,7 +137,10 @@ fn parse_part(headers: &[u8], data: Vec<u8>) -> Option<FormPart> {
     let mut filename = None;
     for line in text.lines() {
         let line = line.trim();
-        if !line.to_ascii_lowercase().starts_with("content-disposition:") {
+        if !line
+            .to_ascii_lowercase()
+            .starts_with("content-disposition:")
+        {
             continue;
         }
         for item in line.split(';') {
@@ -209,9 +213,17 @@ Content-Type: application/octet-stream\r\n\r\nCERTDATA\r\n--X--\r\n";
         let cert_path = dir.join("c.pem");
         let status = std::process::Command::new("openssl")
             .args([
-                "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
-                "-subj", "/CN=home.local",
-                "-addext", "subjectAltName=DNS:home.local,DNS:*.home.local",
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-days",
+                "1",
+                "-subj",
+                "/CN=home.local",
+                "-addext",
+                "subjectAltName=DNS:home.local,DNS:*.home.local",
                 "-keyout",
             ])
             .arg(dir.join("k.pem"))

@@ -178,9 +178,7 @@ pub fn fold_unicode(input: &str) -> String {
         .chars()
         .map(|c| match c {
             // 全角 ！ 到 ～ 对应 ASCII 0x21..0x7E
-            '\u{FF01}'..='\u{FF5E}' => {
-                char::from_u32(c as u32 - 0xFEE0).unwrap_or(c)
-            }
+            '\u{FF01}'..='\u{FF5E}' => char::from_u32(c as u32 - 0xFEE0).unwrap_or(c),
             '\u{3000}' => ' ',
             _ => c,
         })

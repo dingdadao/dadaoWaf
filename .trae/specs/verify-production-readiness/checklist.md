@@ -1,0 +1,9 @@
+- [ ] `fail_to_connect` 在满足应用重试条件时调用 `set_retry(true)`
+- [ ] 请求头（排除 host/cookie/user-agent/content-length）作为 Header 检测目标传入引擎
+- [ ] clippy 全绿、workspace 测试全通过
+- [ ] 生产二进制已更新且 systemd 服务 active
+- [ ] D1–D6 复测通过
+- [ ] D7 安全用例全部 403（含 JNDI 自定义头、Shellshock UA、SQL 布尔恒真）
+- [ ] 持续压测无 503 突发
+- [ ] 生产残留测试应用已清理、白名单规则与 auto_ban 状态已恢复
+- [ ] 生产测试报告已生成并随代码提交推送

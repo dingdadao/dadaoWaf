@@ -46,7 +46,13 @@ impl TamperBaseline {
             let Some(digest) = parse_hex(hex) else {
                 continue;
             };
-            files.insert(PathBuf::from(path), Fingerprint { size: *size, digest });
+            files.insert(
+                PathBuf::from(path),
+                Fingerprint {
+                    size: *size,
+                    digest,
+                },
+            );
         }
         Self { files }
     }
@@ -195,7 +201,8 @@ pub fn build_baseline(app: &Application) -> Result<(Vec<BaselineEntry>, TamperSc
         }
         walk_files(root, &mut scan.skipped, &mut found);
         if found.len() >= MAX_FILES {
-            scan.skipped.push(format!("文件数超过上限 {MAX_FILES}，已截断"));
+            scan.skipped
+                .push(format!("文件数超过上限 {MAX_FILES}，已截断"));
             break;
         }
     }
@@ -206,7 +213,9 @@ pub fn build_baseline(app: &Application) -> Result<(Vec<BaselineEntry>, TamperSc
             continue;
         }
         match std::fs::read(&path) {
-            Ok(data) => entries.push((path.display().to_string(), size, digest_hex(&sha256(&data)))),
+            Ok(data) => {
+                entries.push((path.display().to_string(), size, digest_hex(&sha256(&data))))
+            }
             Err(_) => scan.skipped.push(path.display().to_string()),
         }
     }
@@ -235,7 +244,8 @@ pub fn scan_changes(app: &Application, baseline: &TamperBaseline) -> Result<Tamp
         }
         walk_files(root, &mut scan.skipped, &mut found);
         if found.len() >= MAX_FILES {
-            scan.skipped.push(format!("文件数超过上限 {MAX_FILES}，结果已截断"));
+            scan.skipped
+                .push(format!("文件数超过上限 {MAX_FILES}，结果已截断"));
             break;
         }
     }
@@ -256,10 +266,12 @@ pub fn scan_changes(app: &Application, baseline: &TamperBaseline) -> Result<Tamp
                 path: path.display().to_string(),
                 kind: "added".to_string(),
             }),
-            Some(fp) if fp.size != *size || fp.digest != *digest => scan.changes.push(TamperChange {
-                path: path.display().to_string(),
-                kind: "modified".to_string(),
-            }),
+            Some(fp) if fp.size != *size || fp.digest != *digest => {
+                scan.changes.push(TamperChange {
+                    path: path.display().to_string(),
+                    kind: "modified".to_string(),
+                })
+            }
             Some(_) => {}
         }
     }
@@ -403,7 +415,10 @@ mod tests {
         assert_eq!(scan.files, 1);
         let baseline = TamperBaseline::from_rows(&rows);
         let real = std::fs::canonicalize(&a).unwrap();
-        assert_eq!(check_file(&app, Some(&baseline), &real, b"one"), FileState::Clean);
+        assert_eq!(
+            check_file(&app, Some(&baseline), &real, b"one"),
+            FileState::Clean
+        );
 
         assert_eq!(
             check_file(&app, Some(&baseline), &real, b"two"),
@@ -439,11 +454,8 @@ mod tests {
     fn disabled_app_is_not_checked() {
         let mut a = app("/tmp");
         a.tamper.enabled = false;
-        let baseline = TamperBaseline::from_rows(&[(
-            "/tmp/x".to_string(),
-            1,
-            digest_hex(&sha256(b"x")),
-        )]);
+        let baseline =
+            TamperBaseline::from_rows(&[("/tmp/x".to_string(), 1, digest_hex(&sha256(b"x")))]);
         assert_eq!(
             check_file(&a, Some(&baseline), Path::new("/tmp/x"), b"y"),
             FileState::NotCovered

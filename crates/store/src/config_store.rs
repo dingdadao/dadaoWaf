@@ -68,15 +68,13 @@ impl super::Store {
     /// 列出所有应用（按 id 排序保证顺序稳定）。
     pub fn list_applications<T: DeserializeOwned>(&self) -> Result<Vec<T>, StoreError> {
         self.with_conn(|conn| {
-            let mut stmt =
-                conn.prepare("SELECT body FROM applications ORDER BY id")?;
+            let mut stmt = conn.prepare("SELECT body FROM applications ORDER BY id")?;
             let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
             let mut out = Vec::new();
             for r in rows {
                 let text = r?;
-                let parsed = serde_json::from_str(&text).map_err(|e| {
-                    StoreError::Decode(format!("应用数据损坏：{e}"))
-                })?;
+                let parsed = serde_json::from_str(&text)
+                    .map_err(|e| StoreError::Decode(format!("应用数据损坏：{e}")))?;
                 out.push(parsed);
             }
             Ok(out)
@@ -324,9 +322,8 @@ impl super::Store {
 
     pub fn list_whitelist(&self) -> Result<Vec<WhitelistRow>, StoreError> {
         self.with_conn(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT id, app, path, rule_id, note FROM detect_whitelist ORDER BY id",
-            )?;
+            let mut stmt = conn
+                .prepare("SELECT id, app, path, rule_id, note FROM detect_whitelist ORDER BY id")?;
             let rows = stmt.query_map([], |row| {
                 Ok(WhitelistRow {
                     id: row.get(0)?,
@@ -432,8 +429,9 @@ impl super::Store {
     /// 读取全部基线，用于启动时构建运行时索引：`(应用, 路径, 大小, SHA-256)`。
     pub fn all_tamper_baselines(&self) -> Result<Vec<(String, String, u64, String)>, StoreError> {
         self.with_conn(|conn| {
-            let mut stmt = conn
-                .prepare("SELECT app_id, path, size, digest FROM tamper_baselines ORDER BY app_id, path")?;
+            let mut stmt = conn.prepare(
+                "SELECT app_id, path, size, digest FROM tamper_baselines ORDER BY app_id, path",
+            )?;
             let rows = stmt.query_map([], |row| {
                 Ok((
                     row.get::<_, String>(0)?,

@@ -241,7 +241,8 @@ impl Store {
         f(&conn)
     }
 
-    fn migrate(&self) -> Result<(), StoreError> {        let conn = self.conn.lock().map_err(|_| StoreError::Poisoned)?;
+    fn migrate(&self) -> Result<(), StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::Poisoned)?;
         conn.execute_batch(
             r#"
             PRAGMA journal_mode = WAL;
@@ -1054,10 +1055,7 @@ impl Store {
     }
 
     /// 每天每类事件数，供报表列表与安全态势历史使用。
-    pub fn daily_event_counts(
-        &self,
-        since: i64,
-    ) -> Result<Vec<(i64, String, usize)>, StoreError> {
+    pub fn daily_event_counts(&self, since: i64) -> Result<Vec<(i64, String, usize)>, StoreError> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 r#"
@@ -1085,7 +1083,10 @@ impl Store {
     pub fn prune_traffic(&self, before: i64) -> Result<usize, StoreError> {
         let day = before - before.rem_euclid(86_400);
         let conn = self.conn.lock().map_err(|_| StoreError::Poisoned)?;
-        let n = conn.execute("DELETE FROM traffic_minutes WHERE minute < ?1", params![before])?;
+        let n = conn.execute(
+            "DELETE FROM traffic_minutes WHERE minute < ?1",
+            params![before],
+        )?;
         conn.execute("DELETE FROM traffic_unique WHERE day < ?1", params![day])?;
         Ok(n)
     }
@@ -1178,7 +1179,10 @@ impl Store {
 
     pub fn delete_rule_feed_package(&self, feed: &str) -> Result<bool, StoreError> {
         let conn = self.conn.lock().map_err(|_| StoreError::Poisoned)?;
-        let n = conn.execute("DELETE FROM rule_feed_packages WHERE feed = ?1", params![feed])?;
+        let n = conn.execute(
+            "DELETE FROM rule_feed_packages WHERE feed = ?1",
+            params![feed],
+        )?;
         Ok(n > 0)
     }
 }
@@ -1312,7 +1316,8 @@ mod tests {
     fn recent_events_respects_limit() {
         let s = store();
         for _ in 0..5 {
-            s.insert_event(&Event::new(NOW, EventKind::Ban, "1.2.3.4")).unwrap();
+            s.insert_event(&Event::new(NOW, EventKind::Ban, "1.2.3.4"))
+                .unwrap();
         }
         assert_eq!(s.recent_events(2).unwrap().len(), 2);
     }
@@ -1346,10 +1351,8 @@ mod tests {
         .iter()
         .enumerate()
         {
-            s.insert_event(
-                &Event::new(NOW + i as i64, *kind, *ip).with_action(*action),
-            )
-            .unwrap();
+            s.insert_event(&Event::new(NOW + i as i64, *kind, *ip).with_action(*action))
+                .unwrap();
         }
     }
 
@@ -1451,7 +1454,9 @@ mod tests {
             })
             .unwrap();
         assert_eq!(total, 2, "detect + 1.1.1.1 应命中 2 条");
-        assert!(events.iter().all(|e| e.kind == EventKind::Detect && e.client_ip == "1.1.1.1"));
+        assert!(events
+            .iter()
+            .all(|e| e.kind == EventKind::Detect && e.client_ip == "1.1.1.1"));
     }
 
     #[test]
@@ -1487,7 +1492,8 @@ mod tests {
     }
 
     #[test]
-    fn feed_state_roundtrip() {        let s = store();
+    fn feed_state_roundtrip() {
+        let s = store();
         assert!(s.load_feed_state("chaitin").unwrap().is_none());
 
         s.save_feed_state("chaitin", "1.2.3.0/24\n4.5.6.0/24", NOW)
@@ -1505,7 +1511,8 @@ mod tests {
     }
 
     #[test]
-    fn ban_survives_reopen() {        // 用临时文件验证真正的持久化
+    fn ban_survives_reopen() {
+        // 用临时文件验证真正的持久化
         let dir = std::env::temp_dir();
         let path = dir.join(format!("homewaf-store-{}.db", std::process::id()));
         let _ = std::fs::remove_file(&path);
@@ -1581,7 +1588,16 @@ mod tests {
         assert_eq!(s.list_certificates().unwrap().len(), 2);
 
         assert!(s
-            .update_certificate(a, "a2", "CERT-A2", "KEY-A2", "a.test,www.a.test", 0, 300, NOW + 1)
+            .update_certificate(
+                a,
+                "a2",
+                "CERT-A2",
+                "KEY-A2",
+                "a.test,www.a.test",
+                0,
+                300,
+                NOW + 1
+            )
             .unwrap());
         let got = s.get_certificate(a).unwrap().unwrap();
         assert_eq!(got.name, "a2");
@@ -1682,7 +1698,8 @@ mod tests {
     #[test]
     fn ip_group_roundtrip() {
         let s = store();
-        s.upsert_ip_group("chaitin", true, &demo("g", 1), NOW).unwrap();
+        s.upsert_ip_group("chaitin", true, &demo("g", 1), NOW)
+            .unwrap();
 
         let groups = s.list_ip_groups().unwrap();
         assert_eq!(groups.len(), 1);
@@ -1714,15 +1731,9 @@ mod tests {
     fn hourly_counts_group_by_bucket() {
         let s = store();
         let hour = 3_600;
-        for (ts, action) in [
-            (NOW, "block"),
-            (NOW + 10, "log"),
-            (NOW + hour, "block"),
-        ] {
-            s.insert_event(
-                &Event::new(ts, EventKind::Detect, "1.1.1.1").with_action(action),
-            )
-            .unwrap();
+        for (ts, action) in [(NOW, "block"), (NOW + 10, "log"), (NOW + hour, "block")] {
+            s.insert_event(&Event::new(ts, EventKind::Detect, "1.1.1.1").with_action(action))
+                .unwrap();
         }
 
         let buckets = s.hourly_event_counts(NOW).unwrap();
@@ -1736,14 +1747,10 @@ mod tests {
     #[test]
     fn rule_strings_include_detect_and_ratelimit_only() {
         let s = store();
-        s.insert_event(
-            &Event::new(NOW, EventKind::Detect, "1.1.1.1").with_rules("xss-script-tag"),
-        )
-        .unwrap();
-        s.insert_event(
-            &Event::new(NOW + 1, EventKind::RateLimit, "1.1.1.1").with_rules("cc-ip"),
-        )
-        .unwrap();
+        s.insert_event(&Event::new(NOW, EventKind::Detect, "1.1.1.1").with_rules("xss-script-tag"))
+            .unwrap();
+        s.insert_event(&Event::new(NOW + 1, EventKind::RateLimit, "1.1.1.1").with_rules("cc-ip"))
+            .unwrap();
         s.insert_event(&Event::new(NOW + 2, EventKind::Acl, "1.1.1.1").with_rules("deny"))
             .unwrap();
 
@@ -1760,10 +1767,8 @@ mod tests {
             .unwrap();
         s.insert_event(&Event::new(NOW + 1, EventKind::Detect, "1.1.1.1").with_action("log"))
             .unwrap();
-        s.insert_event(
-            &Event::new(NOW + 2, EventKind::Challenge, "2.2.2.2").with_action("block"),
-        )
-        .unwrap();
+        s.insert_event(&Event::new(NOW + 2, EventKind::Challenge, "2.2.2.2").with_action("block"))
+            .unwrap();
         s.insert_event(
             &Event::new(NOW + 3, EventKind::Acl, "2.2.2.2").with_rules("黑名单规则 ban-1"),
         )
@@ -1786,7 +1791,10 @@ mod tests {
         let acl = s.acl_reason_counts(NOW, NOW + 10, 10).unwrap();
         assert_eq!(acl[0], ("黑名单规则 ban-1".to_string(), 1));
 
-        assert!(s.event_rule_strings_between(NOW, NOW + 2, 10).unwrap().is_empty());
+        assert!(s
+            .event_rule_strings_between(NOW, NOW + 2, 10)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -1871,7 +1879,9 @@ mod tests {
         assert_eq!(all.unique_ips, 2, "同一 IP 跨分钟/应用按天去重");
         assert_eq!(all.unique_visitors, 2);
 
-        let nas = s.traffic_totals(minute - 60, minute + 120, Some("nas")).unwrap();
+        let nas = s
+            .traffic_totals(minute - 60, minute + 120, Some("nas"))
+            .unwrap();
         assert_eq!(nas.requests, 13);
         assert_eq!(nas.unique_ips, 2);
     }
@@ -1887,9 +1897,7 @@ mod tests {
         ])
         .unwrap();
 
-        let points = s
-            .traffic_series(minute, minute + 180, None, 3_600)
-            .unwrap();
+        let points = s.traffic_series(minute, minute + 180, None, 3_600).unwrap();
         assert_eq!(points.len(), 1);
         assert_eq!(points[0].ts, minute - minute.rem_euclid(3_600));
         assert_eq!(points[0].requests, 18);

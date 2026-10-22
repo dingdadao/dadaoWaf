@@ -119,9 +119,7 @@ struct Sharded<K> {
 impl<K: Eq + Hash + Clone> Sharded<K> {
     fn new() -> Self {
         Self {
-            shards: (0..SHARDS)
-                .map(|_| Mutex::new(HashMap::new()))
-                .collect(),
+            shards: (0..SHARDS).map(|_| Mutex::new(HashMap::new())).collect(),
         }
     }
 
@@ -148,7 +146,9 @@ impl<K: Eq + Hash + Clone> Sharded<K> {
             }
         }
 
-        let window = map.entry(key.clone()).or_insert_with(|| Window::new(now_ms));
+        let window = map
+            .entry(key.clone())
+            .or_insert_with(|| Window::new(now_ms));
         let observed = window.estimate(now_ms);
         if observed >= limit {
             // 被拒绝的请求不计数：否则一次突刺会让用户在整个窗口内持续被拒。
@@ -190,9 +190,7 @@ pub struct ConnTable {
 impl ConnTable {
     fn new() -> Self {
         Self {
-            shards: (0..SHARDS)
-                .map(|_| Mutex::new(HashMap::new()))
-                .collect(),
+            shards: (0..SHARDS).map(|_| Mutex::new(HashMap::new())).collect(),
         }
     }
 
@@ -441,7 +439,9 @@ mod tests {
     fn zero_limits_mean_unlimited() {
         let rl = RateLimiter::new();
         for _ in 0..10_000 {
-            assert!(rl.check_at(0, Some(ip("1.2.3.4")), Some("/a"), params(0, 0, 0)).is_none());
+            assert!(rl
+                .check_at(0, Some(ip("1.2.3.4")), Some("/a"), params(0, 0, 0))
+                .is_none());
         }
     }
 
@@ -450,8 +450,12 @@ mod tests {
         let rl = RateLimiter::new();
         let p = params(0, 2, 0);
         assert!(rl.check_at(0, Some(ip("1.2.3.4")), Some("/a"), p).is_none());
-        assert!(rl.check_at(10, Some(ip("1.2.3.4")), Some("/a"), p).is_none());
-        let hit = rl.check_at(20, Some(ip("1.2.3.4")), Some("/a"), p).expect("第三次应超限");
+        assert!(rl
+            .check_at(10, Some(ip("1.2.3.4")), Some("/a"), p)
+            .is_none());
+        let hit = rl
+            .check_at(20, Some(ip("1.2.3.4")), Some("/a"), p)
+            .expect("第三次应超限");
         assert_eq!(hit.scope, Scope::Ip);
         assert_eq!(hit.limit, 2);
     }
@@ -469,18 +473,30 @@ mod tests {
     fn different_urls_are_independent() {
         let rl = RateLimiter::new();
         let p = params(0, 0, 1);
-        assert!(rl.check_at(0, Some(ip("1.1.1.1")), Some("app/a"), p).is_none());
-        assert!(rl.check_at(0, Some(ip("1.1.1.1")), Some("app/b"), p).is_none());
-        assert!(rl.check_at(0, Some(ip("1.1.1.1")), Some("app/a"), p).is_some());
+        assert!(rl
+            .check_at(0, Some(ip("1.1.1.1")), Some("app/a"), p)
+            .is_none());
+        assert!(rl
+            .check_at(0, Some(ip("1.1.1.1")), Some("app/b"), p)
+            .is_none());
+        assert!(rl
+            .check_at(0, Some(ip("1.1.1.1")), Some("app/a"), p)
+            .is_some());
     }
 
     #[test]
     fn global_limit_enforced() {
         let rl = RateLimiter::new();
         let p = params(2, 100, 100);
-        assert!(rl.check_at(0, Some(ip("1.1.1.1")), Some("app/a"), p).is_none());
-        assert!(rl.check_at(0, Some(ip("2.2.2.2")), Some("app/b"), p).is_none());
-        let hit = rl.check_at(0, Some(ip("3.3.3.3")), Some("app/c"), p).expect("应触发全局限流");
+        assert!(rl
+            .check_at(0, Some(ip("1.1.1.1")), Some("app/a"), p)
+            .is_none());
+        assert!(rl
+            .check_at(0, Some(ip("2.2.2.2")), Some("app/b"), p)
+            .is_none());
+        let hit = rl
+            .check_at(0, Some(ip("3.3.3.3")), Some("app/c"), p)
+            .expect("应触发全局限流");
         assert_eq!(hit.scope, Scope::Global);
     }
 
@@ -493,14 +509,26 @@ mod tests {
         assert!(rl.check_at(0, Some(ip("1.1.1.1")), Some("/a"), p).is_some());
 
         // 1.5 秒：上一窗口权重减半，估算为 1，允许一条
-        assert!(rl.check_at(1_500, Some(ip("1.1.1.1")), Some("/a"), p).is_none());
+        assert!(rl
+            .check_at(1_500, Some(ip("1.1.1.1")), Some("/a"), p)
+            .is_none());
         // 2 秒：1.5 秒那条还在上一窗口里，只能再放一条
-        assert!(rl.check_at(2_000, Some(ip("1.1.1.1")), Some("/a"), p).is_none());
-        assert!(rl.check_at(2_000, Some(ip("1.1.1.1")), Some("/a"), p).is_some());
+        assert!(rl
+            .check_at(2_000, Some(ip("1.1.1.1")), Some("/a"), p)
+            .is_none());
+        assert!(rl
+            .check_at(2_000, Some(ip("1.1.1.1")), Some("/a"), p)
+            .is_some());
         // 3.1 秒：窗口彻底清空，重新允许两条
-        assert!(rl.check_at(3_100, Some(ip("1.1.1.1")), Some("/a"), p).is_none());
-        assert!(rl.check_at(3_100, Some(ip("1.1.1.1")), Some("/a"), p).is_none());
-        assert!(rl.check_at(3_100, Some(ip("1.1.1.1")), Some("/a"), p).is_some());
+        assert!(rl
+            .check_at(3_100, Some(ip("1.1.1.1")), Some("/a"), p)
+            .is_none());
+        assert!(rl
+            .check_at(3_100, Some(ip("1.1.1.1")), Some("/a"), p)
+            .is_none());
+        assert!(rl
+            .check_at(3_100, Some(ip("1.1.1.1")), Some("/a"), p)
+            .is_some());
     }
 
     #[test]
@@ -509,10 +537,14 @@ mod tests {
         let p = params(0, 1, 0);
         assert!(rl.check_at(0, Some(ip("1.1.1.1")), Some("/a"), p).is_none());
         for _ in 0..100 {
-            assert!(rl.check_at(100, Some(ip("1.1.1.1")), Some("/a"), p).is_some());
+            assert!(rl
+                .check_at(100, Some(ip("1.1.1.1")), Some("/a"), p)
+                .is_some());
         }
         // 拒绝不计数，窗口滑过后应恢复
-        assert!(rl.check_at(1_500, Some(ip("1.1.1.1")), Some("/a"), p).is_none());
+        assert!(rl
+            .check_at(1_500, Some(ip("1.1.1.1")), Some("/a"), p)
+            .is_none());
     }
 
     #[test]
@@ -534,7 +566,10 @@ mod tests {
         let rl = RateLimiter::new();
         let p = params(0, 1, 1);
         assert!(rl.check_at(0, None, None, p).is_none());
-        assert!(rl.check_at(0, None, None, p).is_none(), "没有 IP/URL 时不应限流");
+        assert!(
+            rl.check_at(0, None, None, p).is_none(),
+            "没有 IP/URL 时不应限流"
+        );
     }
 
     // ============================================================

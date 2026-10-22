@@ -331,12 +331,13 @@ fn validate_protection(p: &ProtectionConfig, base: &str, ctx: &mut Ctx) {
 }
 
 fn validate_ratelimit(r: &RateLimitConfig, base: &str, ctx: &mut Ctx) {
-    if r.enabled && r.global_qps == 0 && r.per_ip_qps == 0 && r.per_ip_conn == 0 && r.per_url_qps == 0
+    if r.enabled
+        && r.global_qps == 0
+        && r.per_ip_qps == 0
+        && r.per_ip_conn == 0
+        && r.per_url_qps == 0
     {
-        ctx.warn(
-            base,
-            "CC 防护已启用但四层阈值全为 0，等于不限制",
-        );
+        ctx.warn(base, "CC 防护已启用但四层阈值全为 0，等于不限制");
     }
 }
 
@@ -560,10 +561,7 @@ fn validate_rule_feeds(feeds: &[RuleFeed], ctx: &mut Ctx) {
             );
         }
         if f.timeout.as_secs() == 0 || f.timeout.as_secs() > 300 {
-            ctx.error(
-                format!("{base}.timeout"),
-                "拉取超时应在 1s-300s 之间",
-            );
+            ctx.error(format!("{base}.timeout"), "拉取超时应在 1s-300s 之间");
         }
         let max_size = f.max_size.as_bytes();
         if !(1024..=64 * 1024 * 1024).contains(&max_size) {
@@ -827,10 +825,18 @@ fn validate_upstreams(upstreams: &[Upstream], base: &str, ctx: &mut Ctx) {
 }
 
 fn validate_route(route: &Route, base: &str, ctx: &mut Ctx) {
-    if !route.path.starts_with('/') {
+    // 路径支持普通前缀，以及 nginx 风格的 `= /x`、`^~ /x`、`~ re`、`~* re`
+    let trimmed = route.path.trim_start();
+    let has_operator = ["= ", "^~ ", "~* ", "~ "]
+        .iter()
+        .any(|prefix| trimmed.starts_with(prefix));
+    if !route.path.starts_with('/') && !has_operator {
         ctx.error(
             format!("{base}.path"),
-            format!("路由路径必须以 `/` 开头，实际为 `{}`", route.path),
+            format!(
+                "路由路径必须以 `/` 开头，或使用 `= /`、`^~ /`、`~ `、`~* ` 运算符，实际为 `{}`",
+                route.path
+            ),
         );
     }
     if route.path.len() > 2048 {
@@ -853,10 +859,7 @@ fn validate_route(route: &Route, base: &str, ctx: &mut Ctx) {
                         format!("{:?} 模式必须指定 value", rw.mode),
                     );
                 } else if !rw.value.starts_with('/') {
-                    ctx.error(
-                        format!("{base}.rewrite.value"),
-                        "重写目标必须以 `/` 开头",
-                    );
+                    ctx.error(format!("{base}.rewrite.value"), "重写目标必须以 `/` 开头");
                 }
             }
             RewriteMode::Regex => {
@@ -1284,9 +1287,7 @@ mod tests {
             max_size: Size::from_bytes(4 * 1024 * 1024),
             headers: std::collections::BTreeMap::new(),
             require_signature: true,
-            public_key: Some(
-                "ed25519:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string(),
-            ),
+            public_key: Some("ed25519:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string()),
             shadow_period: None,
             rollback_on_error: true,
             pinned_version: None,

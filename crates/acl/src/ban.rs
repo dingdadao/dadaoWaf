@@ -333,7 +333,9 @@ mod tests {
     fn single_critical_hit_bans_immediately() {
         let t = table();
         // Critical 一条就是 80 分，超过阈值 50
-        let out = t.record(ip("203.0.113.9"), 80, NOW).expect("单次高分应直接封禁");
+        let out = t
+            .record(ip("203.0.113.9"), 80, NOW)
+            .expect("单次高分应直接封禁");
         assert!(out.banned);
     }
 
@@ -405,10 +407,7 @@ mod tests {
         let b = ip("2001:db8:1:2:ffff::9");
 
         t.record(a, 50, NOW).unwrap();
-        assert!(
-            t.check(b, NOW).is_some(),
-            "同一 /64 内的其他地址也应被封"
-        );
+        assert!(t.check(b, NOW).is_some(), "同一 /64 内的其他地址也应被封");
 
         // 不同 /64 不受影响
         let c = ip("2001:db8:1:3::1");
@@ -449,10 +448,7 @@ mod tests {
         new_cfg.trigger_score = 100;
         t.update_settings(&new_cfg, 64);
 
-        assert!(
-            t.check(addr, NOW).is_some(),
-            "改配置不应解除已有封禁"
-        );
+        assert!(t.check(addr, NOW).is_some(), "改配置不应解除已有封禁");
     }
 
     #[test]

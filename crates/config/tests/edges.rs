@@ -33,7 +33,10 @@ fn errors_of(yaml: &str) -> Vec<String> {
 
 fn warnings_of(yaml: &str) -> Vec<String> {
     match from_str_with_warnings(yaml) {
-        Ok((_, ws)) => ws.iter().map(|w| format!("{}: {}", w.path, w.message)).collect(),
+        Ok((_, ws)) => ws
+            .iter()
+            .map(|w| format!("{}: {}", w.path, w.message))
+            .collect(),
         Err(ConfigError::Validation(items)) => items
             .into_iter()
             .filter(|i| i.severity == Severity::Warning)
@@ -239,7 +242,9 @@ fn route_path_must_start_with_slash() {
       - path: "api"
 "#,
     );
-    assert!(errors_of(&yaml).iter().any(|e| e.contains("必须以 `/` 开头")));
+    assert!(errors_of(&yaml)
+        .iter()
+        .any(|e| e.contains("必须以 `/` 开头")));
 }
 
 #[test]
@@ -306,7 +311,9 @@ fn invalid_method_rejected() {
         allow_methods: [GET, FOOBAR]
 "#,
     );
-    assert!(errors_of(&yaml).iter().any(|e| e.contains("非法 HTTP 方法")));
+    assert!(errors_of(&yaml)
+        .iter()
+        .any(|e| e.contains("非法 HTTP 方法")));
 }
 
 #[test]
@@ -505,7 +512,9 @@ applications:
     domains: { primary: a.home.lan }
     upstreams: [{ addr: 192.168.1.5, port: 80 }]
 "#;
-    assert!(warnings_of(yaml).iter().any(|w| w.contains("没有时间完成转发")));
+    assert!(warnings_of(yaml)
+        .iter()
+        .any(|w| w.contains("没有时间完成转发")));
 }
 
 // ============================================================

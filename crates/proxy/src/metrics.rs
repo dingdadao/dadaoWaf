@@ -200,12 +200,7 @@ impl TrafficMetrics {
     }
 
     /// 聚合一个时间范围的仪表盘数据。
-    pub fn dashboard(
-        &self,
-        range_secs: i64,
-        app: Option<&str>,
-        now: i64,
-    ) -> DashboardData {
+    pub fn dashboard(&self, range_secs: i64, app: Option<&str>, now: i64) -> DashboardData {
         let range_secs = range_secs.clamp(60, RETENTION_MINUTES * 60);
         let now_minute = now - now.rem_euclid(60);
         let start = now_minute - (range_secs / 60).max(1) * 60 + 60;
@@ -325,13 +320,7 @@ impl TrafficMetrics {
 impl Inner {
     fn prune(&mut self, current_minute: i64) {
         let cutoff = current_minute - (RETENTION_MINUTES - 1) * 60;
-        while self
-            .buckets
-            .front()
-            .map(|b| b.minute)
-            .unwrap_or(i64::MAX)
-            < cutoff
-        {
+        while self.buckets.front().map(|b| b.minute).unwrap_or(i64::MAX) < cutoff {
             self.buckets.pop_front();
         }
     }
@@ -671,7 +660,10 @@ mod tests {
         assert_eq!(d.referer_hosts[0].name, "www.baidu.com");
         assert_eq!(d.os[0].name, "Windows");
         assert_eq!(d.browsers[0].name, "Chrome");
-        assert_eq!(d.statuses.iter().find(|c| c.name == "403").unwrap().count, 1);
+        assert_eq!(
+            d.statuses.iter().find(|c| c.name == "403").unwrap().count,
+            1
+        );
     }
 
     #[test]
@@ -714,16 +706,17 @@ mod tests {
     #[test]
     fn ua_classification() {
         assert_eq!(classify(None), (OS_UNKNOWN, BR_UNKNOWN));
+        assert_eq!(classify(Some("curl/8.0")), (OS_UNKNOWN, BR_CURL));
         assert_eq!(
-            classify(Some("curl/8.0")),
-            (OS_UNKNOWN, BR_CURL)
-        );
-        assert_eq!(
-            classify(Some("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Version/17.0 Safari/605.1.15")),
+            classify(Some(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Version/17.0 Safari/605.1.15"
+            )),
             (OS_MAC, BR_SAFARI)
         );
         assert_eq!(
-            classify(Some("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0) EdgiOS/120.0")),
+            classify(Some(
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0) EdgiOS/120.0"
+            )),
             (OS_IOS, BR_EDGE)
         );
         assert_eq!(
