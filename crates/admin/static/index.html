@@ -191,6 +191,225 @@
   .catrow .num { text-align: right; font-variant-numeric: tabular-nums; }
   .legend { font-size: 11px; color: var(--muted); display: flex; gap: 14px; align-items: center; }
   .legend i { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 4px; }
+
+  /* ---------- 统计报表（深色） ---------- */
+  .stats-wrap {
+    --s-bg: #0b0f14;
+    --s-card: #141a22;
+    --s-border: #232c38;
+    --s-text: #e6edf3;
+    --s-muted: #8b949e;
+    --s-accent: #4a9eda;
+    --s-green: #3ddc97;
+    --s-red: #f06a6a;
+    --s-amber: #e3b341;
+    --s-purple: #a371f7;
+    background: var(--s-bg); color: var(--s-text);
+    border: 1px solid #1a222c; border-radius: 12px;
+    padding: 16px 18px 22px; min-height: calc(100vh - 132px);
+  }
+  .stats-head {
+    display: flex; justify-content: space-between; align-items: center; gap: 12px;
+    flex-wrap: wrap; border-bottom: 1px solid var(--s-border);
+    padding-bottom: 10px; margin-bottom: 14px;
+  }
+  .stats-tabs { display: flex; gap: 6px; }
+  .stats-tabs a {
+    padding: 6px 14px; font-size: 13px; color: var(--s-muted); border-radius: 7px;
+    cursor: pointer; border: 1px solid transparent; user-select: none;
+  }
+  .stats-tabs a:hover { color: var(--s-text); background: #161e27; }
+  .stats-tabs a.active {
+    color: #fff; background: #1c2733; border-color: #2b3a4a;
+    box-shadow: inset 0 -2px 0 var(--s-accent);
+  }
+  .stats-filters { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .stats-wrap select, .stats-wrap input {
+    width: auto; background: #111820; border-color: var(--s-border);
+    color: var(--s-text); font-size: 12px; padding: 5px 9px;
+  }
+  .stats-wrap button {
+    background: #16202a; border-color: var(--s-border); color: var(--s-text);
+    font-size: 12px; padding: 5px 12px;
+  }
+  .stats-wrap button:hover { background: #1d2936; }
+  .stats-wrap button.primary { background: var(--s-accent); border-color: var(--s-accent); color: #06121d; font-weight: 600; }
+  .stats-wrap button.primary:hover { background: #63b0e9; }
+  .stats-panel { display: none; }
+  .stats-panel.active { display: block; }
+
+  .kpi-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; margin-bottom: 14px; }
+  .kpi {
+    background: linear-gradient(160deg, #18212c 0%, #111820 100%);
+    border: 1px solid var(--s-border); border-radius: 10px; padding: 12px 14px;
+    position: relative; overflow: hidden;
+  }
+  .kpi::after {
+    content: ''; position: absolute; right: -18px; top: -18px; width: 56px; height: 56px;
+    border-radius: 50%; background: radial-gradient(circle, rgba(74,158,218,.22), transparent 70%);
+  }
+  .kpi .kpi-label { font-size: 12px; color: var(--s-muted); margin-bottom: 6px; }
+  .kpi .kpi-value { font-size: 25px; font-weight: 600; font-variant-numeric: tabular-nums; line-height: 1.15; }
+  .kpi .kpi-sub { font-size: 11px; color: var(--s-muted); margin-top: 4px; min-height: 16px; }
+  .kpi.hot .kpi-value { color: var(--s-red); }
+  .kpi.ok .kpi-value { color: var(--s-green); }
+  .kpi.acc .kpi-value { color: var(--s-accent); }
+
+  .dcard { background: var(--s-card); border: 1px solid var(--s-border); border-radius: 10px; overflow: hidden; min-width: 0; }
+  .dcard > header {
+    display: flex; align-items: center; justify-content: space-between; gap: 10px;
+    padding: 10px 14px; border-bottom: 1px solid var(--s-border);
+  }
+  .dcard > header h2 { font-size: 13px; margin: 0; font-weight: 600; color: var(--s-text); }
+  .dcard > header .muted { font-size: 11px; color: var(--s-muted); }
+  .dcard .empty { color: var(--s-muted); font-size: 12px; padding: 24px 14px; text-align: center; }
+
+  .stats-cols { display: grid; gap: 12px; margin-bottom: 12px; }
+  .stats-cols.two { grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
+  .stats-cols.three { grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
+  .stats-cols.wide-left, .stats-cols.maprow { grid-template-columns: minmax(0, 2.1fr) minmax(220px, 1fr); }
+  .stats-cols.report-cols { grid-template-columns: 268px minmax(0, 1fr); }
+  @media (max-width: 1040px) {
+    .stats-cols.wide-left, .stats-cols.maprow, .stats-cols.report-cols { grid-template-columns: 1fr; }
+  }
+
+  .chart { padding: 8px 6px 4px; }
+  .chart-svg { display: block; width: 100%; }
+  .chart-svg .grid { stroke: #232c38; stroke-width: 1; stroke-dasharray: 3 4; }
+  .chart-svg .axis { fill: #7d8794; font-size: 10px; }
+  .chart-legend { display: flex; gap: 14px; font-size: 11px; color: var(--s-muted); }
+  .chart-legend i { display: inline-block; width: 9px; height: 3px; border-radius: 2px; margin-right: 5px; vertical-align: middle; }
+
+  .seg { display: inline-flex; gap: 2px; background: #101820; border: 1px solid var(--s-border); border-radius: 7px; padding: 2px; }
+  .stats-wrap .seg button { border: none; background: transparent; padding: 3px 10px; border-radius: 5px; color: var(--s-muted); }
+  .stats-wrap .seg button.on { background: #223040; color: #fff; }
+  .screen-shell .seg button { border: none; background: transparent; padding: 3px 10px; border-radius: 5px; color: var(--sc-muted); font-size: 12px; }
+  .screen-shell .seg button.on { background: #17303f; color: #fff; }
+
+  .mapbox { position: relative; padding: 6px 8px 10px; min-height: 240px; }
+  .mapbox svg { display: block; width: 100%; }
+  .map-land { fill: #243342; }
+  .geo-point { fill: var(--s-accent); opacity: .85; }
+  .geo-point.hot { fill: var(--s-red); }
+  .map-note {
+    position: absolute; left: 14px; top: 10px; font-size: 11px; color: var(--s-muted);
+    background: rgba(11,15,20,.72); padding: 2px 8px; border-radius: 4px;
+  }
+  .map-badge { position: absolute; right: 14px; top: 10px; font-size: 11px; color: var(--s-muted); }
+
+  .rank-h { padding: 10px 14px 0; font-size: 11px; color: var(--s-muted); }
+  .ranklist { padding: 6px 14px 12px; display: grid; gap: 7px; }
+  .rankrow {
+    display: grid; grid-template-columns: 16px minmax(60px, 1fr) 90px 62px;
+    gap: 8px; align-items: center; font-size: 12px;
+  }
+  .rankrow .idx { color: #5b6673; font-variant-numeric: tabular-nums; }
+  .rankrow .nm { color: #c6d2dd; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .rankrow .track { height: 6px; background: #1a2430; border-radius: 4px; overflow: hidden; }
+  .rankrow .fill { display: block; height: 100%; border-radius: 4px; background: linear-gradient(90deg, #2f6fa8, #4a9eda); }
+  .rankrow .num { text-align: right; color: var(--s-text); font-variant-numeric: tabular-nums; }
+
+  .donut-wrap { display: flex; gap: 12px; align-items: center; padding: 10px 14px 14px; flex-wrap: wrap; }
+  .donut-legend { flex: 1; min-width: 120px; display: grid; gap: 5px; font-size: 12px; }
+  .legendrow { display: grid; grid-template-columns: 8px minmax(40px,1fr) 54px 48px; gap: 6px; align-items: center; color: #c6d2dd; }
+  .legendrow i { width: 8px; height: 8px; border-radius: 2px; }
+  .legendrow .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .legendrow .num, .legendrow .pct { text-align: right; color: var(--s-muted); font-variant-numeric: tabular-nums; }
+  .donut-num { fill: #e6edf3; font-size: 19px; font-weight: 600; }
+  .donut-label { fill: #7d8794; font-size: 9px; }
+
+  .darktable { width: 100%; border-collapse: collapse; }
+  .darktable th {
+    background: #111820; color: var(--s-muted); font-size: 11px; font-weight: 500;
+    border-bottom: 1px solid var(--s-border); padding: 8px 12px; text-align: left;
+  }
+  .darktable td { padding: 7px 12px; border-bottom: 1px solid #1c242e; font-size: 12px; color: #c6d2dd; }
+  .darktable tr:last-child td { border-bottom: none; }
+  .darktable .mono { font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+  .darktable .num { text-align: right; font-variant-numeric: tabular-nums; }
+  .darktable .geo { color: var(--s-muted); font-size: 11px; }
+  .darktable tbody tr:hover { background: #17202b; }
+  .live-dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: var(--s-green); margin-right: 6px; }
+
+  .report-list { max-height: 640px; overflow-y: auto; }
+  .report-item {
+    padding: 10px 14px; border-bottom: 1px solid #1c242e; cursor: pointer;
+    display: flex; justify-content: space-between; gap: 10px; font-size: 12px;
+  }
+  .report-item:hover { background: #17202b; }
+  .report-item.active { background: #1b2837; box-shadow: inset 2px 0 0 var(--s-accent); }
+  .report-item .date { color: #dbe6f0; font-weight: 500; }
+  .report-item .sub { color: var(--s-muted); font-size: 11px; margin-top: 2px; }
+  .report-item .rate { color: var(--s-red); font-variant-numeric: tabular-nums; }
+  .report-body { padding: 14px; }
+  .report-kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(118px, 1fr)); gap: 8px; margin-bottom: 12px; }
+  .report-kpis .kpi { padding: 10px 12px; }
+  .report-kpis .kpi .kpi-value { font-size: 20px; }
+  .report-block { margin-top: 14px; }
+  .report-block h3 { font-size: 12px; color: var(--s-muted); font-weight: 500; margin: 0 0 8px; }
+  .report-grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; }
+
+  /* ---------- 防护大屏 ---------- */
+  .screen-overlay { position: fixed; inset: 0; z-index: 60; display: none; overflow: auto; background: #04070b; }
+  .screen-overlay.show { display: block; }
+  .screen-shell {
+    --sc-bg: #04070b; --sc-card: rgba(12, 21, 31, .9); --sc-border: #163040;
+    --sc-text: #e3f1fb; --sc-muted: #7f9cb3; --sc-accent: #38d6ff;
+    --sc-red: #ff6b81; --sc-green: #35e0a1;
+    min-height: 100vh; color: var(--sc-text);
+    background: radial-gradient(1200px 600px at 50% -10%, #0a2030 0%, var(--sc-bg) 60%);
+    padding: 18px 26px 26px; display: flex; flex-direction: column; gap: 14px;
+  }
+  .screen-shell.light {
+    --sc-bg: #eef2f6; --sc-card: #ffffff; --sc-border: #d8e2ec;
+    --sc-text: #172532; --sc-muted: #63788b; --sc-accent: #0b7fd1;
+    --sc-red: #c8443f; --sc-green: #12805c;
+    background: radial-gradient(1200px 600px at 50% -10%, #dfeaf5 0%, var(--sc-bg) 70%);
+  }
+  .screen-head {
+    display: flex; justify-content: space-between; align-items: center; gap: 16px;
+    border-bottom: 1px solid var(--sc-border); padding-bottom: 12px;
+  }
+  .screen-title { font-size: 24px; font-weight: 600; letter-spacing: .06em; cursor: text; }
+  .screen-sub { font-size: 12px; color: var(--sc-muted); margin-top: 4px; }
+  .screen-tools { display: flex; gap: 8px; }
+  .screen-tools button {
+    background: transparent; border: 1px solid var(--sc-border); color: var(--sc-muted);
+    font-size: 12px; padding: 5px 12px; border-radius: 6px; cursor: pointer;
+  }
+  .screen-tools button:hover { color: var(--sc-text); border-color: var(--sc-accent); }
+  .screen-kpis { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 12px; }
+  .screen-kpis .skpi { background: var(--sc-card); border: 1px solid var(--sc-border); border-radius: 10px; padding: 12px 16px; }
+  .screen-kpis .skpi-label { font-size: 12px; color: var(--sc-muted); letter-spacing: .04em; }
+  .screen-kpis .skpi-value {
+    font-size: 30px; font-weight: 600; color: var(--sc-accent);
+    font-variant-numeric: tabular-nums; margin-top: 4px;
+  }
+  .screen-kpis .skpi.hot .skpi-value { color: var(--sc-red); }
+  .screen-kpis .skpi.green .skpi-value { color: var(--sc-green); }
+  .screen-row { display: grid; gap: 12px; }
+  .screen-row.main { grid-template-columns: minmax(0, 2fr) minmax(240px, 1fr); }
+  .screen-row.split3 { grid-template-columns: minmax(0, 1.5fr) minmax(0, 1fr) minmax(0, 1fr); }
+  .screen-shell .dcard { background: var(--sc-card); border-color: var(--sc-border); }
+  .screen-shell .dcard > header { border-color: var(--sc-border); }
+  .screen-shell .dcard > header h2 { color: var(--sc-text); }
+  .screen-shell .chart-svg .grid { stroke: #173040; }
+  .screen-shell.light .chart-svg .grid { stroke: #dbe6f0; }
+  .screen-shell .chart-svg .axis { fill: #6f8ba1; }
+  .screen-shell.light .seg { background: #eef3f7; border-color: #d8e2ec; }
+  .screen-shell.light .seg button.on { background: #d7e7f5; color: #0b4a72; }
+  .screen-shell .map-land { fill: #1c3242; }
+  .screen-shell.light .map-land { fill: #cddcea; }
+  .screen-shell.light .darktable th { background: #f4f8fb; color: #63788b; border-color: #e2ebf3; }
+  .screen-shell.light .darktable td { color: #172532; border-color: #e8eff5; }
+  .screen-shell.light .rankrow .nm { color: #2b3a48; }
+  .screen-shell.light .rankrow .track { background: #eef3f7; }
+  .screen-shell.light .rankrow .num { color: #172532; }
+  .screen-shell.light .donut-num { fill: #172532; }
+  @media (max-width: 1100px) {
+    .screen-kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .screen-row.main, .screen-row.split3 { grid-template-columns: 1fr; }
+  }
 </style>
 </head>
 <body>
@@ -199,7 +418,7 @@
   <aside class="sidebar">
     <div class="brand">HomeWAF<small>家用 Web 应用防火墙</small></div>
     <nav class="nav" id="nav">
-      <a data-page="overview" class="active">概览</a>
+      <a data-page="statistics" class="active">统计报表</a>
       <a data-page="apps">应用</a>
       <a data-page="rules">访问控制</a>
       <a data-page="whitelist">检测白名单</a>
@@ -214,7 +433,7 @@
 
   <main>
     <div class="topbar">
-      <h1 id="page-title">概览</h1>
+      <h1 id="page-title">统计报表</h1>
       <div class="meta">
         <span id="top-mode">–</span>
         <span>检测规则 <b id="top-rules">–</b></span>
@@ -225,36 +444,119 @@
     <div class="content">
       <div class="msg" id="msg"></div>
 
-      <!-- ========== 概览 ========== -->
-      <div class="page active" data-page="overview">
-        <div class="grid">
-          <div class="stat"><div class="label">应用</div><div class="value" id="s-apps">–</div></div>
-          <div class="stat"><div class="label">上游</div><div class="value" id="s-upstreams">–</div></div>
-          <div class="stat"><div class="label">ACL 规则</div><div class="value" id="s-rules">–</div></div>
-          <div class="stat danger"><div class="label">当前封禁</div><div class="value" id="s-bans">–</div></div>
-          <div class="stat"><div class="label">事件总数</div><div class="value" id="s-events">–</div></div>
-          <div class="stat danger"><div class="label">累计拦截</div><div class="value" id="s-blocked">–</div></div>
-          <div class="stat"><div class="label">近 24 小时</div><div class="value" id="s-24h">–</div></div>
-          <div class="stat"><div class="label">检测规则</div><div class="value" id="s-detect">–</div></div>
+      <!-- ========== 统计报表 ========== -->
+      <div class="page active" data-page="statistics">
+        <div class="stats-wrap" id="stats-wrap">
+          <div class="stats-head">
+            <div class="stats-tabs" id="stats-tabs">
+              <a data-tab="traffic" class="active">流量分析</a>
+              <a data-tab="security">安全态势</a>
+              <a data-tab="reports">防护报告</a>
+            </div>
+            <div class="stats-filters">
+              <select id="stats-range" title="统计时间范围">
+                <option value="3600">最近 1 小时</option>
+                <option value="21600">最近 6 小时</option>
+                <option value="86400" selected>最近 24 小时</option>
+              </select>
+              <select id="stats-app" title="按应用过滤">
+                <option value="">全部应用</option>
+              </select>
+              <button id="stats-refresh">刷新</button>
+              <button class="primary" id="stats-screen-btn">防护大屏</button>
+            </div>
+          </div>
+
+          <!-- 流量分析 -->
+          <div class="stats-panel active" data-tab="traffic">
+            <div class="kpi-grid" id="traffic-kpis"></div>
+            <div class="stats-cols wide-left">
+              <section class="dcard">
+                <header>
+                  <h2>请求与拦截趋势</h2>
+                  <span class="chart-legend"><span><i style="background:#4a9eda"></i>请求</span><span><i style="background:#f06a6a"></i>拦截</span></span>
+                </header>
+                <div class="chart" id="traffic-trend"></div>
+              </section>
+              <section class="dcard">
+                <header><h2>状态码分布</h2></header>
+                <div id="traffic-status"></div>
+              </section>
+            </div>
+            <div class="stats-cols maprow">
+              <section class="dcard">
+                <header>
+                  <h2>访问来源地图</h2>
+                  <div class="seg" id="map-mode">
+                    <button data-mode="all" class="on">全部请求</button>
+                    <button data-mode="blocked">仅拦截</button>
+                  </div>
+                </header>
+                <div style="padding:8px 14px 0">
+                  <div class="seg" id="map-region">
+                    <button data-region="world" class="on">世界</button>
+                    <button data-region="cn">中国</button>
+                  </div>
+                </div>
+                <div class="mapbox" id="traffic-map"></div>
+              </section>
+              <section class="dcard">
+                <header><h2>地域排行</h2></header>
+                <div id="traffic-geo-list"></div>
+              </section>
+            </div>
+            <div class="stats-cols three">
+              <section class="dcard"><header><h2>外部来源域名 Top</h2></header><div id="top-hosts"></div></section>
+              <section class="dcard"><header><h2>外部来源页面 Top</h2></header><div id="top-paths"></div></section>
+              <section class="dcard"><header><h2>来源页面 Top</h2></header><div id="top-referers"></div></section>
+            </div>
+            <div class="stats-cols two">
+              <section class="dcard"><header><h2>操作系统分布</h2></header><div id="traffic-os"></div></section>
+              <section class="dcard"><header><h2>浏览器分布</h2></header><div id="traffic-browsers"></div></section>
+            </div>
+          </div>
+
+          <!-- 安全态势 -->
+          <div class="stats-panel" data-tab="security">
+            <div class="kpi-grid" id="sec-kpis"></div>
+            <div class="stats-cols wide-left">
+              <section class="dcard">
+                <header><h2>攻击防护趋势</h2><span class="chart-legend" id="sec-trend-legend"></span></header>
+                <div class="chart" id="sec-trend"></div>
+              </section>
+              <section class="dcard">
+                <header><h2>攻击类型分布</h2></header>
+                <div id="sec-categories"></div>
+              </section>
+            </div>
+            <div class="stats-cols three">
+              <section class="dcard"><header><h2>黑白名单命中</h2></header><div id="sec-acl"></div></section>
+              <section class="dcard"><header><h2>规则命中 Top</h2></header><div id="sec-rules"></div></section>
+              <section class="dcard"><header><h2>攻击来源 IP</h2></header><div id="sec-ips"></div></section>
+            </div>
+            <section class="dcard">
+              <header><h2>实时事件流</h2><span class="muted"><span class="live-dot"></span>最近 20 条</span></header>
+              <div id="sec-recent"></div>
+            </section>
+          </div>
+
+          <!-- 防护报告 -->
+          <div class="stats-panel" data-tab="reports">
+            <div class="stats-cols report-cols">
+              <section class="dcard">
+                <header><h2>日报列表</h2><span class="muted">近 30 天</span></header>
+                <div class="report-list" id="report-list"></div>
+              </section>
+              <section class="dcard">
+                <header>
+                  <h2 id="report-title">报告预览</h2>
+                  <button id="report-csv" disabled>导出 CSV</button>
+                </header>
+                <div id="report-detail"><div class="empty">选择左侧日期查看日报</div></div>
+              </section>
+            </div>
+          </div>
         </div>
-        <div class="cols">
-          <section class="card">
-            <header>
-              <h2>24 小时事件趋势</h2>
-              <span class="legend"><span><i style="background:#b9cfe4"></i>事件</span><span><i style="background:#c96a6a"></i>拦截</span></span>
-            </header>
-            <div class="trend" id="trend"></div>
-            <div class="trend-axis"><span id="trend-start">–</span><span>现在</span></div>
-          </section>
-          <section class="card">
-            <header><h2>攻击类型分布</h2></header>
-            <div class="catlist" id="categories"></div>
-          </section>
-        </div>
-        <section class="card">
-          <header><h2>最近事件</h2></header>
-          <div id="overview-events"></div>
-        </section>
       </div>
 
       <!-- ========== 应用 ========== -->
@@ -466,6 +768,54 @@
   </main>
 </div>
 
+<!-- ========== 防护大屏（全屏浮层） ========== -->
+<div class="screen-overlay" id="screen-overlay">
+  <div class="screen-shell" id="screen-shell">
+    <header class="screen-head">
+      <div>
+        <div class="screen-title" id="screen-title" title="点击可修改标题">HomeWAF 防护大屏</div>
+        <div class="screen-sub" id="screen-sub">–</div>
+      </div>
+      <div class="screen-tools">
+        <button id="screen-theme-btn">明亮主题</button>
+        <button id="screen-rename-btn">自定义标题</button>
+        <button id="screen-close-btn">退出大屏</button>
+      </div>
+    </header>
+    <div class="screen-kpis" id="screen-kpis"></div>
+    <div class="screen-row main">
+      <section class="dcard screen-card">
+        <header><h2>30 天访问与拦截趋势</h2><span class="chart-legend"><span><i style="background:#38d6ff"></i>请求</span><span><i style="background:#ff6b81"></i>拦截</span></span></header>
+        <div class="chart" id="screen-trend"></div>
+      </section>
+      <section class="dcard screen-card">
+        <header><h2>实时 QPS（最近 60 秒）</h2><span class="chart-legend"><span><i style="background:#35e0a1"></i>每秒请求</span></span></header>
+        <div class="chart" id="screen-ops"></div>
+      </section>
+    </div>
+    <div class="screen-row split3">
+      <section class="dcard screen-card">
+        <header>
+          <h2>访问来源地图（24 小时）</h2>
+          <div class="seg" id="screen-map-region">
+            <button data-region="world" class="on">世界</button>
+            <button data-region="cn">中国</button>
+          </div>
+        </header>
+        <div class="mapbox" id="screen-map"></div>
+      </section>
+      <section class="dcard screen-card">
+        <header><h2>拦截分类 / 数量</h2></header>
+        <div id="screen-categories"></div>
+      </section>
+      <section class="dcard screen-card">
+        <header><h2>Top 攻击 IP（30 天）</h2></header>
+        <div id="screen-ips"></div>
+      </section>
+    </div>
+  </div>
+</div>
+
 <script>
 // ============================================================
 // 基础工具
@@ -501,15 +851,18 @@ const durationToSecs = (d) => {
 // 页面切换
 // ============================================================
 const PAGE_TITLES = {
-  overview: '概览', apps: '应用', rules: '访问控制', whitelist: '检测白名单',
+  statistics: '统计报表', apps: '应用', rules: '访问控制', whitelist: '检测白名单',
   feeds: 'IP 组订阅', 'rule-feeds': '规则订阅', bans: '封禁', events: '事件',
   logs: '日志', settings: '设置',
 };
+
+let currentPage = 'statistics';
 
 document.getElementById('nav').addEventListener('click', (e) => {
   const link = e.target.closest('a[data-page]');
   if (!link) return;
   const page = link.dataset.page;
+  currentPage = page;
 
   document.querySelectorAll('.nav a').forEach(a => a.classList.toggle('active', a === link));
   document.querySelectorAll('.page').forEach(p => p.classList.toggle('active', p.dataset.page === page));
@@ -519,57 +872,18 @@ document.getElementById('nav').addEventListener('click', (e) => {
   ({ apps: loadApps, rules: loadRules, whitelist: loadWhitelist, feeds: loadFeeds,
      'rule-feeds': loadRuleFeeds,
      bans: loadBans, events: loadEvents, logs: loadLogs, settings: loadSettings,
-     overview: loadStats }[page] || (() => {}))();
+     statistics: loadStatistics }[page] || (() => {}))();
 });
 
 // ============================================================
-// 概览
+// 统计报表：流量分析 / 安全态势 / 防护报告 / 防护大屏
 // ============================================================
-async function loadStats() {
-  try {
-    const s = await api('/stats');
-    document.getElementById('s-apps').textContent = s.apps;
-    document.getElementById('s-upstreams').textContent = s.upstreams;
-    document.getElementById('s-rules').textContent = s.acl_rules;
-    document.getElementById('s-bans').textContent = s.active_bans;
-    document.getElementById('s-events').textContent = s.events_total;
-    document.getElementById('s-blocked').textContent = s.events_blocked;
-    document.getElementById('s-detect').textContent = s.detect_rules;
-
-    const hourly = s.hourly || [];
-    document.getElementById('s-24h').textContent = hourly.reduce((n, h) => n + h.total, 0);
-    renderTrend(hourly);
-    renderCategories(s.categories || []);
-
-    document.getElementById('top-rules').textContent = s.detect_rules;
-    document.getElementById('top-bans').textContent = s.active_bans;
-    document.getElementById('top-mode').textContent = s.observe_mode ? '观察模式' : '拦截模式';
-    document.getElementById('nav-bans').textContent = s.active_bans;
-    document.getElementById('nav-bans').className = 'badge' + (s.active_bans > 0 ? ' alert' : '');
-
-    loadOverviewEvents();
-  } catch (e) {
-    showMsg('加载概览失败：' + e.message, 'error');
-  }
-}
-
-function renderTrend(hourly) {
-  const el = document.getElementById('trend');
-  if (!hourly.length) { el.innerHTML = '<div class="empty" style="width:100%">暂无数据</div>'; return; }
-  const max = Math.max(1, ...hourly.map(h => h.total));
-  el.innerHTML = hourly.map(h => {
-    const total = Math.round(h.total / max * 100);
-    const blocked = h.total ? Math.round(h.blocked / h.total * 100) : 0;
-    const t = new Date(h.ts * 1000).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', hour12: false });
-    return `<div class="col" title="${esc(t)} · 事件 ${h.total} · 拦截 ${h.blocked}">
-      <div class="bar" style="height:${total}%"><div class="blocked" style="height:${blocked}%"></div></div>
-    </div>`;
-  }).join('');
-  if (hourly.length) {
-    document.getElementById('trend-start').textContent =
-      new Date(hourly[0].ts * 1000).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', hour12: false });
-  }
-}
+const STATS = {
+  tab: 'traffic', range: 86400, app: '',
+  mapRegion: 'world', mapMode: 'all', geoCache: {},
+  reports: [], reportDay: null,
+  screenTimer: null, screenLight: false, screenRegion: 'world', screenGeo: null,
+};
 
 const CAT_LABELS = {
   sqli: 'SQL 注入', xss: 'XSS', cmdi: '命令注入', traversal: '路径穿越', ssrf: 'SSRF',
@@ -577,31 +891,686 @@ const CAT_LABELS = {
   scanner: '扫描器', deserialization: '反序列化', crlf: 'CRLF 注入', file_upload: '恶意上传',
   bruteforce: '暴力破解', sensitive_leak: '敏感信息', custom: '自定义', cc: 'CC 限流', other: '其他',
 };
+const catLabel = (n) => CAT_LABELS[n] || n;
+const S_COLORS = ['#4a9eda', '#f06a6a', '#3ddc97', '#e3b341', '#a371f7', '#48c9b0', '#eb6f92', '#8b949e'];
+const SC_COLORS = ['#38d6ff', '#ff6b81', '#35e0a1', '#ffd166', '#b388ff', '#4fc3f7', '#ff8fab', '#8aa4b8'];
 
-function renderCategories(cats) {
-  const el = document.getElementById('categories');
-  if (!cats.length) { el.innerHTML = '<div class="empty" style="padding:8px 0">暂无命中记录</div>'; return; }
-  const max = Math.max(1, ...cats.map(c => c.count));
-  el.innerHTML = cats.map(c => `<div class="catrow">
-    <span class="name" title="${esc(c.name)}">${esc(CAT_LABELS[c.name] || c.name)}</span>
-    <span class="track"><span class="fill" style="width:${Math.round(c.count / max * 100)}%"></span></span>
-    <span class="num">${c.count}</span>
-  </div>`).join('');
+const fmtNum = (n) => Number(n ?? 0).toLocaleString('zh-CN');
+const fmtPct = (v, digits = 2) => `${(Number(v) || 0).toFixed(digits)}%`;
+const fmtAxis = (v) => v >= 1e6 ? (v / 1e6).toFixed(v >= 1e7 ? 0 : 1) + 'M'
+  : v >= 1e3 ? (v / 1e3).toFixed(v >= 1e4 ? 0 : 1) + 'k' : String(Math.round(v));
+const hhmm = (ts) => ts ? new Date(ts * 1000).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false }) : '';
+const dayLabel = (ts) => new Date(ts * 1000).toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit' });
+const rangeLabel = (r) => ({ 3600: '最近 1 小时', 21600: '最近 6 小时', 86400: '最近 24 小时' }[r] || '自定义范围');
+
+// ---------- 数字滚动 ----------
+function countUp(el, target, opts = {}) {
+  if (!el) return;
+  const dur = 720, from = 0, decimals = opts.decimals || 0, suffix = opts.suffix || '';
+  const start = performance.now();
+  const step = (now) => {
+    const p = Math.min(1, (now - start) / dur);
+    const ease = 1 - Math.pow(1 - p, 3);
+    const v = from + (target - from) * ease;
+    el.textContent = (decimals ? v.toFixed(decimals) : Math.round(v).toLocaleString('zh-CN')) + suffix;
+    if (p < 1) requestAnimationFrame(step);
+  };
+  requestAnimationFrame(step);
 }
 
-async function loadOverviewEvents() {
-  const el = document.getElementById('overview-events');
+function renderKpis(el, items) {
+  if (!el) return;
+  el.innerHTML = items.map((it, i) => `<div class="kpi ${it.cls || ''}">
+    <div class="kpi-label">${esc(it.label)}</div>
+    <div class="kpi-value" id="${el.id}-v${i}">0</div>
+    <div class="kpi-sub">${esc(it.sub || '')}</div>
+  </div>`).join('');
+  items.forEach((it, i) => countUp(document.getElementById(`${el.id}-v${i}`), it.value || 0,
+    { decimals: it.decimals || 0, suffix: it.suffix || '' }));
+}
+
+// ---------- 图表 ----------
+function niceMax(v) {
+  if (!(v > 0)) return 1;
+  const exp = Math.floor(Math.log10(v));
+  const base = Math.pow(10, exp);
+  const f = v / base;
+  const nice = f <= 1 ? 1 : f <= 2 ? 2 : f <= 5 ? 5 : 10;
+  return nice * base;
+}
+
+/// Catmull-Rom 转三次贝塞尔，得到平滑曲线
+function smoothPath(pts) {
+  if (!pts.length) return '';
+  if (pts.length === 1) return `M${pts[0].x.toFixed(2)},${pts[0].y.toFixed(2)}`;
+  let d = `M${pts[0].x.toFixed(2)},${pts[0].y.toFixed(2)}`;
+  for (let i = 0; i < pts.length - 1; i++) {
+    const p0 = pts[i - 1] || pts[i], p1 = pts[i], p2 = pts[i + 1], p3 = pts[i + 2] || p2;
+    const c1x = p1.x + (p2.x - p0.x) / 6, c1y = p1.y + (p2.y - p0.y) / 6;
+    const c2x = p2.x - (p3.x - p1.x) / 6, c2y = p2.y - (p3.y - p1.y) / 6;
+    d += ` C${c1x.toFixed(2)},${c1y.toFixed(2)} ${c2x.toFixed(2)},${c2y.toFixed(2)} ${p2.x.toFixed(2)},${p2.y.toFixed(2)}`;
+  }
+  return d;
+}
+
+function lineChart(el, series, opts = {}) {
+  if (!el) return;
+  const rows = (series || []).filter(s => s.points && s.points.length);
+  if (!rows.length) { el.innerHTML = '<div class="empty">该范围内暂无数据</div>'; return; }
+  const W = Math.max(320, Math.round(el.clientWidth || 640));
+  const H = opts.height || 220;
+  const pad = { l: 46, r: 14, t: 14, b: 24 };
+  const iw = W - pad.l - pad.r, ih = H - pad.t - pad.b;
+  const count = Math.max(...rows.map(s => s.points.length));
+  const max = niceMax(Math.max(1, ...rows.flatMap(s => s.points.map(p => p.v || 0))));
+  const X = (i) => pad.l + (count <= 1 ? iw / 2 : (i / (count - 1)) * iw);
+  const Y = (v) => pad.t + ih - (Math.min(v || 0, max) / max) * ih;
+  const uid = el.id || 'chart';
+  const grid = [0, 0.25, 0.5, 0.75, 1].map(f => {
+    const gy = pad.t + ih * (1 - f);
+    return `<line x1="${pad.l}" y1="${gy.toFixed(1)}" x2="${W - pad.r}" y2="${gy.toFixed(1)}" class="grid"/>`
+      + `<text x="${pad.l - 8}" y="${(gy + 3).toFixed(1)}" class="axis" text-anchor="end">${fmtAxis(max * f)}</text>`;
+  }).join('');
+  const defs = rows.map((s, i) => `<linearGradient id="${uid}-g${i}" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="${s.color}" stop-opacity=".30"/>
+      <stop offset="1" stop-color="${s.color}" stop-opacity="0"/></linearGradient>`).join('');
+  const paths = rows.map((s, i) => {
+    const pts = s.points.map((p, j) => ({ x: X(j), y: Y(p.v) }));
+    const d = smoothPath(pts);
+    const area = `${d} L${pts[pts.length - 1].x.toFixed(2)},${pad.t + ih} L${pts[0].x.toFixed(2)},${pad.t + ih} Z`;
+    return `<path d="${area}" fill="url(#${uid}-g${i})"/>`
+      + `<path d="${d}" fill="none" stroke="${s.color}" stroke-width="${rows.length > 2 ? 1.6 : 2}" stroke-linecap="round"/>`;
+  }).join('');
+  // 点太少时补上端点，避免单点/稀疏数据画不出线
+  const dots = count <= 24 ? rows.map(s => s.points.map((p, j) =>
+    `<circle cx="${X(j).toFixed(1)}" cy="${Y(p.v).toFixed(1)}" r="2.4" fill="${s.color}"/>`).join('')).join('') : '';
+  const tsList = rows[0].points.map(p => p.ts || 0);
+  const tickFmt = opts.tickFormatter || ((ts) => (STATS.range <= 86400 ? hhmm(ts) : dayLabel(ts)));
+  const idxs = [...new Set([0, 0.25, 0.5, 0.75, 1].map(f => Math.round(f * (tsList.length - 1))))];
+  const xlabels = idxs.map(i => `<text x="${X(i).toFixed(1)}" y="${H - 6}" class="axis"
+      text-anchor="${i === 0 ? 'start' : i === tsList.length - 1 ? 'end' : 'middle'}">${esc(tickFmt(tsList[i]))}</text>`).join('');
+  el.innerHTML = `<svg viewBox="0 0 ${W} ${H}" class="chart-svg">${defs}${grid}${paths}${dots}${xlabels}</svg>`;
+}
+
+function arcPath(cx, cy, R, r, a1, a2) {
+  const large = a2 - a1 > Math.PI ? 1 : 0;
+  const pt = (rad, a) => [cx + rad * Math.cos(a), cy + rad * Math.sin(a)];
+  const [x1, y1] = pt(R, a1), [x2, y2] = pt(R, a2), [x3, y3] = pt(r, a2), [x4, y4] = pt(r, a1);
+  return `M${x1.toFixed(2)},${y1.toFixed(2)} A${R},${R} 0 ${large} 1 ${x2.toFixed(2)},${y2.toFixed(2)}`
+    + ` L${x3.toFixed(2)},${y3.toFixed(2)} A${r},${r} 0 ${large} 0 ${x4.toFixed(2)},${y4.toFixed(2)} Z`;
+}
+
+function donut(el, items, opts = {}) {
+  if (!el) return;
+  const rows = (items || []).filter(i => i.count > 0);
+  const total = rows.reduce((n, i) => n + i.count, 0);
+  if (!total) { el.innerHTML = '<div class="empty">暂无数据</div>'; return; }
+  const colors = opts.colors || S_COLORS;
+  const cx = 70, cy = 70, R = 56, r = 39;
+  let arcs = '';
+  if (rows.length === 1) {
+    arcs = `<circle cx="${cx}" cy="${cy}" r="${(R + r) / 2}" fill="none" stroke="${colors[0]}" stroke-width="${R - r}"/>`;
+  } else {
+    let a = -Math.PI / 2;
+    rows.forEach((it, i) => {
+      const a2 = a + (it.count / total) * Math.PI * 2;
+      arcs += `<path d="${arcPath(cx, cy, R, r, a, a2)}" fill="${colors[i % colors.length]}"><title>${esc(it.name)} ${it.count}</title></path>`;
+      a = a2;
+    });
+  }
+  el.innerHTML = `<div class="donut-wrap">
+    <svg viewBox="0 0 140 140" width="140" height="140">${arcs}
+      <text x="${cx}" y="${cy - 2}" text-anchor="middle" class="donut-num">${fmtNum(total)}</text>
+      <text x="${cx}" y="${cy + 16}" text-anchor="middle" class="donut-label">${esc(opts.center || '总计')}</text>
+    </svg>
+    <div class="donut-legend">${rows.map((it, i) => `<div class="legendrow">
+      <i style="background:${colors[i % colors.length]}"></i>
+      <span class="nm" title="${esc(it.name)}">${esc(it.name)}</span>
+      <span class="num">${fmtNum(it.count)}</span>
+      <span class="pct">${(it.count / total * 100).toFixed(1)}%</span>
+    </div>`).join('')}</div>
+  </div>`;
+}
+
+function rankList(el, items, opts = {}) {
+  if (!el) return;
+  if (!items || !items.length) { el.innerHTML = '<div class="empty">暂无数据</div>'; return; }
+  const max = Math.max(1, ...items.map(i => i.count));
+  const label = opts.label || ((n) => n);
+  el.innerHTML = `<div class="ranklist">${items.map((it, i) => `<div class="rankrow">
+    <span class="idx">${i + 1}</span>
+    <span class="nm" title="${esc(it.name)}">${esc(label(it.name))}</span>
+    <span class="track"><span class="fill" style="width:${Math.max(2, it.count / max * 100)}%"></span></span>
+    <span class="num">${fmtNum(it.count)}</span>
+  </div>`).join('')}</div>`;
+}
+
+// ---------- 点阵地图 ----------
+const WORLD_POLYS = [
+  [[-168,66],[-140,70],[-120,72],[-95,74],[-80,73],[-60,60],[-55,50],[-65,45],[-70,42],[-75,35],[-80,26],[-87,30],[-97,26],[-105,22],[-115,30],[-125,40],[-130,52],[-140,60]],
+  [[-81,12],[-70,12],[-60,10],[-50,0],[-35,-6],[-38,-22],[-48,-30],[-58,-40],[-65,-50],[-72,-54],[-75,-45],[-71,-30],[-70,-18],[-80,-5]],
+  [[-17,15],[-5,36],[10,37],[32,32],[35,15],[43,12],[51,12],[42,-2],[40,-15],[35,-25],[25,-34],[18,-34],[12,-18],[9,4],[-8,5]],
+  [[-10,36],[0,44],[10,45],[20,40],[28,36],[30,45],[40,48],[60,60],[45,70],[30,70],[10,70],[5,58],[-5,48]],
+  [[30,45],[45,42],[60,38],[75,35],[60,25],[75,20],[80,8],[90,20],[100,10],[110,5],[122,10],[127,30],[140,45],[142,55],[160,60],[180,66],[180,74],[140,74],[100,78],[60,70],[40,60]],
+  [[113,-22],[130,-12],[142,-11],[153,-26],[150,-38],[140,-38],[130,-32],[115,-34]],
+  [[-45,60],[-20,70],[-20,83],[-60,83],[-55,70]],
+  [[130,31],[136,35],[141,41],[145,44],[142,39],[138,34],[132,31]],
+  [[-8,50],[-4,58],[2,58],[0,51]],
+];
+const CN_POLYS = [
+  [[73.5,39.5],[76,40],[80,42],[85,45],[88,48],[90,47.5],[95,49],[98,52],[105,51],[110,49],[116,50],[120,53],[126,53],[130,49],[134,48],[135,45],[130,42],[124,41],[122,37],[121,31],[122,29],[120,25],[117,23],[110,21],[108,21],[106,22],[104,22],[101,21],[99,22],[97,24],[98,27],[95,28],[92,28],[88,28],[85,29],[81,30],[79,32],[78,35],[75,37]],
+  [[108.7,19.2],[110.5,20.1],[111.5,18.3],[108.8,18.2]],
+  [[121,25.5],[122,25],[121.5,22],[120.2,22.5]],
+];
+
+function pointInPoly(lon, lat, poly) {
+  let inside = false;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const [xi, yi] = poly[i], [xj, yj] = poly[j];
+    if ((yi > lat) !== (yj > lat) && lon < (xj - xi) * (lat - yi) / (yj - yi) + xi) inside = !inside;
+  }
+  return inside;
+}
+
+function mapConfig(region) {
+  return region === 'cn'
+    ? { lon0: 73, lon1: 135, lat0: 54, lat1: 18, step: 1.1, W: 600, H: 349, polys: CN_POLYS }
+    : { lon0: -180, lon1: 180, lat0: 84, lat1: -56, step: 3, W: 600, H: 233, polys: WORLD_POLYS };
+}
+
+const MAP_DOTS = {};
+function mapDots(region) {
+  if (MAP_DOTS[region]) return MAP_DOTS[region];
+  const cfg = mapConfig(region);
+  let d = '';
+  for (let lon = cfg.lon0; lon <= cfg.lon1; lon += cfg.step) {
+    for (let lat = cfg.lat1; lat <= cfg.lat0; lat += cfg.step) {
+      if (!cfg.polys.some(poly => pointInPoly(lon, lat, poly))) continue;
+      const x = (lon - cfg.lon0) / (cfg.lon1 - cfg.lon0) * cfg.W;
+      const y = (cfg.lat0 - lat) / (cfg.lat0 - cfg.lat1) * cfg.H;
+      d += `M${x.toFixed(1)} ${y.toFixed(1)}h1.7v1.7h-1.7z`;
+    }
+  }
+  MAP_DOTS[region] = `<path class="map-land" d="${d}"/>`;
+  return MAP_DOTS[region];
+}
+
+function mapHtml(region, geo, hot) {
+  const cfg = mapConfig(region);
+  const base = mapDots(region);
+  const pts = (geo && geo.points ? geo.points : []).filter(p =>
+    p.longitude >= cfg.lon0 && p.longitude <= cfg.lon1 && p.latitude >= cfg.lat1 && p.latitude <= cfg.lat0);
+  const max = Math.max(1, ...pts.map(p => p.count || 1));
+  const pins = pts.map(p => {
+    const x = (p.longitude - cfg.lon0) / (cfg.lon1 - cfg.lon0) * cfg.W;
+    const y = (cfg.lat0 - p.latitude) / (cfg.lat0 - cfg.lat1) * cfg.H;
+    const r = (2 + Math.sqrt((p.count || 1) / max) * 5.5).toFixed(1);
+    return `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="${r}" class="geo-point${hot ? ' hot' : ''}">`
+      + `<title>${p.latitude.toFixed(2)}, ${p.longitude.toFixed(2)} · ${fmtNum(p.count)} 次</title></circle>`;
+  }).join('');
+  const note = geo && geo.available === false
+    ? '<div class="map-note">未启用 GeoIP：在「设置 → 地理信息」填写 mmdb 路径</div>' : '';
+  const badge = geo && geo.available ? `<div class="map-badge">已解析 ${fmtNum(geo.resolved_ips)} 个 IP</div>` : '';
+  return `<svg viewBox="0 0 ${cfg.W} ${cfg.H}">${base}${pins}</svg>${note}${badge}`;
+}
+
+// ---------- 流量分析 ----------
+async function loadStatistics() {
+  if (!document.querySelector('.page[data-page="statistics"]').classList.contains('active')) return;
+  if (STATS.tab === 'traffic') await loadTraffic();
+  else if (STATS.tab === 'security') await loadSecurity();
+  else await loadReports();
+}
+
+async function loadTraffic() {
+  const qs = new URLSearchParams({ range: String(STATS.range) });
+  if (STATS.app) qs.set('app', STATS.app);
   try {
-    const res = await api('/events?limit=5');
-    if (!res.events.length) { el.innerHTML = '<div class="empty">还没有安全事件</div>'; return; }
-    el.innerHTML = `<table>
-      <thead><tr><th>时间</th><th>类型</th><th>来源</th><th>规则</th><th>处置</th></tr></thead>
-      <tbody>${res.events.map(e => `<tr>
-        <td>${fmtTime(e.ts)}</td><td>${esc(kindLabel(e.kind))}</td><td><code>${esc(e.client_ip)}</code></td>
-        <td><code>${esc(e.rules)}</code></td>
-        <td><span class="tag ${esc(e.action)}">${esc(actionLabel(e.action))}</span></td>
-      </tr>`).join('')}</tbody></table>`;
-  } catch { el.innerHTML = '<div class="empty">加载失败</div>'; }
+    const s = await api('/stats?' + qs.toString());
+    const t = s.traffic || {};
+    document.getElementById('top-rules').textContent = s.detect_rules;
+    document.getElementById('top-bans').textContent = s.active_bans;
+    document.getElementById('top-mode').textContent = s.observe_mode ? '观察模式' : '拦截模式';
+    document.getElementById('nav-bans').textContent = s.active_bans;
+    document.getElementById('nav-bans').className = 'badge' + (s.active_bans > 0 ? ' alert' : '');
+
+    const statuses = t.statuses || [];
+    const sumStatus = (p) => statuses.filter(x => String(x.name).startsWith(p)).reduce((a, b) => a + b.count, 0);
+    const c4 = sumStatus('4'), c5 = sumStatus('5');
+    const req = t.requests || 0;
+    renderKpis(document.getElementById('traffic-kpis'), [
+      { label: '请求次数', value: req, cls: 'acc', sub: rangeLabel(STATS.range) + (STATS.app ? ' · ' + STATS.app : '') },
+      { label: 'PV', value: t.pv || 0, sub: '页面浏览量' },
+      { label: 'UV', value: t.uv || 0, sub: '按 IP + UA 去重' },
+      { label: '独立 IP', value: t.unique_ips || 0, sub: '含放行与拦截' },
+      { label: '拦截次数', value: t.blocked || 0, cls: 'hot', sub: `拦截率 ${fmtPct(req ? t.blocked / req * 100 : 0)}` },
+      { label: '攻击 IP', value: t.attack_ips || 0, cls: 'hot', sub: '被拦截来源去重' },
+      { label: '4xx 率', value: req ? c4 / req * 100 : 0, decimals: 2, suffix: '%', sub: `${fmtNum(c4)} 次客户端错误` },
+      { label: '5xx 率', value: req ? c5 / req * 100 : 0, decimals: 2, suffix: '%', sub: `${fmtNum(c5)} 次服务端错误` },
+    ]);
+
+    const series = t.series || [];
+    lineChart(document.getElementById('traffic-trend'), [
+      { name: '请求', color: '#4a9eda', points: series.map(p => ({ ts: p.ts, v: p.requests })) },
+      { name: '拦截', color: '#f06a6a', points: series.map(p => ({ ts: p.ts, v: p.blocked })) },
+    ]);
+
+    const groups = [
+      { name: '2xx 成功', count: sumStatus('2') },
+      { name: '3xx 跳转', count: sumStatus('3') },
+      { name: '4xx 客户端', count: sumStatus('4') },
+      { name: '5xx 服务端', count: sumStatus('5') },
+    ].filter(g => g.count > 0);
+    donut(document.getElementById('traffic-status'), groups,
+      { colors: ['#3ddc97', '#4a9eda', '#e3b341', '#f06a6a'], center: '状态码' });
+
+    rankList(document.getElementById('top-hosts'), (t.hosts || []).slice(0, 8));
+    rankList(document.getElementById('top-paths'), (t.paths || []).slice(0, 8));
+    rankList(document.getElementById('top-referers'), (t.referer_hosts || []).slice(0, 8));
+    rankList(document.getElementById('traffic-os'), t.os || []);
+    rankList(document.getElementById('traffic-browsers'), t.browsers || []);
+
+    renderTrafficMap();
+  } catch (e) {
+    showMsg('加载流量分析失败：' + e.message, 'error');
+  }
+}
+
+async function fetchGeo(mode) {
+  const qs = new URLSearchParams({ range: String(STATS.range) });
+  if (STATS.app) qs.set('app', STATS.app);
+  if (mode === 'blocked') qs.set('mode', 'blocked');
+  return api('/stats/geo?' + qs.toString());
+}
+
+async function ensureGeo(mode) {
+  const key = `${mode}|${STATS.range}|${STATS.app}`;
+  if (!STATS.geoCache[key]) STATS.geoCache[key] = await fetchGeo(mode);
+  return STATS.geoCache[key];
+}
+
+async function renderTrafficMap() {
+  const el = document.getElementById('traffic-map');
+  if (!el) return;
+  try {
+    const geo = await ensureGeo(STATS.mapMode);
+    el.innerHTML = mapHtml(STATS.mapRegion, geo, STATS.mapMode === 'blocked');
+    renderGeoList(geo);
+  } catch (e) {
+    el.innerHTML = `<div class="empty">地图加载失败：${esc(e.message)}</div>`;
+  }
+}
+
+function renderGeoList(geo) {
+  const el = document.getElementById('traffic-geo-list');
+  if (!geo || !geo.available) {
+    el.innerHTML = `<div class="empty">${geo && geo.error ? 'GeoIP 加载失败：' + esc(geo.error) : '未启用 GeoIP'}</div>`;
+    return;
+  }
+  const block = (title, items) => {
+    if (!items || !items.length) return '';
+    const max = Math.max(1, ...items.map(i => i.count));
+    return `<div class="rank-h">${esc(title)}</div><div class="ranklist">${items.map((it, i) => `<div class="rankrow">
+      <span class="idx">${i + 1}</span>
+      <span class="nm" title="${esc(it.name)}">${esc(it.name)}</span>
+      <span class="track"><span class="fill" style="width:${Math.max(2, it.count / max * 100)}%"></span></span>
+      <span class="num">${fmtNum(it.count)}</span>
+    </div>`).join('')}</div>`;
+  };
+  const html = block('国家 Top', (geo.countries || []).slice(0, 7))
+    + block('省份 Top', (geo.provinces || []).slice(0, 6))
+    + block('城市 Top', (geo.cities || []).slice(0, 4));
+  el.innerHTML = html || '<div class="empty">该范围内没有可解析的来源 IP</div>';
+}
+
+// ---------- 安全态势 ----------
+async function loadSecurity() {
+  try {
+    const d = await api('/security?range=' + STATS.range);
+    const tot = d.totals || {};
+    renderKpis(document.getElementById('sec-kpis'), [
+      { label: '安全事件', value: tot.events || 0, cls: 'acc', sub: rangeLabel(STATS.range) },
+      { label: '拦截次数', value: tot.blocked || 0, cls: 'hot', sub: '已处置事件' },
+      { label: '攻击 IP', value: tot.attack_ips || 0, cls: 'hot', sub: '被拦截来源去重' },
+      { label: '拦截占比', value: tot.events ? tot.blocked / tot.events * 100 : 0, decimals: 2, suffix: '%', sub: '拦截 / 安全事件' },
+    ]);
+
+    const points = d.series || [];
+    const keys = [
+      { key: 'detect', name: '检测', color: '#4a9eda' },
+      { key: 'ban', name: '封禁', color: '#f06a6a' },
+      { key: 'acl', name: '名单命中', color: '#e3b341' },
+      { key: 'ratelimit', name: 'CC 限流', color: '#a371f7' },
+      { key: 'challenge', name: '人机验证', color: '#3ddc97' },
+    ].filter(k => points.some(p => (p[k.key] || 0) > 0));
+    lineChart(document.getElementById('sec-trend'),
+      keys.map(k => ({ name: k.name, color: k.color, points: points.map(p => ({ ts: p.ts, v: p[k.key] || 0 })) })));
+    document.getElementById('sec-trend-legend').innerHTML =
+      keys.map(k => `<span><i style="background:${k.color}"></i>${k.name}</span>`).join('');
+
+    donut(document.getElementById('sec-categories'),
+      (d.categories || []).map(c => ({ name: catLabel(c.name), count: c.count })),
+      { center: '攻击类型' });
+    rankList(document.getElementById('sec-acl'), d.acl_reasons || [], { label: catLabel });
+    rankList(document.getElementById('sec-rules'), d.rules || []);
+
+    const ips = d.top_ips || [];
+    document.getElementById('sec-ips').innerHTML = ips.length
+      ? `<table class="darktable"><thead><tr><th>来源 IP</th><th>归属地</th><th class="num">次数</th></tr></thead>
+        <tbody>${ips.map(ip => `<tr>
+          <td class="mono">${esc(ip.ip)}</td>
+          <td class="geo">${esc(geoText(ip.geo))}</td>
+          <td class="num">${fmtNum(ip.count)}</td>
+        </tr>`).join('')}</tbody></table>`
+      : '<div class="empty">暂无攻击来源</div>';
+
+    const recent = d.recent || [];
+    document.getElementById('sec-recent').innerHTML = recent.length
+      ? `<table class="darktable"><thead><tr>
+          <th>时间</th><th>类型</th><th>来源 IP</th><th>应用</th><th>路径</th><th>处置</th>
+        </tr></thead><tbody>${recent.map(e => `<tr>
+          <td>${fmtTime(e.ts)}</td>
+          <td>${esc(kindLabel(e.kind))}</td>
+          <td class="mono">${esc(e.client_ip)}</td>
+          <td>${esc(e.app || '—')}</td>
+          <td class="mono">${esc(e.path || '—')}</td>
+          <td><span class="tag ${esc(e.action)}">${esc(actionLabel(e.action))}</span></td>
+        </tr>`).join('')}</tbody></table>`
+      : '<div class="empty">该范围内没有安全事件</div>';
+  } catch (e) {
+    showMsg('加载安全态势失败：' + e.message, 'error');
+  }
+}
+
+const geoText = (g) => {
+  if (!g) return '—';
+  const parts = [g.country, g.province, g.city].filter(Boolean);
+  return parts.length ? parts.join(' / ') : '—';
+};
+
+function ipTable(ips) {
+  if (!ips || !ips.length) return '<div class="empty">暂无数据</div>';
+  return `<table class="darktable"><thead><tr><th>来源 IP</th><th>归属地</th><th class="num">次数</th></tr></thead>
+    <tbody>${ips.map(ip => `<tr>
+      <td class="mono">${esc(ip.ip)}</td><td class="geo">${esc(geoText(ip.geo))}</td>
+      <td class="num">${fmtNum(ip.count)}</td></tr>`).join('')}</tbody></table>`;
+}
+
+// ---------- 防护报告 ----------
+async function loadReports() {
+  const el = document.getElementById('report-list');
+  try {
+    const d = await api('/reports?days=30');
+    STATS.reports = d.reports || [];
+    if (!STATS.reports.length) {
+      el.innerHTML = '<div class="empty">还没有日报数据</div>';
+      return;
+    }
+    el.innerHTML = STATS.reports.map(r => `<div class="report-item ${r.id === STATS.reportDay ? 'active' : ''}" data-day="${r.id}">
+      <div>
+        <div class="date">${esc(r.date)}</div>
+        <div class="sub">请求 ${fmtNum(r.requests)} · 拦截 ${fmtNum(r.blocked)} · 事件 ${fmtNum(r.events)}</div>
+      </div>
+      <div class="rate">${fmtPct(r.block_rate)}</div>
+    </div>`).join('');
+    if (!STATS.reportDay || !STATS.reports.some(r => r.id === STATS.reportDay)) {
+      STATS.reportDay = STATS.reports[0].id;
+      markReportActive();
+    }
+    loadReport(STATS.reportDay);
+  } catch (e) {
+    el.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`;
+  }
+}
+
+function markReportActive() {
+  document.querySelectorAll('#report-list .report-item').forEach(it => {
+    it.classList.toggle('active', Number(it.dataset.day) === STATS.reportDay);
+  });
+}
+
+async function loadReport(day) {
+  const box = document.getElementById('report-detail');
+  const qs = new URLSearchParams();
+  if (STATS.app) qs.set('app', STATS.app);
+  box.innerHTML = '<div class="empty">加载中…</div>';
+  try {
+    const r = await api(`/reports/${day}` + (qs.toString() ? '?' + qs.toString() : ''));
+    document.getElementById('report-title').textContent = `${r.date} 防护日报` + (r.app ? ' · ' + r.app : '');
+    document.getElementById('report-csv').disabled = false;
+    const t = r.totals || {};
+    box.innerHTML = `<div class="report-body">
+      <div class="report-kpis">
+        <div class="kpi acc"><div class="kpi-label">请求次数</div><div class="kpi-value">${fmtNum(t.requests)}</div><div class="kpi-sub"></div></div>
+        <div class="kpi"><div class="kpi-label">PV</div><div class="kpi-value">${fmtNum(t.pv)}</div><div class="kpi-sub"></div></div>
+        <div class="kpi hot"><div class="kpi-label">拦截次数</div><div class="kpi-value">${fmtNum(t.blocked)}</div><div class="kpi-sub">拦截率 ${fmtPct(r.block_rate)}</div></div>
+        <div class="kpi"><div class="kpi-label">独立 IP</div><div class="kpi-value">${fmtNum(t.unique_ips)}</div><div class="kpi-sub">UV ${fmtNum(t.unique_visitors)}</div></div>
+        <div class="kpi"><div class="kpi-label">4xx</div><div class="kpi-value">${fmtNum(t.status_4xx)}</div><div class="kpi-sub">${fmtPct(r.four_xx_rate)}</div></div>
+        <div class="kpi"><div class="kpi-label">5xx</div><div class="kpi-value">${fmtNum(t.status_5xx)}</div><div class="kpi-sub">${fmtPct(r.five_xx_rate)}</div></div>
+      </div>
+      <div class="chart" id="report-trend"></div>
+      <div class="report-grid2">
+        <div class="report-block"><h3>攻击类型分布</h3><div id="report-categories"></div></div>
+        <div class="report-block"><h3>处置类型</h3><div id="report-kinds"></div></div>
+      </div>
+      <div class="report-grid2">
+        <div class="report-block"><h3>名单命中</h3><div id="report-acl"></div></div>
+        <div class="report-block"><h3>规则命中</h3><div id="report-rules"></div></div>
+      </div>
+      <div class="report-block"><h3>攻击来源 IP</h3><div id="report-ips"></div></div>
+      <div class="report-block"><h3>地理分布</h3><div id="report-geo"></div></div>
+    </div>`;
+
+    const series = r.series || [];
+    lineChart(document.getElementById('report-trend'), [
+      { name: '请求', color: '#4a9eda', points: series.map(p => ({ ts: p.ts, v: p.requests })) },
+      { name: '拦截', color: '#f06a6a', points: series.map(p => ({ ts: p.ts, v: p.blocked })) },
+    ], { height: 190 });
+    donut(document.getElementById('report-categories'),
+      (r.categories || []).map(c => ({ name: catLabel(c.name), count: c.count })), { center: '攻击类型' });
+    rankList(document.getElementById('report-kinds'),
+      (r.kinds || []).map(k => ({ name: kindLabel(k.name), count: k.count })));
+    rankList(document.getElementById('report-acl'), r.acl_reasons || []);
+    rankList(document.getElementById('report-rules'), r.rules || []);
+    document.getElementById('report-ips').innerHTML = ipTable(r.top_ips);
+    renderGeoListInto(document.getElementById('report-geo'), r.geo);
+  } catch (e) {
+    box.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`;
+  }
+}
+
+function renderGeoListInto(el, geo) {
+  if (!el) return;
+  if (!geo || !geo.available) { el.innerHTML = '<div class="empty">未启用 GeoIP</div>'; return; }
+  const block = (title, items) => {
+    if (!items || !items.length) return '';
+    const max = Math.max(1, ...items.map(i => i.count));
+    return `<div class="rank-h">${esc(title)}</div><div class="ranklist">${items.map((it, i) => `<div class="rankrow">
+      <span class="idx">${i + 1}</span><span class="nm">${esc(it.name)}</span>
+      <span class="track"><span class="fill" style="width:${Math.max(2, it.count / max * 100)}%"></span></span>
+      <span class="num">${fmtNum(it.count)}</span></div>`).join('')}</div>`;
+  };
+  el.innerHTML = block('国家', (geo.countries || []).slice(0, 6))
+    + block('省份', (geo.provinces || []).slice(0, 5))
+    || '<div class="empty">暂无归属地数据</div>';
+}
+
+async function downloadReportCsv() {
+  if (!STATS.reportDay) return;
+  try {
+    const qs = STATS.app ? '?app=' + encodeURIComponent(STATS.app) : '';
+    const res = await fetch(`/api/reports/${STATS.reportDay}/csv${qs}`);
+    if (!res.ok) throw new Error((await res.text()) || res.statusText);
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `homewaf-report-${new Date(STATS.reportDay * 1000).toISOString().slice(0, 10)}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  } catch (e) {
+    showMsg('导出失败：' + e.message, 'error');
+  }
+}
+
+// ---------- 防护大屏 ----------
+async function openScreen() {
+  document.getElementById('screen-overlay').classList.add('show');
+  document.body.style.overflow = 'hidden';
+  await loadScreen();
+  if (STATS.screenTimer) clearInterval(STATS.screenTimer);
+  STATS.screenTimer = setInterval(loadScreen, 10000);
+}
+
+function closeScreen() {
+  document.getElementById('screen-overlay').classList.remove('show');
+  document.body.style.overflow = '';
+  if (STATS.screenTimer) { clearInterval(STATS.screenTimer); STATS.screenTimer = null; }
+}
+
+async function loadScreen() {
+  try {
+    const d = await api('/screen');
+    STATS.screenGeo = d.geo;
+    document.getElementById('screen-sub').textContent =
+      `今日 ${new Date(d.today * 1000).toLocaleDateString('zh-CN')} · 更新于 `
+      + new Date(d.generated_at * 1000).toLocaleTimeString('zh-CN', { hour12: false });
+
+    const k = d.kpi || {};
+    const kpis = [
+      { label: '今日请求数', value: k.requests || 0, cls: '' },
+      { label: '今日拦截', value: k.blocked || 0, cls: 'hot', sub: `拦截率 ${fmtPct(k.block_rate)}` },
+      { label: '今日攻击 IP', value: k.attack_ips || 0, cls: 'hot' },
+      { label: '今日独立 IP', value: k.unique_ips || 0, cls: 'green' },
+      { label: '实时 QPS', value: k.qps || 0, decimals: 1, cls: 'green', sub: `峰值 ${k.peak_qps || 0}` },
+    ];
+    document.getElementById('screen-kpis').innerHTML = kpis.map((it, i) => `<div class="skpi ${it.cls}">
+      <div class="skpi-label">${esc(it.label)}</div>
+      <div class="skpi-value" id="skpi-${i}">0</div>
+      ${it.sub ? `<div class="skpi-label" style="margin-top:2px">${esc(it.sub)}</div>` : ''}
+    </div>`).join('');
+    kpis.forEach((it, i) => countUp(document.getElementById('skpi-' + i), it.value, { decimals: it.decimals || 0 }));
+
+    const trend = d.trend || [];
+    lineChart(document.getElementById('screen-trend'), [
+      { name: '请求', color: '#38d6ff', points: trend.map(p => ({ ts: p.ts, v: p.requests })) },
+      { name: '拦截', color: '#ff6b81', points: trend.map(p => ({ ts: p.ts, v: p.blocked })) },
+    ], { height: 240, tickFormatter: dayLabel });
+
+    const ops = d.ops || [];
+    lineChart(document.getElementById('screen-ops'), [
+      { name: 'QPS', color: '#35e0a1', points: ops.map((v, i) => ({ ts: d.generated_at - (ops.length - i) + 1, v })) },
+    ], { height: 240, tickFormatter: (ts) => new Date(ts * 1000).toLocaleTimeString('zh-CN', { minute: '2-digit', second: '2-digit', hour12: false }) });
+
+    document.getElementById('screen-map').innerHTML = mapHtml(STATS.screenRegion, d.geo, false);
+
+    const cats = d.categories || [];
+    document.getElementById('screen-categories').innerHTML = cats.length
+      ? `<table class="darktable"><thead><tr><th>攻击分类</th><th class="num">数量</th></tr></thead>
+        <tbody>${cats.map(c => `<tr><td>${esc(catLabel(c.name))}</td><td class="num">${fmtNum(c.count)}</td></tr>`).join('')}</tbody></table>`
+      : '<div class="empty">今日暂无拦截记录</div>';
+
+    const ips = d.top_ips || [];
+    document.getElementById('screen-ips').innerHTML = ips.length
+      ? `<table class="darktable"><thead><tr><th>来源 IP</th><th>归属地</th><th class="num">次数</th></tr></thead>
+        <tbody>${ips.map(ip => `<tr><td class="mono">${esc(ip.ip)}</td>
+          <td class="geo">${esc(geoText(ip.geo))}</td><td class="num">${fmtNum(ip.count)}</td></tr>`).join('')}</tbody></table>`
+      : '<div class="empty">今日暂无攻击来源</div>';
+  } catch (e) {
+    document.getElementById('screen-sub').textContent = '加载失败：' + e.message;
+  }
+}
+
+// ---------- 统计报表交互 ----------
+document.getElementById('stats-tabs').addEventListener('click', (e) => {
+  const a = e.target.closest('a[data-tab]');
+  if (!a) return;
+  STATS.tab = a.dataset.tab;
+  document.querySelectorAll('#stats-tabs a').forEach(x => x.classList.toggle('active', x === a));
+  document.querySelectorAll('.stats-panel').forEach(p => p.classList.toggle('active', p.dataset.tab === STATS.tab));
+  loadStatistics();
+});
+
+document.getElementById('stats-range').addEventListener('change', (e) => {
+  STATS.range = parseInt(e.target.value, 10) || 86400;
+  STATS.geoCache = {};
+  loadStatistics();
+});
+
+document.getElementById('stats-app').addEventListener('change', (e) => {
+  STATS.app = e.target.value;
+  STATS.geoCache = {};
+  loadStatistics();
+});
+
+document.getElementById('stats-refresh').addEventListener('click', () => {
+  STATS.geoCache = {};
+  loadStatistics();
+});
+document.getElementById('stats-screen-btn').addEventListener('click', openScreen);
+
+document.getElementById('map-mode').addEventListener('click', (e) => {
+  const btn = e.target.closest('button[data-mode]');
+  if (!btn) return;
+  STATS.mapMode = btn.dataset.mode;
+  document.querySelectorAll('#map-mode button').forEach(b => b.classList.toggle('on', b === btn));
+  renderTrafficMap();
+});
+
+document.getElementById('map-region').addEventListener('click', (e) => {
+  const btn = e.target.closest('button[data-region]');
+  if (!btn) return;
+  STATS.mapRegion = btn.dataset.region;
+  document.querySelectorAll('#map-region button').forEach(b => b.classList.toggle('on', b === btn));
+  renderTrafficMap();
+});
+
+document.getElementById('report-list').addEventListener('click', (e) => {
+  const item = e.target.closest('.report-item');
+  if (!item) return;
+  STATS.reportDay = Number(item.dataset.day);
+  markReportActive();
+  loadReport(STATS.reportDay);
+});
+
+document.getElementById('report-csv').addEventListener('click', downloadReportCsv);
+
+document.getElementById('screen-close-btn').addEventListener('click', closeScreen);
+document.getElementById('screen-theme-btn').addEventListener('click', () => {
+  STATS.screenLight = !STATS.screenLight;
+  document.getElementById('screen-shell').classList.toggle('light', STATS.screenLight);
+  document.getElementById('screen-theme-btn').textContent = STATS.screenLight ? '暗黑主题' : '明亮主题';
+});
+
+function renameScreen() {
+  const el = document.getElementById('screen-title');
+  const t = prompt('自定义大屏标题', el.textContent);
+  if (t && t.trim()) el.textContent = t.trim();
+}
+document.getElementById('screen-rename-btn').addEventListener('click', renameScreen);
+document.getElementById('screen-title').addEventListener('click', renameScreen);
+
+document.getElementById('screen-map-region').addEventListener('click', (e) => {
+  const btn = e.target.closest('button[data-region]');
+  if (!btn) return;
+  STATS.screenRegion = btn.dataset.region;
+  document.querySelectorAll('#screen-map-region button').forEach(b => b.classList.toggle('on', b === btn));
+  if (STATS.screenGeo) document.getElementById('screen-map').innerHTML = mapHtml(STATS.screenRegion, STATS.screenGeo, false);
+});
+
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') closeScreen();
+});
+
+async function loadStatisticsApps() {
+  try {
+    const apps = await api('/apps');
+    const sel = document.getElementById('stats-app');
+    sel.innerHTML = '<option value="">全部应用</option>'
+      + apps.map(a => `<option value="${esc(a.id)}">${esc(a.id)}</option>`).join('');
+  } catch { /* 忽略：应用下拉失败不影响统计 */ }
 }
 
 // ============================================================
@@ -712,7 +1681,7 @@ async function submitApp(e) {
   try {
     await api('/apps', { method: 'POST', body: JSON.stringify(app) });
     showMsg(editingApp ? `已更新 ${id}` : `已创建 ${id}`);
-    hideAppForm(); loadApps(); loadStats();
+    hideAppForm(); loadApps(); loadStatistics();
   } catch (err) { showMsg('保存失败：' + err.message, 'error'); }
   finally { btn.disabled = false; btn.textContent = editingApp ? '保存修改' : '创建'; }
 }
@@ -721,7 +1690,7 @@ async function deleteApp(id) {
   if (!confirm(`删除应用 ${id}？该域名的请求会立即停止转发。`)) return;
   try {
     await api('/apps/' + encodeURIComponent(id), { method: 'DELETE' });
-    showMsg(`已删除 ${id}`); loadApps(); loadStats();
+    showMsg(`已删除 ${id}`); loadApps(); loadStatistics();
   } catch (e) { showMsg('删除失败：' + e.message, 'error'); }
 }
 
@@ -767,14 +1736,14 @@ async function submitRule(e) {
   try {
     await api('/rules', { method: 'POST', body: JSON.stringify({ cidr, action, scope: scope || null, note: note || null }) });
     showMsg(`规则已添加：${cidr}`);
-    hideRuleForm(); loadRules(); loadStats();
+    hideRuleForm(); loadRules(); loadStatistics();
   } catch (err) { showMsg('添加失败：' + err.message, 'error'); }
   finally { btn.disabled = false; btn.textContent = '添加'; }
 }
 
 async function deleteRule(id) {
   if (!confirm(`删除规则 ${id}？`)) return;
-  try { await api('/rules/' + encodeURIComponent(id), { method: 'DELETE' }); showMsg('已删除'); loadRules(); loadStats(); }
+  try { await api('/rules/' + encodeURIComponent(id), { method: 'DELETE' }); showMsg('已删除'); loadRules(); loadStatistics(); }
   catch (e) { showMsg('删除失败：' + e.message, 'error'); }
 }
 
@@ -878,7 +1847,7 @@ async function submitFeed(e) {
     const res = await api('/feeds', { method: 'POST', body: JSON.stringify({ name, url, action, scope: scope ? [scope] : [] }) });
     if (res && res.warning) showMsg(res.warning, 'error');
     else showMsg(`订阅 ${name} 已添加并拉取成功`);
-    hideFeedForm(); loadFeeds(); loadStats();
+    hideFeedForm(); loadFeeds(); loadStatistics();
   } catch (err) { showMsg('添加失败：' + err.message, 'error'); }
   finally { btn.disabled = false; btn.textContent = '添加并拉取'; }
 }
@@ -895,7 +1864,7 @@ async function refreshFeed(name) {
 
 async function deleteFeed(name) {
   if (!confirm(`删除订阅 ${name}？对应的规则会立即失效。`)) return;
-  try { await api('/feeds/' + encodeURIComponent(name), { method: 'DELETE' }); showMsg('已删除'); loadFeeds(); loadStats(); }
+  try { await api('/feeds/' + encodeURIComponent(name), { method: 'DELETE' }); showMsg('已删除'); loadFeeds(); loadStatistics(); }
   catch (e) { showMsg('删除失败：' + e.message, 'error'); }
 }
 
@@ -1034,7 +2003,7 @@ async function submitRuleFeed(e) {
     const res = await api('/rule-feeds', { method: 'POST', body: JSON.stringify(feed) });
     if (res && res.warning) showMsg(res.warning, 'error');
     else showMsg(`规则订阅 ${name} 已保存并拉取成功`);
-    hideRuleFeedForm(); loadRuleFeeds(); loadStats();
+    hideRuleFeedForm(); loadRuleFeeds(); loadStatistics();
   } catch (err) { showMsg('保存失败：' + err.message, 'error'); }
   finally { btn.disabled = false; btn.textContent = '保存并拉取'; }
 }
@@ -1045,7 +2014,7 @@ async function refreshRuleFeed(name) {
     const res = await api('/rule-feeds/' + encodeURIComponent(name) + '/refresh', { method: 'POST' });
     if (res && res.warning) showMsg(res.warning, 'error');
     else showMsg(`${name} 已刷新`);
-    loadRuleFeeds(); loadStats();
+    loadRuleFeeds(); loadStatistics();
   } catch (e) { showMsg('刷新失败：' + e.message, 'error'); }
 }
 
@@ -1053,7 +2022,7 @@ async function deleteRuleFeed(name) {
   if (!confirm(`删除规则订阅 ${name}？该订阅提供的检测规则会立即失效。`)) return;
   try {
     await api('/rule-feeds/' + encodeURIComponent(name), { method: 'DELETE' });
-    showMsg('已删除'); loadRuleFeeds(); loadStats();
+    showMsg('已删除'); loadRuleFeeds(); loadStatistics();
   } catch (e) { showMsg('删除失败：' + e.message, 'error'); }
 }
 
@@ -1079,7 +2048,7 @@ async function loadBans() {
 
 async function unban(ip) {
   if (!confirm(`确定解封 ${ip}？`)) return;
-  try { await api('/bans/' + encodeURIComponent(ip), { method: 'DELETE' }); showMsg(`已解封 ${ip}`); loadBans(); loadStats(); }
+  try { await api('/bans/' + encodeURIComponent(ip), { method: 'DELETE' }); showMsg(`已解封 ${ip}`); loadBans(); loadStatistics(); }
   catch (e) { showMsg('解封失败：' + e.message, 'error'); }
 }
 
@@ -1422,7 +2391,7 @@ async function saveSettings() {
     await api('/settings/geoip_db', { method: 'PUT', body: JSON.stringify(document.getElementById('set-geoip').value.trim()) });
 
     showMsg('设置已保存并立即生效');
-    loadSettings(); loadStats();
+    loadSettings(); loadStatistics();
   } catch (e) {
     showMsg('保存失败：' + e.message, 'error');
     loadSettings();
@@ -1432,8 +2401,12 @@ async function saveSettings() {
 // ============================================================
 // 启动
 // ============================================================
-loadStats();
-setInterval(loadStats, 5000);
+loadStatisticsApps();
+loadStatistics();
+// 统计页保持轻量轮询；报告页不动，避免打断正在看的日报
+setInterval(() => {
+  if (currentPage === 'statistics' && STATS.tab !== 'reports') loadStatistics();
+}, 30000);
 </script>
 </body>
 </html>

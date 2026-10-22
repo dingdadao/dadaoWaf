@@ -290,6 +290,9 @@ struct RangeQuery {
     range: Option<i64>,
     #[serde(default)]
     app: Option<String>,
+    /// 地理聚合口径：`blocked` 只看被拦截的来源，其它值按全部请求
+    #[serde(default)]
+    mode: Option<String>,
 }
 
 /// 统一去掉空白的应用过滤，`""` 视为不过滤。
@@ -437,8 +440,18 @@ async fn geo_stats(
     let range = q.range.unwrap_or(86_400).clamp(60, 86_400);
     let app = norm_app(&q.app);
     let now = homewaf_acl::now_unix();
-    let data = ctx.metrics.dashboard(range, app, now);
-    Json(ctx.geoip.resolve(&data.ips)).into_response()
+    // 「仅拦截」口径取事件表里的攻击来源；与内存快照不同，它天然带着处置结果，
+    // 也不受应用过滤影响（事件归属应用，但地图只看来源地区）。
+    let stats = if q.mode.as_deref() == Some("blocked") {
+        let pairs = ctx
+            .store
+            .top_event_ips(now - range + 1, now + 1, Some("block"), 500)
+            .unwrap_or_default();
+        geo_stats_from(&ctx.geoip, &pairs)
+    } else {
+        ctx.geoip.resolve(&ctx.metrics.dashboard(range, app, now).ips)
+    };
+    Json(stats).into_response()
 }
 
 // ============================================================
