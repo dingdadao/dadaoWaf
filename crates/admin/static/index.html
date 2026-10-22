@@ -407,6 +407,7 @@
                 <option value="">全部类型</option><option value="detect">检测</option>
                 <option value="ban">封禁</option><option value="acl">ACL</option>
                 <option value="ratelimit">CC 限流</option>
+                <option value="challenge">人机验证</option>
               </select>
               <select id="ev-action" onchange="eventPage=0;loadEvents()">
                 <option value="">全部处置</option><option value="block">拦截</option>
@@ -487,7 +488,7 @@ const fmtDuration = (secs) => secs >= 3600 ? Math.floor(secs/3600)+' 小时'
   : secs >= 60 ? Math.floor(secs/60)+' 分钟' : secs+' 秒';
 const fmtTime = (ts) => new Date(ts * 1000).toLocaleString('zh-CN', { hour12: false });
 const actionLabel = (a) => ({ block: '拒绝', challenge: '人机验证', log: '仅记录', observe: '观察' }[a] || a);
-const kindLabel = (k) => ({ detect: '检测', ban: '封禁', acl: 'ACL', ratelimit: 'CC 限流' }[k] || k);
+const kindLabel = (k) => ({ detect: '检测', ban: '封禁', acl: 'ACL', ratelimit: 'CC 限流', challenge: '人机验证' }[k] || k);
 /// 把后端返回的 "30m" / "2h" / "90s" 转成秒，供输入框编辑
 const durationToSecs = (d) => {
   const m = String(d).trim().match(/^(\d+)(s|m|h|d)?$/);
@@ -1370,6 +1371,12 @@ function renderSettings(s) {
       <div><label for="set-ch-ttl">通过后免验证时长（秒）</label>
         <input type="number" id="set-ch-ttl" min="30" value="${durationToSecs(ch.ttl ?? '30m')}"></div>
       <div class="hint">难度每加 1 计算量约翻 16 倍。浏览器用纯 JS 计算，家用设备建议 4–5；纯 HTTP 环境也可用（不依赖 crypto.subtle）。</div>
+    </div>
+    <div class="fieldset">
+      <h3>地理信息（GeoIP）</h3>
+      <div class="wide"><label for="set-geoip">GeoLite2-City.mmdb 路径</label>
+        <input id="set-geoip" placeholder="/path/to/GeoLite2-City.mmdb（留空禁用）" value="${esc(s.geoip_db || '')}"></div>
+      <div class="hint">用于统计报表与防护大屏的访问来源地图。只在控制台聚合时查询，不影响代理转发；留空时地图显示「未启用地理位置」。</div>
     </div>`;
 }
 
@@ -1412,6 +1419,7 @@ async function saveSettings() {
     await api('/settings/real_ip', { method: 'PUT', body: JSON.stringify(ri) });
     await api('/settings/ratelimit', { method: 'PUT', body: JSON.stringify(rl) });
     await api('/settings/challenge', { method: 'PUT', body: JSON.stringify(ch) });
+    await api('/settings/geoip_db', { method: 'PUT', body: JSON.stringify(document.getElementById('set-geoip').value.trim()) });
 
     showMsg('设置已保存并立即生效');
     loadSettings(); loadStats();

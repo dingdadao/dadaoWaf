@@ -384,7 +384,7 @@ impl Agg {
             .filter_map(|(k, n)| decode_ip(k).map(|ip| (ip, n)))
             .collect();
         let unique_ips = ips.len() as u64;
-        ips.sort_by(|a, b| b.1.cmp(&a.1));
+        ips.sort_by_key(|a| std::cmp::Reverse(a.1));
         ips.truncate(5_000);
 
         DashboardData {

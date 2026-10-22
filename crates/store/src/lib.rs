@@ -142,7 +142,7 @@ impl Event {
 pub struct EventFilter {
     pub limit: usize,
     pub offset: usize,
-    /// detect / ban / acl / ratelimit
+    /// detect / ban / acl / ratelimit / challenge
     pub kind: Option<String>,
     /// 精确匹配来源 IP
     pub ip: Option<String>,

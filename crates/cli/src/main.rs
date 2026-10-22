@@ -440,6 +440,7 @@ fn cmd_serve(
             shared: shared.clone(),
             bans: bans.clone(),
             metrics: metrics.clone(),
+            geoip: std::sync::Arc::new(homewaf_admin::geoip::GeoIp::new()),
             allow_regex,
             token,
             log_dir: std::path::PathBuf::from(&logging_cfg.dir),

@@ -5,6 +5,8 @@
 //! - **认证用 Bearer token**，未配置 token 时只允许回环访问（家用默认安全）
 //! - **写操作后显式触发重载**，这是 DB 模式补回热重载的唯一途径
 
+pub mod geoip;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -27,6 +29,8 @@ pub struct AdminState {
     pub shared: SharedState,
     pub bans: Arc<BanTable>,
     pub metrics: Arc<TrafficMetrics>,
+    /// GeoIP 查询器。只在控制台聚合快照时使用，代理热路径不查库
+    pub geoip: Arc<geoip::GeoIp>,
     pub allow_regex: bool,
     /// 认证 token。`None` 时只允许回环访问
     pub token: Option<String>,
@@ -69,6 +73,8 @@ pub fn router(state: Ctx) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/api/stats", get(stats))
+        .route("/api/stats/geo", get(geo_stats))
+        .route("/api/geoip", get(geoip_status))
         .route("/api/apps", get(list_apps).post(upsert_app))
         .route("/api/apps/{id}", delete(delete_app))
         .route("/api/rules", get(list_rules).post(upsert_rule))
@@ -111,6 +117,15 @@ pub fn spawn(state: AdminState, listen: String) -> anyhow::Result<()> {
                  请设置 token 或改为 127.0.0.1"
             );
         }
+    }
+
+    // 启动前加载 GeoIP。失败只告警，不影响控制台其它功能
+    state.geoip.reload_from_store(&state.store);
+    let geo = state.geoip.status();
+    match (&geo.error, geo.enabled) {
+        (Some(err), _) => tracing::warn!(path = %geo.path, error = %err, "GeoIP 数据库加载失败"),
+        (None, true) => tracing::info!(path = %geo.path, "GeoIP 数据库已加载"),
+        (None, false) => {}
     }
 
     let ctx = Arc::new(state);
@@ -271,6 +286,48 @@ async fn stats(State(ctx): State<Ctx>, headers: HeaderMap) -> Response {
         categories,
     })
     .into_response()
+}
+
+// ============================================================
+// GeoIP / 地理分布
+// ============================================================
+
+#[derive(Deserialize)]
+struct GeoQuery {
+    /// 时间范围（秒），默认 24 小时
+    #[serde(default)]
+    range: Option<i64>,
+    #[serde(default)]
+    app: Option<String>,
+}
+
+async fn geoip_status(State(ctx): State<Ctx>, headers: HeaderMap) -> Response {
+    if !authorized(&ctx, &headers) {
+        return unauthorized();
+    }
+    Json(ctx.geoip.status()).into_response()
+}
+
+/// 把指标快照里的 IP 批量解析成国家/城市/经纬度。
+///
+/// 查询发生在控制台请求路径上，不在代理热路径；结果只保留聚合值。
+async fn geo_stats(
+    State(ctx): State<Ctx>,
+    headers: HeaderMap,
+    Query(q): Query<GeoQuery>,
+) -> Response {
+    if !authorized(&ctx, &headers) {
+        return unauthorized();
+    }
+    let range = q.range.unwrap_or(86_400).clamp(60, 86_400);
+    let app = q
+        .app
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let now = homewaf_acl::now_unix();
+    let data = ctx.metrics.dashboard(range, app, now);
+    Json(ctx.geoip.resolve(&data.ips)).into_response()
 }
 
 // ============================================================
@@ -874,6 +931,8 @@ async fn get_all_settings(State(ctx): State<Ctx>, headers: HeaderMap) -> Respons
             "rule_feeds",
             serde_json::to_value(&defaults.rule_feeds).unwrap_or_default(),
         ),
+        // GeoIP 数据库路径，空表示未启用
+        ("geoip_db", serde_json::Value::String(String::new())),
     ] {
         out.insert(key.to_string(), load(key, value));
     }
@@ -924,7 +983,16 @@ async fn put_setting(
     }
 
     match reload_state(&ctx) {
-        Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
+        Ok(()) => {
+            // GeoIP 路径不属于运行时状态，单独换库
+            if key == geoip::GEOIP_SETTING {
+                ctx.geoip.reload_from_store(&ctx.store);
+                if let Some(err) = ctx.geoip.status().error {
+                    return (StatusCode::BAD_REQUEST, err).into_response();
+                }
+            }
+            Json(serde_json::json!({"ok": true})).into_response()
+        }
         Err(e) => {
             // 重载失败说明业务校验没过（比如阈值非法）。回滚，别把库留在坏状态
             let rolled_back = match &old {
@@ -976,6 +1044,12 @@ fn check_setting_type(key: &str, value: &serde_json::Value) -> Result<(), String
         "rule_feeds" => serde_json::from_value::<Vec<RuleFeed>>(value.clone())
             .map(|_| ())
             .map_err(|e| format!("rule_feeds 结构不合法：{e}")),
+        "geoip_db" => {
+            let path = value
+                .as_str()
+                .ok_or_else(|| "geoip_db 必须是字符串路径".to_string())?;
+            geoip::validate_db(path)
+        }
         // 未知 key 直接拒绝，避免往库里塞垃圾
         other => Err(format!("未知的设置项 `{other}`")),
     }
@@ -1579,6 +1653,7 @@ mod tests {
             shared: homewaf_proxy::shared(empty_runtime()),
             bans: Arc::new(BanTable::new(&AutoBanConfig::default(), 64)),
             metrics: Arc::new(TrafficMetrics::new()),
+            geoip: Arc::new(geoip::GeoIp::new()),
             allow_regex: false,
             token: None,
             log_dir: std::env::temp_dir(),
@@ -1757,6 +1832,19 @@ mod tests {
     fn setting_type_accepts_rule_feeds() {
         assert!(check_setting_type("rule_feeds", &serde_json::json!([])).is_ok());
         assert!(check_setting_type("rule_feeds", &serde_json::json!({})).is_err());
+    }
+
+    #[test]
+    fn setting_type_accepts_empty_geoip_path() {
+        // 留空是合法配置，表示不启用地图
+        assert!(check_setting_type("geoip_db", &serde_json::json!("")).is_ok());
+        assert!(check_setting_type("geoip_db", &serde_json::json!("  ")).is_ok());
+    }
+
+    #[test]
+    fn setting_type_rejects_bad_geoip() {
+        assert!(check_setting_type("geoip_db", &serde_json::json!(123)).is_err());
+        assert!(check_setting_type("geoip_db", &serde_json::json!("/no/such.mmdb")).is_err());
     }
 
     // ============================================================
