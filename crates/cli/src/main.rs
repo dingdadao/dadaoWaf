@@ -69,6 +69,9 @@ enum Command {
         /// TLS 监听地址，可重复。覆盖数据库中的设置
         #[arg(long)]
         tls_listen: Vec<String>,
+        /// 管理面监听地址，如 `0.0.0.0:9443`。覆盖数据库中的设置
+        #[arg(long)]
+        admin_listen: Option<String>,
         /// 启用正则匹配
         #[arg(long)]
         allow_regex: bool,
@@ -164,9 +167,17 @@ fn main() -> ExitCode {
             db,
             listen,
             tls_listen,
+            admin_listen,
             allow_regex,
             no_watch,
-        } => cmd_serve(&db, listen, tls_listen, allow_regex, no_watch),
+        } => cmd_serve(
+            &db,
+            listen,
+            tls_listen,
+            admin_listen,
+            allow_regex,
+            no_watch,
+        ),
         Command::Import {
             path,
             db,
@@ -353,6 +364,7 @@ fn cmd_serve(
     db: &str,
     listen_override: Vec<String>,
     tls_override: Vec<String>,
+    admin_override: Option<String>,
     allow_regex: bool,
     no_watch: bool,
 ) -> anyhow::Result<ExitCode> {
@@ -385,13 +397,19 @@ fn cmd_serve(
         return Ok(ExitCode::FAILURE);
     };
 
-    let state = match homewaf_proxy::load_state_from_db(&store, allow_regex) {
+    let mut state = match homewaf_proxy::load_state_from_db(&store, allow_regex) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("{e}");
             return Ok(ExitCode::FAILURE);
         }
     };
+
+    // 管理面监听：命令行显式指定时覆盖，并回写到状态里，
+    // 否则控制台「系统信息」显示的仍是数据库里的旧地址。
+    if let Some(addr) = admin_override {
+        state.server.admin.listen = addr;
+    }
 
     // 监听地址优先级：命令行 > 数据库 > 默认
     let listen = if listen_override.is_empty() {
@@ -429,8 +447,8 @@ fn cmd_serve(
     let metrics = std::sync::Arc::new(homewaf_proxy::TrafficMetrics::new());
 
     // 启动控制台（独立线程，不阻塞代理）
-    let admin_listen = shared.load_full().server.admin.listen.clone();
-    if !admin_listen.is_empty() {
+    let admin_addr = shared.load_full().server.admin.listen.clone();
+    if !admin_addr.is_empty() {
         let token = std::env::var("HOMEWAF_ADMIN_TOKEN").ok();
         let admin_state = homewaf_admin::AdminState {
             store: store.clone(),
@@ -449,8 +467,8 @@ fn cmd_serve(
             listen: listen.clone(),
             tls_listen: tls_listen.clone(),
         };
-        match homewaf_admin::spawn(admin_state, admin_listen.clone()) {
-            Ok(()) => tracing::info!(listen = %admin_listen, "控制台启动中"),
+        match homewaf_admin::spawn(admin_state, admin_addr.clone()) {
+            Ok(()) => tracing::info!(listen = %admin_addr, "控制台启动中"),
             Err(e) => tracing::error!(error = %e, "控制台启动失败，代理继续运行"),
         }
     }

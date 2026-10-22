@@ -152,15 +152,26 @@ pub fn router(state: Ctx) -> Router {
 
 /// 启动管理服务（独立线程 + 独立 tokio runtime）。
 pub fn spawn(state: AdminState, listen: String) -> anyhow::Result<()> {
-    // 没配 token 时强制只监听回环，避免管理面裸奔在局域网
+    // 没配 token 时默认只允许监听回环，避免管理面裸奔在局域网。
+    // 需要从其它设备直接打开控制台时，显式设置 HOMEWAF_ADMIN_INSECURE=1 放行，
+    // 此时启动日志会打出告警——这是用户明确选择的取舍。
     if state.token.is_none() {
         let addr: SocketAddr = listen
             .parse()
             .map_err(|e| anyhow::anyhow!("管理面监听地址非法：{listen}（{e}）"))?;
         if !addr.ip().is_loopback() {
-            anyhow::bail!(
-                "管理面监听 {listen} 不是回环地址，但未配置 admin token。\
-                 请设置 token 或改为 127.0.0.1"
+            let insecure = std::env::var("HOMEWAF_ADMIN_INSECURE")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            if !insecure {
+                anyhow::bail!(
+                    "管理面监听 {listen} 不是回环地址，但未配置 admin token。\
+                     请设置 token，或设置 HOMEWAF_ADMIN_INSECURE=1 明确接受无认证暴露"
+                );
+            }
+            tracing::warn!(
+                listen = %listen,
+                "管理面将无认证对外监听（HOMEWAF_ADMIN_INSECURE=1），请确保仅在可信网络内使用"
             );
         }
     }
