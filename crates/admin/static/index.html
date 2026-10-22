@@ -1230,6 +1230,7 @@
         <div class="sys-tabs" id="system-tabs">
           <a data-systemtab="protect" class="active">防护配置</a>
           <a data-systemtab="console">控制台管理</a>
+          <a data-systemtab="leichi">雷池同步</a>
           <a data-systemtab="logs">系统日志</a>
         </div>
 
@@ -1297,6 +1298,31 @@
               <div class="wide"><label>管理面监听</label><input id="sys-admin-listen" readonly></div>
               <div class="wide hint">管理面地址由启动参数与 server.admin.listen 决定，修改后需要重启进程。HomeWAF 不包含共享计划、许可证与云端配额。</div>
             </div>
+          </section>
+        </div>
+
+        <div class="sys-panel" data-systemtab="leichi">
+          <section class="card">
+            <header>
+              <h2>雷池（SafeLine）配置同步</h2>
+              <div class="filters">
+                <button onclick="loadLeichiPage()">刷新</button>
+                <button onclick="runLeichiSync(true)">预览</button>
+                <button class="primary" onclick="runLeichiSync(false)">开始同步</button>
+              </div>
+            </header>
+            <div class="fieldset">
+              <div class="wide hint">
+                通过雷池开放接口（<code>X-SLCE-API-Token</code>）拉取应用、自定义规则、IP 组与证书。
+                应用 ID 为 <code>lei-站点ID</code>，规则 ID 为 <code>lei-策略ID</code>；本地手工创建、
+                未被雷池管理的规则会保留。IP 组会展开成具体 CIDR 写入规则，ACME 托管证书因无法导出私钥会跳过。
+              </div>
+              <div class="wide"><label for="leichi-url">雷池地址</label>
+                <input id="leichi-url" placeholder="https://10.0.0.14:9443"></div>
+              <div class="wide"><label for="leichi-token">API Token</label>
+                <input id="leichi-token" placeholder="雷池系统设置中生成的 API Token"></div>
+            </div>
+            <div id="leichi-report"><div class="empty">尚未同步</div></div>
           </section>
         </div>
 
@@ -3707,6 +3733,7 @@ function switchSystemTab(tab) {
     p.classList.toggle('active', p.dataset.systemtab === tab));
   if (tab === 'protect') { loadSettings(); loadCustomRules(); }
   else if (tab === 'console') loadSystemInfo();
+  else if (tab === 'leichi') loadLeichiPage();
 }
 
 const sysField = (label, value) => `<div>
@@ -3748,6 +3775,73 @@ async function loadSystemInfo() {
     if (adminListen) adminListen.value = s.admin_listen || '';
   } catch (e) {
     el.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`;
+  }
+}
+
+// ============================================================
+// 雷池（SafeLine）配置同步
+// ============================================================
+async function loadLeichiPage() {
+  try {
+    const cfg = await api('/leichi/config');
+    const urlEl = document.getElementById('leichi-url');
+    const tokenEl = document.getElementById('leichi-token');
+    if (urlEl && !urlEl.value) urlEl.value = cfg.url || 'https://10.0.0.14:9443';
+    if (tokenEl && !tokenEl.value) tokenEl.value = cfg.token || '';
+    renderLeichiReport(cfg.last);
+  } catch (e) {
+    showMsg('读取雷池连接配置失败：' + e.message, 'err');
+  }
+}
+
+const leichiStat = (label, s) => sysField(label,
+  s ? `${s.imported}/${s.total}${s.skipped ? `（跳过 ${s.skipped}）` : ''}` : '-');
+
+function renderLeichiReport(r) {
+  const el = document.getElementById('leichi-report');
+  if (!el) return;
+  if (!r || (!r.apps && !r.rules)) {
+    el.innerHTML = '<div class="empty">尚未同步</div>';
+    return;
+  }
+  const items = (r.items || []).slice(0, 100);
+  const warnings = r.warnings || [];
+  el.innerHTML = `<div class="sys-info-grid">
+    ${sysField('数据源', `<code>${esc(r.source || '-')}</code>`)}
+    ${sysField('模式', r.preview ? '预览（未写库）' : '已写入并热重载')}
+    ${sysField('耗时', `${fmtNum(r.duration_ms || 0)} ms`)}
+    ${leichiStat('应用', r.apps)}
+    ${leichiStat('自定义规则', r.rules)}
+    ${leichiStat('证书', r.certs)}
+    ${leichiStat('IP 组', r.ip_groups)}
+  </div>
+  ${items.length ? `<table>
+    <thead><tr><th>同步明细</th></tr></thead>
+    <tbody>${items.map(i => `<tr><td>${esc(i)}</td></tr>`).join('')}</tbody>
+  </table>` : '<div class="empty">没有可同步的数据</div>'}
+  ${warnings.length ? `<div class="hint" style="padding:10px 16px;border-top:1px solid var(--border)">
+    <b>警告 ${warnings.length} 条</b><br>${warnings.map(w => esc(w)).join('<br>')}</div>` : ''}`;
+}
+
+async function runLeichiSync(preview) {
+  const url = (document.getElementById('leichi-url').value || '').trim();
+  const token = (document.getElementById('leichi-token').value || '').trim();
+  if (!url || !token) {
+    showMsg('请先填写雷池地址与 API Token', 'err');
+    return;
+  }
+  const el = document.getElementById('leichi-report');
+  el.innerHTML = `<div class="empty">${preview ? '正在拉取并生成预览…' : '正在同步，请稍候…'}</div>`;
+  try {
+    const r = await api('/leichi/sync', {
+      method: 'POST',
+      body: JSON.stringify({ url, token, preview: !!preview }),
+    });
+    renderLeichiReport(r);
+    showMsg(preview ? '预览完成' : `同步完成：应用 ${r.apps.imported} 个、规则 ${r.rules.imported} 条`);
+  } catch (e) {
+    el.innerHTML = `<div class="empty">同步失败：${esc(e.message)}</div>`;
+    showMsg('同步失败', 'err');
   }
 }
 

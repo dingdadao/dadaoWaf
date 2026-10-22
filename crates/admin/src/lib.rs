@@ -7,6 +7,7 @@
 
 pub mod certs;
 pub mod geoip;
+pub mod leichi;
 
 use std::net::IpAddr;
 use std::net::SocketAddr;
@@ -134,6 +135,10 @@ pub fn router(state: Ctx) -> Router {
             get(list_custom_rules).post(import_custom_rules),
         )
         .route("/api/custom-rules/export", get(export_custom_rules))
+        // 从雷池（SafeLine）开放接口同步应用、规则、IP 组与证书
+        .route("/api/leichi/sync", post(leichi_sync))
+        .route("/api/leichi/last", get(leichi_last))
+        .route("/api/leichi/config", get(leichi_config))
         .route("/api/reload", post(reload))
         .with_state(state)
 }
@@ -2311,6 +2316,16 @@ fn check_setting_type(key: &str, value: &serde_json::Value) -> Result<(), String
             .as_str()
             .map(|_| ())
             .ok_or_else(|| "api_token 必须是字符串".to_string()),
+        // 雷池同步连接配置与上次同步报告（报告由同步任务自动写入）
+        "leichi_url" => value
+            .as_str()
+            .map(|_| ())
+            .ok_or_else(|| "leichi_url 必须是字符串".to_string()),
+        "leichi_token" => value
+            .as_str()
+            .map(|_| ())
+            .ok_or_else(|| "leichi_token 必须是字符串".to_string()),
+        "leichi_last_sync" => Ok(()),
         // 未知 key 直接拒绝，避免往库里塞垃圾
         other => Err(format!("未知的设置项 `{other}`")),
     }
@@ -2320,7 +2335,7 @@ fn check_setting_type(key: &str, value: &serde_json::Value) -> Result<(), String
 // 系统设置 / 自定义规则
 // ============================================================
 
-const CUSTOM_RULES_KEY: &str = "custom_rules";
+const CUSTOM_RULES_KEY: &str = leichi::CUSTOM_RULES_KEY;
 
 fn load_custom_rules(
     store: &Store,
@@ -2591,6 +2606,63 @@ async fn import_custom_rules(
         )
             .into_response(),
     }
+}
+
+// ============================================================
+// 雷池（SafeLine）配置同步
+// ============================================================
+
+async fn leichi_sync(
+    State(ctx): State<Ctx>,
+    headers: HeaderMap,
+    Json(req): Json<leichi::SyncRequest>,
+) -> Response {
+    if !authorized(&ctx, &headers) {
+        return unauthorized();
+    }
+    let preview = req.preview;
+    let store = ctx.store.clone();
+    // 同步要串行发几十个 HTTP 请求，放到阻塞线程，不占 tokio worker
+    let result = tokio::task::spawn_blocking(move || leichi::sync(&store, &req)).await;
+    let report = match result {
+        Ok(Ok(report)) => report,
+        Ok(Err(e)) => return (StatusCode::BAD_REQUEST, e).into_response(),
+        Err(e) => return internal(format!("同步任务异常：{e}")).into_response(),
+    };
+
+    if !preview {
+        if let Err(e) = reload_state(&ctx) {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("已写入数据库，但重载失败：{e}"),
+            )
+                .into_response();
+        }
+    }
+    Json(report).into_response()
+}
+
+async fn leichi_last(State(ctx): State<Ctx>, headers: HeaderMap) -> Response {
+    if !authorized(&ctx, &headers) {
+        return unauthorized();
+    }
+    match leichi::last_report(&ctx.store) {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => internal(e).into_response(),
+    }
+}
+
+async fn leichi_config(State(ctx): State<Ctx>, headers: HeaderMap) -> Response {
+    if !authorized(&ctx, &headers) {
+        return unauthorized();
+    }
+    let (url, token) = leichi::saved_config(&ctx.store);
+    Json(serde_json::json!({
+        "url": url,
+        "token": token,
+        "last": leichi::last_report(&ctx.store).unwrap_or(serde_json::Value::Null),
+    }))
+    .into_response()
 }
 
 // ============================================================
