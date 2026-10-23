@@ -260,5 +260,33 @@
     "severity": "critical",
     "action": "block",
     "note": "Log4Shell 及同族 JNDI 注入，头部与参数都可能携带"
+  },
+  {
+    "id": "local-pub-php2shell-progress",
+    "name": "PHP2Shell · 上传进度字段利用",
+    "pattern": "php_session_upload_progress",
+    "keywords": [
+      "php_session_upload_progress"
+    ],
+    "targets": [
+      "body"
+    ],
+    "category": "webshell",
+    "severity": "critical",
+    "action": "block",
+    "note": "PHP2Shell（CVE-2026-109618/109619）核心指纹：POST body 携带 PHP_SESSION_UPLOAD_PROGRESS 表单字段（multipart/urlencoded 均可），触发 PHP 解析上传进度时的长跳转内存破坏。对应 Corelight sid:3000650。注意：使用 PHP session.upload_progress 功能的合法上传表单也会携带该字段，属预期取舍"
+  },
+  {
+    "id": "local-pub-php2shell-longfield",
+    "name": "PHP2Shell · 超长表单字段名",
+    "pattern": "[a-z0-9_]{1000,}=",
+    "keywords": [],
+    "targets": [
+      "body"
+    ],
+    "category": "webshell",
+    "severity": "high",
+    "action": "block",
+    "note": "PHP2Shell（CVE-2026-109618/109619）另一指纹：urlencoded 表单字段名超过 1000 字符（归一化后为超长小写词 + 等号），用于触发 PHP 解析整数溢出"
   }
 ]

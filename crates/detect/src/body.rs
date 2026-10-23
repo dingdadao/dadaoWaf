@@ -24,10 +24,9 @@ pub fn should_inspect_content_type(content_type: Option<&str>) -> bool {
 
     let ct = ct.trim().to_ascii_lowercase();
 
-    // 文件上传：多部分表单里混着二进制
-    if ct.starts_with("multipart/") {
-        return false;
-    }
+    // multipart/form-data 也做内容检测：头部字段名、文件名是纯文本，
+    // PHP2Shell 等攻击的指纹（如 PHP_SESSION_UPLOAD_PROGRESS）就藏在字段名里。
+    // 二进制文件内容由 BodyBuffer::as_str 的 UTF-8 校验兜底，非文本直接跳过。
     if ct.starts_with("application/octet-stream") {
         return false;
     }
@@ -130,7 +129,8 @@ mod tests {
 
     #[test]
     fn skips_binary_content_types() {
-        assert!(!should_inspect_content_type(Some(
+        // multipart/form-data 也要检测：PHP2Shell 等攻击指纹就藏在字段名里
+        assert!(should_inspect_content_type(Some(
             "multipart/form-data; boundary=x"
         )));
         assert!(!should_inspect_content_type(Some(
