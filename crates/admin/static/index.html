@@ -1597,6 +1597,21 @@
     </div>
   </div>
 
+  <!-- 管理面认证（仅当服务端配置了 HOMEWAF_ADMIN_TOKEN 时出现） -->
+  <div class="modal-mask" id="login-modal">
+    <div class="modal" style="width:min(420px,92vw)">
+      <header><h2>管理面认证</h2></header>
+      <form onsubmit="submitLogin(event)" style="padding:14px 18px">
+        <div class="login-hint sub" style="margin-bottom:10px">需要访问令牌才能使用控制台</div>
+        <div><label for="login-token">访问令牌</label>
+          <input id="login-token" type="password" autocomplete="current-password" placeholder="HOMEWAF_ADMIN_TOKEN">
+        </div>
+        <div style="margin-top:14px;text-align:right"><button type="submit">进入控制台</button></div>
+        <div class="sub" style="margin-top:10px">令牌只保存在本机浏览器，不会上传到服务器。</div>
+      </form>
+    </div>
+  </div>
+
 
   <!-- 检测规则编辑器 -->
   <div class="modal-mask" id="dr-modal" onclick="if(event.target===this)hideDetectForm()">
@@ -1639,11 +1654,65 @@
 // ============================================================
 // 基础工具
 // ============================================================
+const TOKEN_KEY = 'homewaf.admin.token';
+const adminToken = () => localStorage.getItem(TOKEN_KEY) || '';
+
 const api = async (path, opts = {}) => {
-  const res = await fetch('/api' + path, { headers: { 'Content-Type': 'application/json' }, ...opts });
+  const headers = { 'Content-Type': 'application/json', ...(opts.headers || {}) };
+  const token = adminToken();
+  if (token) headers.Authorization = 'Bearer ' + token;
+  const res = await fetch('/api' + path, { ...opts, headers });
+  if (res.status === 401) {
+    showLogin('需要访问令牌才能使用控制台');
+    throw new Error('需要认证');
+  }
   if (!res.ok) throw new Error((await res.text()) || res.statusText);
   return res.status === 204 ? null : res.json();
 };
+
+/// 认证失败时弹出令牌输入框；令牌只保存在本机浏览器。
+function showLogin(msg) {
+  const el = document.getElementById('login-modal');
+  if (!el) return;
+  const hint = el.querySelector('.login-hint');
+  if (hint && msg) hint.textContent = msg;
+  el.classList.add('show');
+  const input = document.getElementById('login-token');
+  if (input) setTimeout(() => input.focus(), 30);
+}
+
+function submitLogin(ev) {
+  if (ev) ev.preventDefault();
+  const input = document.getElementById('login-token');
+  const v = (input.value || '').trim();
+  if (!v) return;
+  localStorage.setItem(TOKEN_KEY, v);
+  location.reload();
+}
+
+/// 带鉴权的文件下载（导出 CSV / 备份数据库）。直接 location.href 不会带 Bearer 头。
+async function download(url, fallback = 'export') {
+  const headers = {};
+  const token = adminToken();
+  if (token) headers.Authorization = 'Bearer ' + token;
+  try {
+    const res = await fetch(url, { headers });
+    if (res.status === 401) { showLogin('需要访问令牌才能导出'); return; }
+    if (!res.ok) { showMsg('下载失败：' + (await res.text()), 'error'); return; }
+    const cd = res.headers.get('content-disposition') || '';
+    const m = cd.match(/filename\*?=(?:UTF-8'')?["']?([^"';]+)/i);
+    const name = m ? decodeURIComponent(m[1]) : fallback;
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(await res.blob());
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+  } catch (e) {
+    showMsg('下载失败：' + e.message, 'error');
+  }
+}
 
 const showMsg = (text, kind = 'ok') => {
   const el = document.getElementById('msg');
@@ -2507,22 +2576,9 @@ function renderGeoListInto(el, geo) {
 
 async function downloadReportCsv() {
   if (!STATS.reportDay) return;
-  try {
-    const qs = STATS.app ? '?app=' + encodeURIComponent(STATS.app) : '';
-    const res = await fetch(`/api/reports/${STATS.reportDay}/csv${qs}`);
-    if (!res.ok) throw new Error((await res.text()) || res.statusText);
-    const blob = await res.blob();
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `homewaf-report-${new Date(STATS.reportDay * 1000).toISOString().slice(0, 10)}.csv`;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
-  } catch (e) {
-    showMsg('导出失败：' + e.message, 'error');
-  }
+  const qs = STATS.app ? '?app=' + encodeURIComponent(STATS.app) : '';
+  const day = new Date(STATS.reportDay * 1000).toISOString().slice(0, 10);
+  await download(`/api/reports/${STATS.reportDay}/csv${qs}`, `homewaf-report-${day}.csv`);
 }
 
 // ---------- 防护大屏 ----------
@@ -4220,9 +4276,8 @@ function exportEvents() {
   if (ip) params.set('ip', ip);
   const q = document.getElementById('ev-q').value.trim();
   if (q) params.set('q', q);
-  window.location.href = '/api/events/export?' + params.toString();
+  download('/api/events/export?' + params.toString(), 'homewaf-events.csv');
 }
-
 // ============================================================
 // 日志
 // ============================================================
@@ -4794,7 +4849,7 @@ function toggleAttackAuto() {
 
 function exportAttack() {
   const params = attackFilterParams(true);
-  window.location.href = '/api/events/export?' + params.toString();
+  download('/api/events/export?' + params.toString(), 'homewaf-events.csv');
 }
 
 async function banAttackIp(ip) {
@@ -4980,7 +5035,7 @@ async function loadCustomRules() {
 }
 
 function exportCustomRules() {
-  window.location.href = '/api/custom-rules/export';
+  download('/api/custom-rules/export', 'homewaf-custom-rules.json');
 }
 
 async function readRulesFile(input) {
@@ -5000,7 +5055,7 @@ async function readRulesFile(input) {
 }
 
 function downloadBackup() {
-  window.location.href = '/api/system/backup';
+  download('/api/system/backup', 'homewaf.db');
 }
 
 async function pruneEvents() {

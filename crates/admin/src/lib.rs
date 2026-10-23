@@ -15,8 +15,10 @@ use std::sync::Arc;
 
 use axum::{
     body::Bytes,
+    extract::Request,
     extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
+    middleware::{self, Next},
     response::{Html, IntoResponse, Response},
     routing::{delete, get, post, put},
     Json, Router,
@@ -62,7 +64,46 @@ fn internal(e: impl std::fmt::Display) -> ApiError {
 }
 
 fn unauthorized() -> Response {
-    (StatusCode::UNAUTHORIZED, "需要认证").into_response()
+    (
+        StatusCode::UNAUTHORIZED,
+        [(header::WWW_AUTHENTICATE, "Bearer")],
+        "需要认证",
+    )
+        .into_response()
+}
+
+/// 管理面安全响应头。公网暴露或反代时降低点击劫持、MIME 嗅探与缓存泄露风险。
+async fn security_headers(req: Request, next: Next) -> Response {
+    let mut res = next.run(req).await;
+    let headers = res.headers_mut();
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(
+            "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; \
+             script-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; \
+             base-uri 'none'; form-action 'self'",
+        ),
+    );
+    headers.insert(
+        header::HeaderName::from_static("permissions-policy"),
+        HeaderValue::from_static("geolocation=(), microphone=(), camera=()"),
+    );
+    headers
+        .entry(header::CACHE_CONTROL)
+        .or_insert(HeaderValue::from_static("no-store"));
+    headers
+        .entry(header::HeaderName::from_static("x-permitted-cross-domain-policies"))
+        .or_insert(HeaderValue::from_static("none"));
+    res
 }
 
 /// 校验请求是否被允许。
@@ -178,6 +219,7 @@ pub fn router(state: Ctx) -> Router {
         .route("/api/leichi/last", get(leichi_last))
         .route("/api/leichi/config", get(leichi_config))
         .route("/api/reload", post(reload))
+        .layer(middleware::from_fn(security_headers))
         .with_state(state)
 }
 
