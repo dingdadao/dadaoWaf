@@ -1074,6 +1074,51 @@ if let Some((_, err)) = snapshot.feed_failures.iter().find(|(n, _)| n == &group.
 原来点「刷新」直接回 `{"ok":true}`，等于骗用户"已经重新拉过了"。
 现在未到期时返回 warning：`距上次拉取不足 60 分钟，本次未重新联网，仍使用本地快照`。
 
+#### 3.24.2 访问控制改为雷池式条件规则
+
+**问题**：原来的「访问控制」只能填一个网段，而雷池的 custom_rule 是
+「条件组 + 动作」。用户要表达"后台只允许内网访问"就得同时配 IP 白名单和路径规则，
+在旧模型里根本写不出来。
+
+**模型**（`settings.custom_rules`，与雷池 JSON 兼容）：
+
+```json
+{
+  "id": "rule-6adafe158b8",
+  "name": "后台只允许内网访问",
+  "is_enabled": true,
+  "action": 1,
+  "scope": ["nas"],
+  "pattern": [[{"k": "path", "op": "prefix", "v": ["/admin"]},
+               {"k": "ip_group", "op": "in", "v": ["bad-ips"]}]]
+}
+```
+
+- `pattern` 外层是「或」、内层是「且」
+- `action`：0 放行 / 1 拦截 / 2 人机验证 / 3 仅记录（沿用雷池 0/1，2/3 是扩展）
+- `scope` 为空表示对所有应用生效
+- 条件字段：`src_ip`（CIDR）、`ip_group`（订阅组名）、`path`、`method`、`user_agent`、
+  `header`（配 `sub_k` 指定头名）、`query`、`host`、`url`
+
+**优先级**：放行 > 拦截/人机验证 > 仅记录。放行最高是刻意的——用户显式加白的机器
+不该被同一条链路上的拦截规则推翻。人机验证已通过（有 cookie）的会话不再重复挑战。
+
+**为什么保留 ACL 引擎**：订阅 IP 组展开后是 3500+ 条纯 IP 规则，走 `PrefixMap`
+是 O(log n)；条件规则只有几十条，线性扫描足够。两套执行路径，一个页面入口。
+
+**迁移**：`acl_rules` 表里非 `feed:` 开头的历史行（UI 手建、雷池同步产物）在重载时
+自动转成 `src_ip eq <cidr>` 的条件规则，转换后删除原行——否则同一条规则会被执行两次。
+
+**IP 组条件**：`RuntimeState.ip_groups` 保存「组名 → 条目」快照，从订阅生成的
+ACL 规则 id（`feed:{组名}:{序号}:{作用域}`）反解，避免重载时二次联网。
+
+**事件明细**：`events` 表新增 `request_id` / `method` / `query` / `ua` / `rule_names`。
+老库通过 `PRAGMA table_info` + `ALTER TABLE` 补列（SQLite 没有 `ADD COLUMN IF NOT EXISTS`）。
+控制台表格加「请求」「命中规则」「详情」，详情里可点请求 ID 直接跳到日志页按该 ID 过滤。
+
+**日志明细**：访问日志补 `host` / `query` / `user_agent` / `app_id` / `rules` 字段；
+控制台按列展示（时间/方法/主机路径/状态/上游/耗时/应用/来源/说明/ID），点行展开原始 JSON。
+
 ### 3.25 事件筛选与分页
 
 **为什么需要**：原来只显示最近 30 条。真实攻击场景下几小时就刷没了，用户想查"昨天谁在扫我"完全做不到。

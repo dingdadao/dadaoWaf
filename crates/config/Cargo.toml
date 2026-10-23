@@ -12,6 +12,8 @@ serde_yaml.workspace = true
 serde_path_to_error.workspace = true
 thiserror.workspace = true
 ipnet.workspace = true
+# 校验自定义规则里的正则条件：写错的正则不会报错、只会永远不匹配
+regex = "1"
 
 [dev-dependencies]
 serde_json.workspace = true

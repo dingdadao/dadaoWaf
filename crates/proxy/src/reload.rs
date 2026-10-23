@@ -100,6 +100,8 @@ pub struct RuntimeState {
     pub rule_feeds: Vec<crate::rulefeed::RuleFeedStatus>,
     /// 自定义规则（兼容雷池格式）
     pub custom_rules: Vec<homewaf_config::CustomRule>,
+    /// IP 组快照：组名 → 条目。供自定义规则的 `ip_group` 条件使用
+    pub ip_groups: std::collections::HashMap<String, Vec<ipnet::IpNet>>,
     /// 网页防篡改基线，索引与 Router 的应用顺序一致
     pub tamper: Vec<crate::tamper::TamperBaseline>,
 }
@@ -115,6 +117,9 @@ impl RuntimeState {
     ) -> Result<Self, String> {
         let (feed_rules, feed_failures) =
             homewaf_acl::load_enabled_groups(&config.ip_groups, feed_state);
+        // 订阅条目同时留一份按组索引的快照，供自定义规则的 `ip_group` 条件使用。
+        // 规则 id 形如 `feed:{组名}:{序号}:{作用域}`，这里从 id 反解组名。
+        let ip_groups = group_snapshot(&feed_rules);
 
         let mut rules = homewaf_acl::rules_from_config(&config.acl);
         rules.extend(feed_rules);
@@ -166,6 +171,7 @@ impl RuntimeState {
             feed_failures,
             rule_feeds: rule_feeds.statuses,
             custom_rules: config.custom_rules,
+            ip_groups,
             tamper: Vec::new(),
         })
     }
@@ -183,9 +189,29 @@ impl RuntimeState {
     }
 }
 
+/// 从订阅生成的 ACL 规则反解出「组名 → 条目」。
+///
+/// 规则 id 的格式由 `homewaf_acl::feed::rules_from_group` 决定，
+/// 这里依赖它而不是再拉一遍订阅——避免重载时重复联网。
+fn group_snapshot(
+    rules: &[homewaf_acl::AclRule],
+) -> std::collections::HashMap<String, Vec<ipnet::IpNet>> {
+    let mut map: std::collections::HashMap<String, Vec<ipnet::IpNet>> =
+        std::collections::HashMap::new();
+    for rule in rules {
+        let Some(rest) = rule.id.strip_prefix("feed:") else {
+            continue;
+        };
+        let Some((group, _)) = rest.split_once(':') else {
+            continue;
+        };
+        map.entry(group.to_string()).or_default().push(rule.cidr);
+    }
+    map
+}
+
 /// 共享的运行时状态句柄。
 pub type SharedState = Arc<ArcSwap<RuntimeState>>;
-
 /// 把状态包成可热替换的共享句柄。
 pub fn shared(state: RuntimeState) -> SharedState {
     Arc::new(ArcSwap::from_pointee(state))

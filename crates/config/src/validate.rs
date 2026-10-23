@@ -73,6 +73,12 @@ pub fn validate(config: &Config) -> ValidationReport {
     validate_acl(&config.acl, &config.applications, &mut ctx);
     validate_ip_groups(&config.ip_groups, &config.applications, &mut ctx);
     validate_rule_feeds(&config.rule_feeds, &mut ctx);
+    validate_custom_rules(
+        &config.custom_rules,
+        &config.applications,
+        &config.ip_groups,
+        &mut ctx,
+    );
     validate_applications(&config.applications, &mut ctx);
 
     ctx.finish()
@@ -613,6 +619,204 @@ fn validate_label(label: &str, base: &str, ctx: &mut Ctx) {
     }
     if label.chars().any(|c| c.is_control()) {
         ctx.error(format!("{base}.label"), "中文名称不能包含控制字符");
+    }
+}
+
+// ============================================================
+// 自定义规则（访问控制 / 黑白名单）
+// ============================================================
+
+/// 条件字段白名单。写错字段名不会报错、只会永远不匹配，
+/// 所以这里必须显式拦住——否则用户会以为规则"没生效"。
+const KNOWN_CONDITION_KEYS: &[&str] = &[
+    "src_ip",
+    "ip",
+    "client_ip",
+    "source_ip",
+    "ip_group",
+    "website",
+    "app",
+    "site",
+    "host",
+    "domain",
+    "path",
+    "uri",
+    "url",
+    "query",
+    "args",
+    "query_string",
+    "method",
+    "user_agent",
+    "ua",
+    "content_type",
+    "cookie",
+    "header",
+    "headers",
+];
+
+const KNOWN_OPERATORS: &[&str] = &[
+    "eq",
+    "equal",
+    "is",
+    "in",
+    "ne",
+    "not_eq",
+    "not",
+    "contain",
+    "contains",
+    "like",
+    "not_contain",
+    "not_contains",
+    "not_like",
+    "prefix",
+    "start_with",
+    "starts_with",
+    "suffix",
+    "end_with",
+    "ends_with",
+    "regex",
+    "match",
+    "re",
+];
+
+fn validate_custom_rules(
+    rules: &[CustomRule],
+    apps: &[Application],
+    ip_groups: &[IpGroup],
+    ctx: &mut Ctx,
+) {
+    let app_ids: HashSet<&str> = apps.iter().map(|a| a.id.as_str()).collect();
+    let group_names: HashSet<&str> = ip_groups.iter().map(|g| g.name.as_str()).collect();
+    let mut seen = HashSet::new();
+
+    for (i, rule) in rules.iter().enumerate() {
+        let base = format!("custom_rules[{i}]");
+
+        if rule.id.trim().is_empty() {
+            ctx.error(format!("{base}.id"), "规则 id 不能为空");
+        } else if rule.id.chars().count() > 64 {
+            ctx.error(format!("{base}.id"), "规则 id 不能超过 64 个字符");
+        } else if !seen.insert(rule.id.as_str()) {
+            ctx.error(format!("{base}.id"), format!("规则 id `{}` 重复", rule.id));
+        }
+
+        if rule.name.chars().count() > 64 {
+            ctx.error(format!("{base}.name"), "规则名称不能超过 64 个字符");
+        }
+        if rule.action > 3 {
+            ctx.error(
+                format!("{base}.action"),
+                "动作只能是 0（放行）/ 1（拦截）/ 2（人机验证）/ 3（仅记录）",
+            );
+        }
+        if rule.pattern.is_empty() || rule.pattern.iter().all(|g| g.is_empty()) {
+            ctx.error(format!("{base}.pattern"), "规则至少要有一个条件");
+        }
+        for (j, scope) in rule.scope.iter().enumerate() {
+            if !app_ids.contains(scope.as_str()) {
+                ctx.error(
+                    format!("{base}.scope[{j}]"),
+                    format!("引用了不存在的应用 `{scope}`"),
+                );
+            }
+        }
+
+        for (j, group) in rule.pattern.iter().enumerate() {
+            if group.is_empty() {
+                ctx.error(
+                    format!("{base}.pattern[{j}]"),
+                    "条件组不能为空（空组会被忽略，容易让规则永远不生效）",
+                );
+                continue;
+            }
+            for (k, cond) in group.iter().enumerate() {
+                validate_condition(
+                    cond,
+                    &format!("{base}.pattern[{j}][{k}]"),
+                    &group_names,
+                    ctx,
+                );
+            }
+        }
+    }
+}
+
+fn validate_condition(
+    cond: &RuleCondition,
+    base: &str,
+    group_names: &HashSet<&str>,
+    ctx: &mut Ctx,
+) {
+    let key = cond.k.trim().to_ascii_lowercase();
+    let is_header = key == "header"
+        || key == "headers"
+        || key
+            .strip_prefix("header:")
+            .is_some_and(|rest| !rest.trim().is_empty());
+
+    if key.is_empty() {
+        ctx.error(format!("{base}.k"), "条件字段不能为空");
+        return;
+    }
+    if !KNOWN_CONDITION_KEYS.contains(&key.as_str()) && !is_header {
+        ctx.error(
+            format!("{base}.k"),
+            format!(
+                "未知条件字段 `{}`（支持 IP / IP 组 / 路径 / 方法 / UA / 请求头 等）",
+                cond.k
+            ),
+        );
+    }
+
+    let op = cond.op.trim().to_ascii_lowercase();
+    if !KNOWN_OPERATORS.contains(&op.as_str()) {
+        ctx.error(
+            format!("{base}.op"),
+            format!(
+                "未知匹配方式 `{}`（支持 eq / contain / prefix / suffix / regex / ne 等）",
+                cond.op
+            ),
+        );
+    }
+
+    if cond.v.is_empty() || cond.v.iter().all(|v| v.trim().is_empty()) {
+        ctx.error(format!("{base}.v"), "匹配值不能为空");
+        return;
+    }
+
+    // src_ip 的值必须是 CIDR：写成裸 IP 或写错格式时，运行期会静默不匹配
+    if matches!(key.as_str(), "src_ip" | "ip" | "client_ip" | "source_ip") {
+        for (n, v) in cond.v.iter().enumerate() {
+            if v.parse::<ipnet::IpNet>().is_err() {
+                ctx.error(
+                    format!("{base}.v[{n}]"),
+                    format!("`{v}` 不是合法的网段，请写成 1.2.3.4/32 或 1.2.3.0/24"),
+                );
+            }
+        }
+    }
+
+    if key == "ip_group" {
+        for (n, v) in cond.v.iter().enumerate() {
+            if !group_names.contains(v.trim()) {
+                ctx.error(
+                    format!("{base}.v[{n}]"),
+                    format!("引用了不存在的 IP 组 `{v}`"),
+                );
+            }
+        }
+    }
+
+    if is_header && key != "header:" && cond.sub_k.as_deref().unwrap_or("").trim().is_empty() {
+        ctx.error(format!("{base}.sub_k"), "请求头条件必须指定头名（sub_k）");
+    }
+
+    if matches!(op.as_str(), "regex" | "match" | "re") {
+        for (n, v) in cond.v.iter().enumerate() {
+            if regex::Regex::new(v).is_err() {
+                ctx.error(format!("{base}.v[{n}]"), format!("正则表达式非法：{v}"));
+            }
+        }
     }
 }
 
@@ -1287,6 +1491,105 @@ mod tests {
     // ============================================================
     // 规则包订阅
     // ============================================================
+
+    // ============================================================
+    // 自定义规则
+    // ============================================================
+
+    fn custom(id: &str, pattern: Vec<Vec<RuleCondition>>) -> CustomRule {
+        CustomRule {
+            id: id.to_string(),
+            name: "测试规则".to_string(),
+            enabled: true,
+            action: 1,
+            scope: Vec::new(),
+            expires_at: None,
+            pattern,
+        }
+    }
+
+    fn cond(k: &str, op: &str, v: &[&str]) -> RuleCondition {
+        RuleCondition {
+            k: k.to_string(),
+            op: op.to_string(),
+            v: v.iter().map(|s| s.to_string()).collect(),
+            sub_k: None,
+        }
+    }
+
+    #[test]
+    fn valid_custom_rule_passes() {
+        let report = validate(&Config {
+            custom_rules: vec![custom(
+                "r1",
+                vec![vec![cond("path", "prefix", &["/admin"])]],
+            )],
+            ..Default::default()
+        });
+        assert!(
+            !report
+                .errors
+                .iter()
+                .any(|e| e.path.starts_with("custom_rules")),
+            "{:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn custom_rule_rejects_unknown_field_and_bad_cidr() {
+        let report = validate(&Config {
+            custom_rules: vec![custom(
+                "r1",
+                vec![vec![
+                    cond("telepathy", "eq", &["x"]),
+                    cond("src_ip", "eq", &["not-a-cidr"]),
+                ]],
+            )],
+            ..Default::default()
+        });
+        let msgs: Vec<&str> = report
+            .errors
+            .iter()
+            .filter(|e| e.path.starts_with("custom_rules"))
+            .map(|e| e.message.as_str())
+            .collect();
+        assert!(msgs.iter().any(|m| m.contains("未知条件字段")), "{msgs:?}");
+        assert!(
+            msgs.iter().any(|m| m.contains("不是合法的网段")),
+            "{msgs:?}"
+        );
+    }
+
+    #[test]
+    fn custom_rule_rejects_missing_ip_group() {
+        let report = validate(&Config {
+            custom_rules: vec![custom("r1", vec![vec![cond("ip_group", "in", &["nope"])]])],
+            ..Default::default()
+        });
+        assert!(report
+            .errors
+            .iter()
+            .any(|e| e.message.contains("不存在的 IP 组")));
+    }
+
+    #[test]
+    fn custom_rule_rejects_empty_pattern_and_bad_action() {
+        let mut rule = custom("r1", vec![vec![]]);
+        rule.action = 9;
+        let report = validate(&Config {
+            custom_rules: vec![rule],
+            ..Default::default()
+        });
+        assert!(report
+            .errors
+            .iter()
+            .any(|e| e.message.contains("至少要有一个条件")));
+        assert!(report
+            .errors
+            .iter()
+            .any(|e| e.message.contains("动作只能是")));
+    }
 
     fn rule_feed() -> RuleFeed {
         RuleFeed {

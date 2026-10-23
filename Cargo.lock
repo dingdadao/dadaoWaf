@@ -977,6 +977,7 @@ name = "homewaf-config"
 version = "0.1.0"
 dependencies = [
  "ipnet",
+ "regex",
  "serde",
  "serde_json",
  "serde_path_to_error",

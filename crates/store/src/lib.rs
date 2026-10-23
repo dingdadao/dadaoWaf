@@ -90,9 +90,17 @@ pub struct Event {
     pub path: String,
     /// 命中的规则 id，逗号分隔
     pub rules: String,
+    /// 命中的规则名称（人类可读），逗号分隔
+    pub rule_names: String,
     pub score: u32,
     /// `block` / `log` / `observe` / `ban`
     pub action: String,
+    /// 请求 ID，可与访问日志对照
+    pub request_id: String,
+    pub method: String,
+    /// 查询串（不含 `?`）
+    pub query: String,
+    pub user_agent: String,
 }
 
 impl Event {
@@ -106,9 +114,39 @@ impl Event {
             app: String::new(),
             path: String::new(),
             rules: String::new(),
+            rule_names: String::new(),
             score: 0,
             action: String::new(),
+            request_id: String::new(),
+            method: String::new(),
+            query: String::new(),
+            user_agent: String::new(),
         }
+    }
+
+    pub fn with_request(
+        mut self,
+        request_id: impl Into<String>,
+        method: impl Into<String>,
+    ) -> Self {
+        self.request_id = request_id.into();
+        self.method = method.into();
+        self
+    }
+
+    pub fn with_query(mut self, query: impl Into<String>) -> Self {
+        self.query = query.into();
+        self
+    }
+
+    pub fn with_user_agent(mut self, ua: impl Into<String>) -> Self {
+        self.user_agent = ua.into();
+        self
+    }
+
+    pub fn with_rule_names(mut self, names: impl Into<String>) -> Self {
+        self.rule_names = names.into();
+        self
     }
 
     pub fn with_app(mut self, app: impl Into<String>) -> Self {
@@ -267,7 +305,12 @@ impl Store {
                 path      TEXT NOT NULL DEFAULT '',
                 rules     TEXT NOT NULL DEFAULT '',
                 score     INTEGER NOT NULL DEFAULT 0,
-                action    TEXT NOT NULL DEFAULT ''
+                action    TEXT NOT NULL DEFAULT '',
+                request_id TEXT NOT NULL DEFAULT '',
+                method    TEXT NOT NULL DEFAULT '',
+                query     TEXT NOT NULL DEFAULT '',
+                ua        TEXT NOT NULL DEFAULT '',
+                rule_names TEXT NOT NULL DEFAULT ''
             );
             CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts DESC);
 
@@ -387,6 +430,19 @@ impl Store {
             ) WITHOUT ROWID;
             "#,
         )?;
+
+        // 老库补列：SQLite 没有 `ADD COLUMN IF NOT EXISTS`，只能先查 table_info。
+        // 事件表在 v0.2 之后新增了请求方法 / 查询串 / UA / 规则名，
+        // 直接 ALTER 失败会让升级后整个服务起不来，所以必须容错。
+        for (column, decl) in [
+            ("request_id", "TEXT NOT NULL DEFAULT ''"),
+            ("method", "TEXT NOT NULL DEFAULT ''"),
+            ("query", "TEXT NOT NULL DEFAULT ''"),
+            ("ua", "TEXT NOT NULL DEFAULT ''"),
+            ("rule_names", "TEXT NOT NULL DEFAULT ''"),
+        ] {
+            ensure_column(&conn, "events", column, decl);
+        }
         Ok(())
     }
 
@@ -474,8 +530,9 @@ impl Store {
         let conn = self.conn.lock().map_err(|_| StoreError::Poisoned)?;
         conn.execute(
             r#"
-            INSERT INTO events (ts, kind, client_ip, app, path, rules, score, action)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            INSERT INTO events (ts, kind, client_ip, app, path, rules, score, action,
+                                request_id, method, query, ua, rule_names)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
             "#,
             params![
                 event.ts,
@@ -485,7 +542,12 @@ impl Store {
                 event.path,
                 event.rules,
                 event.score,
-                event.action
+                event.action,
+                event.request_id,
+                event.method,
+                event.query,
+                event.user_agent,
+                event.rule_names
             ],
         )?;
         Ok(conn.last_insert_rowid())
@@ -518,6 +580,9 @@ impl Store {
                   AND (?7 IS NULL OR path LIKE '%' || ?7 || '%')
                   AND (?8 IS NULL OR path LIKE '%' || ?8 || '%'
                        OR rules LIKE '%' || ?8 || '%'
+                       OR rule_names LIKE '%' || ?8 || '%'
+                       OR ua LIKE '%' || ?8 || '%'
+                       OR request_id LIKE '%' || ?8 || '%'
                        OR client_ip LIKE '%' || ?8 || '%')
                 "#,
                 params![
@@ -535,7 +600,8 @@ impl Store {
 
             let mut stmt = conn.prepare(
                 r#"
-                SELECT id, ts, kind, client_ip, app, path, rules, score, action
+                SELECT id, ts, kind, client_ip, app, path, rules, score, action,
+                       request_id, method, query, ua, rule_names
                 FROM events
                 WHERE (?1 IS NULL OR kind = ?1)
                   AND (?2 IS NULL OR client_ip = ?2)
@@ -546,6 +612,9 @@ impl Store {
                   AND (?7 IS NULL OR path LIKE '%' || ?7 || '%')
                   AND (?8 IS NULL OR path LIKE '%' || ?8 || '%'
                        OR rules LIKE '%' || ?8 || '%'
+                       OR rule_names LIKE '%' || ?8 || '%'
+                       OR ua LIKE '%' || ?8 || '%'
+                       OR request_id LIKE '%' || ?8 || '%'
                        OR client_ip LIKE '%' || ?8 || '%')
                 ORDER BY ts DESC, id DESC
                 LIMIT ?9 OFFSET ?10
@@ -575,6 +644,11 @@ impl Store {
                         rules: row.get(6)?,
                         score: row.get(7)?,
                         action: row.get(8)?,
+                        request_id: row.get(9)?,
+                        method: row.get(10)?,
+                        query: row.get(11)?,
+                        user_agent: row.get(12)?,
+                        rule_names: row.get(13)?,
                     })
                 },
             )?;
@@ -1208,6 +1282,29 @@ pub struct RuleFeedPackageRow {
     pub shadow_until: i64,
     pub signature_ok: bool,
     pub rule_count: usize,
+}
+
+/// 确保表里有某一列；没有就补上。
+///
+/// 查不到表结构时按「已存在」处理：宁可少补一列，也不要因为 ALTER 报错让启动失败。
+fn ensure_column(conn: &Connection, table: &str, column: &str, decl: &str) {
+    let sql = format!("PRAGMA table_info({table})");
+    let exists = conn
+        .prepare(&sql)
+        .and_then(|mut stmt| {
+            let names = stmt
+                .query_map([], |row| row.get::<_, String>(1))?
+                .filter_map(Result::ok)
+                .collect::<Vec<_>>();
+            Ok(names.iter().any(|n| n == column))
+        })
+        .unwrap_or(true);
+    if !exists {
+        let _ = conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"),
+            [],
+        );
+    }
 }
 
 #[cfg(test)]

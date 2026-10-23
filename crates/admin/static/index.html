@@ -748,6 +748,26 @@
   @media (max-width: 760px) {
     .app-grid { grid-template-columns: 1fr; }
   }
+
+  /* ---------- 规则编辑器（模态） ---------- */
+  .modal-mask { position: fixed; inset: 0; background: rgba(0,0,0,.55); display: none; z-index: 80; }
+  .modal-mask.show { display: block; }
+  .modal {
+    position: fixed; top: 5vh; left: 50%; transform: translateX(-50%);
+    width: min(900px, 94vw); max-height: 90vh; overflow: auto;
+    background: var(--card); border: 1px solid var(--border); border-radius: 10px; z-index: 81;
+  }
+  .modal header { display: flex; justify-content: space-between; align-items: center; padding: 14px 18px; border-bottom: 1px solid var(--border); }
+  .modal header h2 { margin: 0; font-size: 15px; }
+  .modal form { border-bottom: none; }
+  .cond-group { border: 1px solid var(--border); border-radius: 8px; padding: 10px; margin-bottom: 10px; display: grid; gap: 8px; }
+  .cond-group-head { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); }
+  .cond-group-head span { margin-right: auto; }
+  .cond-row { display: flex; gap: 8px; align-items: center; }
+  .cond-row input, .cond-row select { font-size: 12px; }
+  .kvtable { width: 100%; border-collapse: collapse; font-size: 13px; }
+  .kvtable th { text-align: left; color: var(--muted); font-weight: 500; width: 130px; padding: 7px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  .kvtable td { padding: 7px 10px; border-bottom: 1px solid var(--border); word-break: break-word; }
 </style>
 </head>
 <body>
@@ -1067,25 +1087,20 @@
         </section>
       </div>
 
-      <!-- ========== ACL 规则 ========== -->
+      <!-- ========== 访问控制（雷池式条件规则） ========== -->
       <div class="page" data-page="rules">
         <section class="card">
           <header>
-            <h2>访问控制规则</h2>
-            <button class="primary" onclick="showRuleForm()">+ 新建规则</button>
+            <h2>访问控制</h2>
+            <div class="filters">
+              <input id="rule-q" placeholder="搜索名称 / 条件 / 应用" style="min-width:220px"
+                     oninput="renderRules()">
+              <button class="primary" onclick="showRuleForm()">+ 新建规则</button>
+            </div>
           </header>
-          <form id="rule-form" onsubmit="submitRule(event)" style="display:none">
-            <div><label for="rf-cidr">网段</label><input id="rf-cidr" placeholder="203.0.113.0/24" required></div>
-            <div><label for="rf-action">动作</label>
-              <select id="rf-action"><option value="deny">拒绝</option><option value="allow">放行</option></select>
-            </div>
-            <div><label for="rf-scope">作用域（留空为全局）</label><input id="rf-scope" placeholder="nas"></div>
-            <div><label for="rf-note">备注</label><input id="rf-note" placeholder="可选"></div>
-            <div style="display:flex;gap:8px;align-items:center">
-              <button type="submit" class="primary" id="rf-submit">添加</button>
-              <button type="button" onclick="hideRuleForm()">取消</button>
-            </div>
-          </form>
+          <div class="hint" style="padding:0 16px 10px;font-size:12px;color:var(--muted)">
+            条件组之间是「或」，组内条件是「且」。动作优先级：放行 &gt; 拦截 / 人机验证 &gt; 仅记录。
+          </div>
           <div id="rules"></div>
         </section>
       </div>
@@ -1189,6 +1204,8 @@
                 <option value="log">记录</option><option value="observe">观察</option>
               </select>
               <input id="ev-ip" placeholder="来源 IP" onkeydown="if(event.key==='Enter'){eventPage=0;loadEvents()}">
+              <input id="ev-q" placeholder="路径 / 规则 / UA / 请求 ID" style="min-width:200px"
+                     onkeydown="if(event.key==='Enter'){eventPage=0;loadEvents()}">
               <button onclick="eventPage=0;loadEvents()">查询</button>
               <button onclick="exportEvents()">导出 CSV</button>
             </div>
@@ -1396,6 +1413,52 @@
     </div>
   </div>
 </div>
+
+
+  <!-- 规则编辑器 -->
+  <div class="modal-mask" id="rule-modal" onclick="if(event.target===this)hideRuleForm()">
+    <div class="modal">
+      <header>
+        <h2 id="rule-modal-title">新建规则</h2>
+        <button onclick="hideRuleForm()">关闭</button>
+      </header>
+      <form id="rule-form" onsubmit="submitRule(event)">
+        <div><label for="rule-name">规则名称</label><input id="rule-name" placeholder="例如：后台只允许内网访问" required></div>
+        <div><label for="rule-action">动作</label>
+          <select id="rule-action">
+            <option value="1">拦截（403）</option>
+            <option value="0">放行（跳过检测与封禁）</option>
+            <option value="2">人机验证</option>
+            <option value="3">仅记录</option>
+          </select>
+        </div>
+        <div><label for="rule-scope">生效应用（ID，逗号分隔，留空为全部）</label><input id="rule-scope" placeholder="nas, blog"></div>
+        <div><label for="rule-id">规则 ID（留空自动生成）</label><input id="rule-id" placeholder="rule-xxx"></div>
+        <div class="wide"><label class="row" style="margin:0;grid-column:auto"><input type="checkbox" id="rule-enabled" checked> 启用</label></div>
+        <div class="wide">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+            <label style="margin:0">匹配条件</label>
+            <button type="button" onclick="addCondGroup()">+ 添加条件组（或）</button>
+          </div>
+          <div id="rule-conds"></div>
+        </div>
+        <div class="hint">组内条件是「且」，条件组之间是「或」。IP 组来自「订阅源」里类型为 IP 组的订阅。</div>
+        <div style="display:flex;gap:8px">
+          <button type="submit" class="primary" id="rule-submit">保存</button>
+          <button type="button" onclick="hideRuleForm()">取消</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+
+  <!-- 通用详情 -->
+  <div class="modal-mask" id="detail-modal" onclick="if(event.target===this)hideDetail()">
+    <div class="modal" style="width:min(760px,94vw)">
+      <header><h2 id="detail-title">详情</h2><button onclick="hideDetail()">关闭</button></header>
+      <div id="detail-body" style="padding:14px 18px"></div>
+    </div>
+  </div>
 
 <script>
 // ============================================================
@@ -2729,54 +2792,232 @@ async function deleteApp(id) {
 }
 
 // ============================================================
-// ACL 规则
+// 访问控制（雷池式条件规则）
 // ============================================================
+const RULE_FIELD_LABEL = {
+  src_ip: '来源 IP', ip_group: 'IP 组', path: '路径', method: '请求方法',
+  user_agent: 'User-Agent', header: '请求头', query: '查询参数', host: '域名', url: '完整 URL',
+};
+const RULE_OP_LABEL = {
+  eq: '等于', ne: '不等于', contain: '包含', not_contain: '不包含',
+  prefix: '前缀是', suffix: '后缀是', regex: '正则匹配',
+};
+const RULE_ACTION = {
+  0: { text: '放行', cls: 'allow' },
+  1: { text: '拦截', cls: 'deny' },
+  2: { text: '人机验证', cls: 'log' },
+  3: { text: '仅记录', cls: 'log' },
+};
+let ruleCtx = { apps: [], groups: [] };
+let ruleCache = [];
+let editingRule = null;
+
+function ruleActionTag(a) {
+  const m = RULE_ACTION[a] || RULE_ACTION[1];
+  return `<span class="tag ${m.cls}">${m.text}</span>`;
+}
+
+function condText(c) {
+  const field = RULE_FIELD_LABEL[c.k] || c.k;
+  const op = RULE_OP_LABEL[c.op] || c.op;
+  const values = (c.v || []).join('、');
+  const sub = c.sub_k ? `(${c.sub_k})` : '';
+  return `${field}${sub} ${op} ${values}`;
+}
+
+function ruleSummary(rule) {
+  return (rule.pattern || []).filter(g => g.length)
+    .map(g => g.map(condText).join(' 且 '))
+    .join(' 或 ');
+}
+
+function ruleApplies(rule) {
+  if (!rule.scope || !rule.scope.length) return '<span class="sub" style="margin:0">全部应用</span>';
+  return rule.scope.map(id => {
+    const app = ruleCtx.apps.find(a => a.id === id);
+    return esc(app ? app.name : id);
+  }).join('、');
+}
+
 async function loadRules() {
   const el = document.getElementById('rules');
   try {
-    const rules = await api('/rules');
-    if (!rules.length) { el.innerHTML = '<div class="empty">还没有规则</div>'; return; }
-    el.innerHTML = `<table>
-      <thead><tr><th>ID</th><th>网段</th><th>动作</th><th>作用域</th><th>备注</th><th></th></tr></thead>
-      <tbody>${rules.map(r => `<tr>
-        <td><code>${esc(r.id)}</code></td><td><code>${esc(r.cidr)}</code></td>
-        <td><span class="tag ${esc(r.action)}">${r.action === 'allow' ? '放行' : '拒绝'}</span></td>
-        <td>${r.scope ? esc(r.scope) : '<span class="sub" style="margin:0">全局</span>'}</td>
-        <td>${esc(r.note || '')}</td>
-        <td><button class="danger" onclick="deleteRule('${esc(r.id)}')">删除</button></td>
-      </tr>`).join('')}</tbody></table>`;
+    const data = await api('/rules');
+    ruleCtx = { apps: data.apps || [], groups: data.ip_groups || [] };
+    ruleCache = data.rules || [];
+    renderRules();
   } catch (e) { el.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`; }
 }
 
-function showRuleForm() {
-  document.getElementById('rule-form').style.display = 'grid';
-  ['rf-cidr', 'rf-scope', 'rf-note'].forEach(id => document.getElementById(id).value = '');
-  document.getElementById('rf-action').value = 'deny';
-  document.getElementById('rf-cidr').focus();
+function renderRules() {
+  const el = document.getElementById('rules');
+  const q = (document.getElementById('rule-q')?.value || '').trim().toLowerCase();
+  const rows = ruleCache.filter(r => !q
+    || (r.name || '').toLowerCase().includes(q)
+    || r.id.toLowerCase().includes(q)
+    || ruleSummary(r).toLowerCase().includes(q));
+
+  if (!rows.length) {
+    el.innerHTML = `<div class="empty">${ruleCache.length
+      ? '没有匹配的规则'
+      : '还没有访问控制规则。新建一条：命中「IP 组」或「路径」时放行 / 拦截 / 人机验证。'}</div>`;
+    return;
+  }
+  el.innerHTML = `<table>
+    <thead><tr><th>规则名称</th><th>匹配条件</th><th>动作</th><th>生效应用</th><th>状态</th><th></th></tr></thead>
+    <tbody>${rows.map(r => `<tr>
+      <td><b>${esc(r.name || r.id)}</b><div class="sub" style="margin:2px 0 0"><code>${esc(r.id)}</code></div></td>
+      <td style="max-width:520px;line-height:1.8">${esc(ruleSummary(r)) || '<span class="sub" style="margin:0">—</span>'}</td>
+      <td>${ruleActionTag(r.action)}</td>
+      <td>${ruleApplies(r)}</td>
+      <td>${r.is_enabled !== false ? '<span class="tag allow">启用</span>' : '<span class="tag">停用</span>'}</td>
+      <td style="white-space:nowrap">
+        <button onclick="showRuleForm('${esc(r.id)}')">编辑</button>
+        <button onclick="toggleRule('${esc(r.id)}')">${r.is_enabled !== false ? '停用' : '启用'}</button>
+        <button class="danger" onclick="deleteRule('${esc(r.id)}')">删除</button>
+      </td>
+    </tr>`).join('')}</tbody></table>`;
 }
-function hideRuleForm() { document.getElementById('rule-form').style.display = 'none'; }
+
+function condRowHtml(c) {
+  const field = c.k || 'path';
+  const op = c.op || 'prefix';
+  const needSub = field === 'header';
+  const options = Object.entries(RULE_FIELD_LABEL).map(([k, label]) =>
+    `<option value="${k}"${k === field ? ' selected' : ''}>${label}</option>`).join('');
+  const ops = Object.entries(RULE_OP_LABEL).map(([k, label]) =>
+    `<option value="${k}"${k === op ? ' selected' : ''}>${label}</option>`).join('');
+  return `<div class="cond-row">
+    <select class="cond-k" style="width:140px" onchange="onCondFieldChange(this)">${options}</select>
+    <select class="cond-op" style="width:120px">${ops}</select>
+    <input class="cond-sub" style="width:120px;display:${needSub ? '' : 'none'}" placeholder="头名" value="${esc(c.sub_k || '')}">
+    <input class="cond-v" style="flex:1" placeholder="匹配值，多个用逗号分隔" value="${esc((c.v || []).join(', '))}">
+    <button type="button" class="danger" style="width:34px" onclick="this.closest('.cond-row').remove()">×</button>
+  </div>`;
+}
+
+function onCondFieldChange(sel) {
+  const sub = sel.closest('.cond-row').querySelector('.cond-sub');
+  sub.style.display = sel.value === 'header' ? '' : 'none';
+}
+
+function renderCondEditor(pattern) {
+  document.getElementById('rule-conds').innerHTML = pattern.map((group, gi) => `
+    <div class="cond-group">
+      <div class="cond-group-head">
+        <span>条件组 ${gi + 1}</span>
+        <button type="button" onclick="addCond(this)">+ 条件</button>
+        <button type="button" class="danger" onclick="this.closest('.cond-group').remove()">删除组</button>
+      </div>
+      ${group.map(condRowHtml).join('')}
+    </div>`).join('');
+}
+
+function addCondGroup() {
+  document.getElementById('rule-conds').insertAdjacentHTML('beforeend', `
+    <div class="cond-group">
+      <div class="cond-group-head">
+        <span>条件组</span>
+        <button type="button" onclick="addCond(this)">+ 条件</button>
+        <button type="button" class="danger" onclick="this.closest('.cond-group').remove()">删除组</button>
+      </div>
+      ${condRowHtml({ k: 'path', op: 'prefix', v: ['/'] })}
+    </div>`);
+  renumberGroups();
+}
+
+function addCond(btn) {
+  btn.closest('.cond-group').insertAdjacentHTML('beforeend', condRowHtml({ k: 'path', op: 'prefix', v: ['/'] }));
+}
+
+function renumberGroups() {
+  document.querySelectorAll('#rule-conds .cond-group-head span').forEach((el, i) => {
+    el.textContent = `条件组 ${i + 1}`;
+  });
+}
+
+function showRuleForm(id) {
+  editingRule = id ? ruleCache.find(r => r.id === id) : null;
+  const r = editingRule || {
+    id: '', name: '', enabled: true, action: 1, scope: [],
+    pattern: [[{ k: 'src_ip', op: 'eq', v: [''] }]],
+  };
+  document.getElementById('rule-modal-title').textContent = editingRule ? '编辑规则' : '新建规则';
+  document.getElementById('rule-id').value = r.id || '';
+  document.getElementById('rule-id').readOnly = !!editingRule;
+  document.getElementById('rule-name').value = r.name || '';
+  document.getElementById('rule-action').value = String(r.action ?? 1);
+  document.getElementById('rule-enabled').checked = r.is_enabled !== false;
+  document.getElementById('rule-scope').value = (r.scope || []).join(', ');
+  renderCondEditor(r.pattern && r.pattern.length ? r.pattern : [[{ k: 'src_ip', op: 'eq', v: [''] }]]);
+  document.getElementById('rule-modal').classList.add('show');
+  document.getElementById('rule-name').focus();
+}
+
+function hideRuleForm() {
+  document.getElementById('rule-modal').classList.remove('show');
+  editingRule = null;
+}
+
+function collectRule() {
+  const pattern = [...document.querySelectorAll('#rule-conds .cond-group')].map(g => {
+    const conds = [...g.querySelectorAll('.cond-row')].map(row => {
+      const k = row.querySelector('.cond-k').value;
+      const op = row.querySelector('.cond-op').value;
+      const sub = row.querySelector('.cond-sub').value.trim();
+      const v = row.querySelector('.cond-v').value.split(',').map(s => s.trim()).filter(Boolean);
+      const c = { k, op, v };
+      if (k === 'header' && sub) c.sub_k = sub;
+      return c;
+    }).filter(c => c.v.length);
+    return conds;
+  }).filter(g => g.length);
+
+  return {
+    id: document.getElementById('rule-id').value.trim(),
+    name: document.getElementById('rule-name').value.trim(),
+    is_enabled: document.getElementById('rule-enabled').checked,
+    action: parseInt(document.getElementById('rule-action').value, 10),
+    scope: document.getElementById('rule-scope').value.split(',').map(s => s.trim()).filter(Boolean),
+    expires_at: editingRule?.expires_at ?? null,
+    pattern,
+  };
+}
 
 async function submitRule(e) {
   e.preventDefault();
-  const btn = document.getElementById('rf-submit');
-  const cidr = document.getElementById('rf-cidr').value.trim();
-  const action = document.getElementById('rf-action').value;
-  const scope = document.getElementById('rf-scope').value.trim();
-  const note = document.getElementById('rf-note').value.trim();
+  const btn = document.getElementById('rule-submit');
+  const rule = collectRule();
 
-  if (!/^[0-9a-fA-F:.]+\/\d{1,3}$/.test(cidr)) return showMsg('网段格式应为 CIDR，如 203.0.113.0/24', 'error');
+  if (!rule.name) return showMsg('请填写规则名称', 'error');
+  if (!rule.pattern.length) return showMsg('至少需要一个有效条件（匹配值不能为空）', 'error');
+  const badHeader = rule.pattern.some(g => g.some(c => c.k === 'header' && !c.sub_k));
+  if (badHeader) return showMsg('请求头条件必须填写头名', 'error');
+  if (!rule.id) rule.id = 'rule-' + Date.now().toString(36);
 
-  btn.disabled = true; btn.textContent = '添加中…';
+  btn.disabled = true; btn.textContent = '保存中…';
   try {
-    await api('/rules', { method: 'POST', body: JSON.stringify({ cidr, action, scope: scope || null, note: note || null }) });
-    showMsg(`规则已添加：${cidr}`);
+    await api('/rules', { method: 'POST', body: JSON.stringify(rule) });
+    showMsg(`规则「${rule.name}」已保存`);
     hideRuleForm(); loadRules(); loadStatistics();
-  } catch (err) { showMsg('添加失败：' + err.message, 'error'); }
-  finally { btn.disabled = false; btn.textContent = '添加'; }
+  } catch (err) { showMsg('保存失败：' + err.message, 'error'); }
+  finally { btn.disabled = false; btn.textContent = '保存'; }
+}
+
+async function toggleRule(id) {
+  const r = ruleCache.find(x => x.id === id);
+  if (!r) return;
+  const on = r.is_enabled !== false;
+  try {
+    await api('/rules', { method: 'POST', body: JSON.stringify({ ...r, is_enabled: !on }) });
+    showMsg(`${r.name || id} 已${on ? '停用' : '启用'}`);
+    loadRules();
+  } catch (e) { showMsg('操作失败：' + e.message, 'error'); }
 }
 
 async function deleteRule(id) {
-  if (!confirm(`删除规则 ${id}？`)) return;
+  const r = ruleCache.find(x => x.id === id);
+  if (!confirm(`删除规则「${r ? (r.name || id) : id}」？`)) return;
   try { await api('/rules/' + encodeURIComponent(id), { method: 'DELETE' }); showMsg('已删除'); loadRules(); loadStatistics(); }
   catch (e) { showMsg('删除失败：' + e.message, 'error'); }
 }
@@ -3090,6 +3331,7 @@ let eventPage = 0;
 const EVENT_PAGE_SIZE = 20;
 
 async function loadEvents() {
+  await ensureAppNames();
   const el = document.getElementById('events');
   const pager = document.getElementById('events-pager');
   const params = new URLSearchParams({ limit: String(EVENT_PAGE_SIZE), offset: String(eventPage * EVENT_PAGE_SIZE) });
@@ -3099,6 +3341,8 @@ async function loadEvents() {
   if (kind) params.set('kind', kind);
   if (action) params.set('action', action);
   if (ip) params.set('ip', ip);
+  const q = document.getElementById('ev-q').value.trim();
+  if (q) params.set('q', q);
 
   try {
     const res = await api('/events?' + params);
@@ -3108,13 +3352,22 @@ async function loadEvents() {
       pager.innerHTML = ''; return;
     }
     el.innerHTML = `<table>
-      <thead><tr><th>时间</th><th>类型</th><th>来源 IP</th><th>应用</th><th>规则</th><th>分数</th><th>处置</th></tr></thead>
-      <tbody>${events.map(e => `<tr>
-        <td>${fmtTime(e.ts)}</td><td>${esc(kindLabel(e.kind))}</td>
-        <td><code>${esc(e.client_ip)}</code></td><td>${esc(e.app)}</td>
-        <td><code>${esc(e.rules)}</code></td><td>${e.score}</td>
+      <thead><tr><th>时间</th><th>类型</th><th>来源 IP</th><th>请求</th><th>命中规则</th><th>分数</th><th>处置</th><th>应用</th><th></th></tr></thead>
+      <tbody>${events.map((e, i) => `<tr>
+        <td style="white-space:nowrap">${fmtTime(e.ts)}</td>
+        <td>${esc(kindLabel(e.kind))}</td>
+        <td><code>${esc(e.client_ip)}</code></td>
+        <td style="max-width:340px">
+          <div><span class="tag">${esc(e.method || '-')}</span> <code style="font-size:12px">${esc(e.path || '-')}</code></div>
+          ${e.query ? `<div class="sub" style="margin:2px 0 0;word-break:break-all">?${esc(e.query)}</div>` : ''}
+        </td>
+        <td style="max-width:280px;word-break:break-all">${esc(e.rule_names || e.rules || '-')}</td>
+        <td>${e.score}</td>
         <td><span class="tag ${esc(e.action)}">${esc(actionLabel(e.action))}</span></td>
+        <td>${esc(appLabel(e.app))}</td>
+        <td><button onclick="showEventDetail(${i})">详情</button></td>
       </tr>`).join('')}</tbody></table>`;
+    eventCache = events;
 
     const pages = Math.max(1, Math.ceil(total / EVENT_PAGE_SIZE));
     pager.innerHTML = `
@@ -3127,6 +3380,54 @@ async function loadEvents() {
   }
 }
 
+let eventCache = [];
+let appNames = {};
+
+/// 事件与日志里存的是应用 ID，展示时换成应用名
+async function ensureAppNames() {
+  if (Object.keys(appNames).length) return;
+  try {
+    const apps = await api('/apps');
+    appNames = Object.fromEntries(apps.map(a => [a.id, a.name]));
+  } catch (_) { /* 拿不到就退回显示 ID */ }
+}
+const appLabel = (id) => (id && appNames[id]) || id || '-';
+
+function showDetail(title, rows) {
+  document.getElementById('detail-title').textContent = title;
+  document.getElementById('detail-body').innerHTML = `<table class="kvtable">${rows.map(([k, v]) =>
+    `<tr><th>${esc(k)}</th><td>${v}</td></tr>`).join('')}</table>`;
+  document.getElementById('detail-modal').classList.add('show');
+}
+function hideDetail() { document.getElementById('detail-modal').classList.remove('show'); }
+
+function showEventDetail(i) {
+  const e = eventCache[i];
+  if (!e) return;
+  showDetail('事件详情', [
+    ['时间', esc(fmtTime(e.ts))],
+    ['类型 / 处置', `${esc(kindLabel(e.kind))} · <span class="tag ${esc(e.action)}">${esc(actionLabel(e.action))}</span>`],
+    ['来源 IP', `<code>${esc(e.client_ip || '-')}</code>`],
+    ['应用', esc(appLabel(e.app))],
+    ['请求', `<span class="tag">${esc(e.method || '-')}</span> <code>${esc(e.path || '-')}</code>`],
+    ['查询串', e.query ? `<code style="word-break:break-all">${esc(e.query)}</code>` : '—'],
+    ['User-Agent', e.user_agent ? `<span style="word-break:break-all">${esc(e.user_agent)}</span>` : '—'],
+    ['命中规则 ID', `<code>${esc(e.rules || '-')}</code>`],
+    ['命中规则名称', esc(e.rule_names || '-')],
+    ['风险分', String(e.score ?? 0)],
+    ['请求 ID', e.request_id
+      ? `<code>${esc(e.request_id)}</code> <button onclick="gotoLogsByReq('${esc(e.request_id)}')">查看日志</button>`
+      : '—'],
+  ]);
+}
+
+function gotoLogsByReq(req) {
+  hideDetail();
+  gotoPage('logs');
+  document.getElementById('log-q').value = req;
+  loadLogs();
+}
+
 function exportEvents() {
   const params = new URLSearchParams();
   const kind = document.getElementById('ev-kind').value;
@@ -3135,6 +3436,8 @@ function exportEvents() {
   if (kind) params.set('kind', kind);
   if (action) params.set('action', action);
   if (ip) params.set('ip', ip);
+  const q = document.getElementById('ev-q').value.trim();
+  if (q) params.set('q', q);
   window.location.href = '/api/events/export?' + params.toString();
 }
 
@@ -3142,6 +3445,7 @@ function exportEvents() {
 // 日志
 // ============================================================
 async function loadLogs() {
+  await ensureAppNames();
   const view = document.getElementById('logview');
   const meta = document.getElementById('log-meta');
   const kind = document.getElementById('log-kind').value;
@@ -3193,23 +3497,29 @@ function renderLogTable(kind, rows) {
 
 function accessTable(rows) {
   return `<table class="logtable">
-    <thead><tr><th>时间</th><th>方法</th><th>路径</th><th>状态</th><th>上游</th>
-    <th style="text-align:right">耗时</th><th>来源 IP</th><th>ID</th></tr></thead>
+    <thead><tr><th>时间</th><th>方法</th><th>主机 / 路径</th><th>状态</th><th>上游</th>
+    <th style="text-align:right">耗时</th><th>应用</th><th>来源 IP</th><th>说明</th><th>ID</th></tr></thead>
     <tbody>${rows.map((o, i) => {
       const f = o.fields || {};
       const st = f.status ?? 0;
       const id = `acc-${i}`;
+      const note = [f.acl && f.acl !== '-' ? f.acl : '', f.rules || ''].filter(Boolean).join(' · ');
       return `<tr onclick="toggleRaw('${id}')">
         <td class="mono muted">${timeOnly(o.timestamp)}</td>
         <td>${esc(f.method || '')}</td>
-        <td class="mono path" title="${esc(f.path || '')}">${esc(f.path || '')}</td>
+        <td class="mono path" style="max-width:360px">
+          <div class="muted" style="font-size:11px">${esc(f.host || '-')}</div>
+          <div title="${esc(f.path || '')}">${esc(f.path || '')}${f.query ? '?' + esc(f.query) : ''}</div>
+        </td>
         <td><span class="status ${statusCls(st)}">${st || '-'}</span></td>
         <td class="mono muted">${esc(f.upstream || '-')}</td>
         <td class="num">${f.latency_us ? f.latency_us + ' μs' : '-'}</td>
+        <td class="mono muted">${esc(appLabel(f.app_id) || f.app || '-')}</td>
         <td class="mono">${esc(f.client_ip || '-')}</td>
+        <td class="mono" style="max-width:240px;word-break:break-all">${esc(note || '-')}</td>
         <td class="mono req">${esc(f.req || '')}</td>
       </tr>
-      <tr class="rawrow hidden" id="raw-${id}"><td colspan="8"><pre>${esc(JSON.stringify(o, null, 2))}</pre></td></tr>`;
+      <tr class="rawrow hidden" id="raw-${id}"><td colspan="10"><pre>${esc(JSON.stringify(o, null, 2))}</pre></td></tr>`;
     }).join('')}</tbody></table>`;
 }
 

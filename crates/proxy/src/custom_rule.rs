@@ -1,12 +1,22 @@
-//! 自定义规则求值。
+//! 自定义规则求值（访问控制 / 黑白名单）。
 //!
-//! 兼容雷池（长亭）的规则格式：`pattern` 外层是 OR、内层是 AND，
-//! `action` 为 0 时是白名单（命中后放行并跳过检测），为 1 时是黑名单（直接拦截）。
-//! 白名单优先于黑名单，与雷池保持一致。
+//! 规则格式兼容雷池（长亭）：`pattern` 外层是 OR、内层是 AND。
+//! 动作沿用雷池的数字编码并做扩展：
+//!
+//! | action | 含义 | 命中后的处置 |
+//! |---|---|---|
+//! | 0 | 放行 | 跳过检测与自动封禁，直接转发 |
+//! | 1 | 拦截 | 返回 403，记事件 |
+//! | 2 | 人机验证 | 走挑战页，通过后放行 |
+//! | 3 | 仅记录 | 记事件，继续正常流程 |
+//!
+//! 优先级：放行 > 拦截/验证 > 仅记录。放行最高是刻意的——用户显式加白
+//! 一台机器，不应该被同一条链路上的拦截规则推翻。
 
+use std::collections::HashMap;
 use std::net::IpAddr;
 
-use homewaf_config::{CustomRule, RuleCondition};
+use homewaf_config::{CustomRule, RuleActionKind, RuleCondition};
 use ipnet::IpNet;
 use regex::Regex;
 
@@ -22,6 +32,8 @@ pub struct RuleRequest<'a> {
     pub content_type: Option<&'a str>,
     pub cookie: Option<&'a str>,
     pub headers: &'a http::HeaderMap,
+    /// IP 组快照：组名 → 条目。由订阅加载后注入，用于 `ip_group` 条件。
+    pub ip_groups: &'a HashMap<String, Vec<IpNet>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,23 +42,65 @@ pub enum CustomDecision {
     Allow(String),
     /// 黑名单命中，规则名
     Deny(String),
+    /// 需要人机验证，规则名
+    Challenge(String),
+    /// 只记录，规则名
+    Log(String),
 }
 
-/// 按顺序求值。白名单只要命中一条就放行；否则返回第一条命中的黑名单。
-pub fn evaluate(rules: &[CustomRule], req: &RuleRequest<'_>) -> Option<CustomDecision> {
-    let mut deny: Option<String> = None;
-    for rule in rules.iter().filter(|r| r.enabled && !r.pattern.is_empty()) {
+impl CustomDecision {
+    pub fn rule(&self) -> &str {
+        match self {
+            CustomDecision::Allow(n)
+            | CustomDecision::Deny(n)
+            | CustomDecision::Challenge(n)
+            | CustomDecision::Log(n) => n,
+        }
+    }
+
+    pub fn action_str(&self) -> &'static str {
+        match self {
+            CustomDecision::Allow(_) => "allow",
+            CustomDecision::Deny(_) => "block",
+            CustomDecision::Challenge(_) => "challenge",
+            CustomDecision::Log(_) => "log",
+        }
+    }
+}
+
+/// 按顺序求值。
+///
+/// 先扫一遍放行规则（命中即返回），再取第一条命中的拦截/验证规则，
+/// 最后才考虑"仅记录"。这样即使用户把记录规则排在前面，也不会削弱拦截。
+pub fn evaluate(rules: &[CustomRule], req: &RuleRequest<'_>, now: i64) -> Option<CustomDecision> {
+    let mut blocking: Option<(String, RuleActionKind)> = None;
+    let mut log: Option<String> = None;
+
+    for rule in rules {
+        if !rule.is_effective() || rule.is_expired(now) || !rule.applies_to(req.app) {
+            continue;
+        }
         if !rule_matches(rule, req) {
             continue;
         }
-        if rule.is_whitelist() {
-            return Some(CustomDecision::Allow(rule_label(rule)));
-        }
-        if deny.is_none() {
-            deny = Some(rule_label(rule));
+        let kind = rule.action_kind();
+        match kind {
+            RuleActionKind::Allow => return Some(CustomDecision::Allow(rule_label(rule))),
+            RuleActionKind::Deny | RuleActionKind::Challenge if blocking.is_none() => {
+                blocking = Some((rule_label(rule), kind));
+            }
+            RuleActionKind::Log if log.is_none() => log = Some(rule_label(rule)),
+            _ => {}
         }
     }
-    deny.map(CustomDecision::Deny)
+
+    if let Some((name, kind)) = blocking {
+        return Some(match kind {
+            RuleActionKind::Challenge => CustomDecision::Challenge(name),
+            _ => CustomDecision::Deny(name),
+        });
+    }
+    log.map(CustomDecision::Log)
 }
 
 fn rule_label(rule: &CustomRule) -> String {
@@ -65,6 +119,24 @@ fn rule_matches(rule: &CustomRule, req: &RuleRequest<'_>) -> bool {
 }
 
 fn condition_matches(cond: &RuleCondition, req: &RuleRequest<'_>) -> bool {
+    let key = cond.k.trim().to_ascii_lowercase();
+
+    // IP 组是集合成员判断，不能走字符串比较
+    if key == "ip_group" {
+        let Some(ip) = req.ip else {
+            return false;
+        };
+        let hit = cond.v.iter().any(|name| {
+            req.ip_groups
+                .get(name.trim())
+                .is_some_and(|nets| nets.iter().any(|net| net.contains(&ip)))
+        });
+        return match cond.op.trim().to_ascii_lowercase().as_str() {
+            "ne" | "not" | "not_eq" => !hit,
+            _ => hit,
+        };
+    }
+
     let Some(actual) = actual_value(cond, req) else {
         return false;
     };
@@ -148,7 +220,12 @@ fn actual_value(cond: &RuleCondition, req: &RuleRequest<'_>) -> Option<String> {
 mod tests {
     use super::*;
 
-    fn req<'a>(headers: &'a http::HeaderMap) -> RuleRequest<'a> {
+    const NOW: i64 = 1_700_000_000;
+
+    fn req<'a>(
+        headers: &'a http::HeaderMap,
+        groups: &'a HashMap<String, Vec<IpNet>>,
+    ) -> RuleRequest<'a> {
         RuleRequest {
             app: "blog",
             host: "nas.test",
@@ -160,6 +237,7 @@ mod tests {
             content_type: None,
             cookie: None,
             headers,
+            ip_groups: groups,
         }
     }
 
@@ -169,6 +247,8 @@ mod tests {
             name: "测试规则".into(),
             enabled: true,
             action,
+            scope: Vec::new(),
+            expires_at: None,
             pattern,
         }
     }
@@ -185,7 +265,8 @@ mod tests {
     #[test]
     fn and_or_semantics() {
         let headers = http::HeaderMap::new();
-        let r = req(&headers);
+        let groups = HashMap::new();
+        let r = req(&headers, &groups);
         let rules = vec![rule(
             1,
             vec![
@@ -194,7 +275,7 @@ mod tests {
             ],
         )];
         assert!(matches!(
-            evaluate(&rules, &r),
+            evaluate(&rules, &r, NOW),
             Some(CustomDecision::Deny(_))
         ));
 
@@ -205,20 +286,119 @@ mod tests {
                 cond("method", "eq", &["POST"]),
             ]],
         )];
-        assert!(evaluate(&rules, &r).is_none());
+        assert!(evaluate(&rules, &r, NOW).is_none());
     }
 
     #[test]
     fn whitelist_wins() {
         let headers = http::HeaderMap::new();
-        let r = req(&headers);
+        let groups = HashMap::new();
+        let r = req(&headers, &groups);
         let rules = vec![
             rule(1, vec![vec![cond("path", "contain", &["/admin"])]]),
             rule(0, vec![vec![cond("src_ip", "eq", &["10.0.0.0/24"])]]),
         ];
         assert!(matches!(
-            evaluate(&rules, &r),
+            evaluate(&rules, &r, NOW),
             Some(CustomDecision::Allow(_))
         ));
+    }
+
+    #[test]
+    fn challenge_action_is_reported_as_challenge() {
+        let headers = http::HeaderMap::new();
+        let groups = HashMap::new();
+        let r = req(&headers, &groups);
+        let rules = vec![rule(2, vec![vec![cond("path", "prefix", &["/admin"])]])];
+        assert!(matches!(
+            evaluate(&rules, &r, NOW),
+            Some(CustomDecision::Challenge(_))
+        ));
+    }
+
+    #[test]
+    fn log_action_does_not_block() {
+        let headers = http::HeaderMap::new();
+        let groups = HashMap::new();
+        let r = req(&headers, &groups);
+        let rules = vec![rule(3, vec![vec![cond("path", "prefix", &["/admin"])]])];
+        assert!(matches!(
+            evaluate(&rules, &r, NOW),
+            Some(CustomDecision::Log(_))
+        ));
+    }
+
+    #[test]
+    fn deny_beats_log_regardless_of_order() {
+        let headers = http::HeaderMap::new();
+        let groups = HashMap::new();
+        let r = req(&headers, &groups);
+        let rules = vec![
+            rule(3, vec![vec![cond("path", "prefix", &["/admin"])]]),
+            rule(1, vec![vec![cond("path", "prefix", &["/admin"])]]),
+        ];
+        assert!(matches!(
+            evaluate(&rules, &r, NOW),
+            Some(CustomDecision::Deny(_))
+        ));
+    }
+
+    #[test]
+    fn ip_group_condition_matches_membership() {
+        let headers = http::HeaderMap::new();
+        let mut groups = HashMap::new();
+        groups.insert(
+            "bad".to_string(),
+            vec!["10.0.0.0/24".parse::<IpNet>().unwrap()],
+        );
+        let r = req(&headers, &groups);
+        let rules = vec![rule(1, vec![vec![cond("ip_group", "in", &["bad"])]])];
+        assert!(matches!(
+            evaluate(&rules, &r, NOW),
+            Some(CustomDecision::Deny(_))
+        ));
+
+        // 不存在的组名不匹配，也不能误伤
+        let rules = vec![rule(1, vec![vec![cond("ip_group", "in", &["nope"])]])];
+        assert!(evaluate(&rules, &r, NOW).is_none());
+    }
+
+    #[test]
+    fn scope_limits_rule_to_app() {
+        let headers = http::HeaderMap::new();
+        let groups = HashMap::new();
+        let r = req(&headers, &groups);
+        let mut scoped = rule(1, vec![vec![cond("path", "prefix", &["/admin"])]]);
+        scoped.scope = vec!["nas".to_string()];
+        assert!(evaluate(&[scoped.clone()], &r, NOW).is_none());
+
+        scoped.scope = vec!["blog".to_string()];
+        assert!(evaluate(&[scoped], &r, NOW).is_some());
+    }
+
+    #[test]
+    fn expired_and_disabled_rules_ignored() {
+        let headers = http::HeaderMap::new();
+        let groups = HashMap::new();
+        let r = req(&headers, &groups);
+
+        let mut expired = rule(1, vec![vec![cond("path", "prefix", &["/admin"])]]);
+        expired.expires_at = Some(NOW - 1);
+        assert!(evaluate(&[expired], &r, NOW).is_none());
+
+        let mut disabled = rule(1, vec![vec![cond("path", "prefix", &["/admin"])]]);
+        disabled.enabled = false;
+        assert!(evaluate(&[disabled], &r, NOW).is_none());
+    }
+
+    #[test]
+    fn header_condition_uses_sub_key() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-debug", http::HeaderValue::from_static("1"));
+        let groups = HashMap::new();
+        let r = req(&headers, &groups);
+        let mut c = cond("header", "eq", &["1"]);
+        c.sub_k = Some("x-debug".into());
+        assert!(evaluate(&[rule(1, vec![vec![c]])], &r, NOW).is_some());
     }
 }

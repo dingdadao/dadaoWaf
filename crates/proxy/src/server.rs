@@ -114,6 +114,12 @@ pub struct RequestCtx {
     pub challenge_passed: bool,
     /// 请求开始时间，用于统计
     pub start: Option<Instant>,
+    /// 请求方法，写入事件与访问日志
+    pub method: String,
+    /// User-Agent，写入事件
+    pub user_agent: String,
+    /// 命中的检测规则名称（逗号分隔），供事件展示
+    pub matched_rule_names: String,
 }
 
 /// 代理主体。
@@ -281,7 +287,11 @@ impl WafProxy {
         .with_path(path.to_string())
         .with_rules(rules.to_string())
         .with_score(score)
-        .with_action(action.to_string());
+        .with_action(action.to_string())
+        .with_request(ctx.request_id.clone(), ctx.method.clone())
+        .with_query(ctx.query.clone().unwrap_or_default())
+        .with_user_agent(ctx.user_agent.clone())
+        .with_rule_names(ctx.matched_rule_names.clone());
         if let Err(e) = store.insert_event(&event) {
             tracing::warn!(error = %e, "写入安全事件失败");
         }
@@ -441,6 +451,8 @@ impl ProxyHttp for WafProxy {
             return write_empty(session, 500).await;
         };
         ctx.app_id = app.id.clone();
+        ctx.method = method.clone();
+        ctx.user_agent = user_agent.clone().unwrap_or_default();
 
         // 规范化后的路径不应含控制字符。`%0d%0a` 之类会被解码出来，
         // 继续转发时无法构造合法 URI（Pingora 报 invalid normalized uri），
@@ -496,7 +508,7 @@ impl ProxyHttp for WafProxy {
             }
         }
 
-        // 自定义规则（兼容雷池格式）：白名单优先放行，黑名单直接拦截。
+        // 自定义规则（兼容雷池格式）：放行优先，其次拦截/人机验证，最后仅记录。
         // 放在 ACL 之后、自动封禁之前——白名单命中时连封禁都可以绕过。
         let mut custom_whitelisted = false;
         let custom = {
@@ -512,8 +524,9 @@ impl ProxyHttp for WafProxy {
                 content_type: content_type.as_deref(),
                 cookie: cookie_header.as_deref(),
                 headers,
+                ip_groups: &state.ip_groups,
             };
-            crate::custom_rule::evaluate(&state.custom_rules, &creq)
+            crate::custom_rule::evaluate(&state.custom_rules, &creq, homewaf_acl::now_unix())
         };
         match custom {
             Some(crate::custom_rule::CustomDecision::Allow(name)) => {
@@ -522,6 +535,7 @@ impl ProxyHttp for WafProxy {
                 custom_whitelisted = true;
             }
             Some(crate::custom_rule::CustomDecision::Deny(name)) => {
+                ctx.matched_rule_names = name.clone();
                 let reason = format!("自定义黑名单：{name}");
                 tracing::info!(
                     target: "homewaf.security",
@@ -544,6 +558,71 @@ impl ProxyHttp for WafProxy {
                 ctx.acl_reason = Some(reason);
                 ctx.blocked = true;
                 return write_empty(session, 403).await;
+            }
+            Some(crate::custom_rule::CustomDecision::Challenge(name)) => {
+                // 已经通过人机验证的会话不再重复挑战，否则会陷入死循环
+                let passed = cookie_header
+                    .as_deref()
+                    .and_then(|h| challenge::cookie_value(Some(h), COOKIE_NAME))
+                    .map(|v| {
+                        self.challenges.verify_cookie(
+                            v,
+                            &app.id,
+                            ctx.client_ip,
+                            homewaf_acl::now_unix().max(0) as u64,
+                        )
+                    })
+                    .unwrap_or(false);
+                ctx.matched_rule_names = name.clone();
+                if !passed {
+                    tracing::info!(
+                        target: "homewaf.security",
+
+                        req = %ctx.request_id,
+                        client_ip = ?ctx.client_ip,
+                        app = %app.id,
+                        rule = %name,
+                        "自定义规则要求人机验证"
+                    );
+                    self.record_security_event(
+                        ctx,
+                        EventKind::Challenge,
+                        &app.id,
+                        &hit.normalized_path,
+                        &format!("自定义规则：{name}"),
+                        0,
+                        "challenge",
+                    );
+                    ctx.acl_reason = Some(format!("自定义规则要求人机验证：{name}"));
+                    ctx.blocked = true;
+                    if state.challenge.enabled {
+                        return self
+                            .issue_challenge(session, &state, &app.id, ctx.client_ip, &path, 403)
+                            .await;
+                    }
+                    return write_text(session, 403, "人机验证未启用").await;
+                }
+            }
+            Some(crate::custom_rule::CustomDecision::Log(name)) => {
+                ctx.matched_rule_names = name.clone();
+                tracing::info!(
+                    target: "homewaf.security",
+
+                    req = %ctx.request_id,
+                    client_ip = ?ctx.client_ip,
+                    app = %app.id,
+                    rule = %name,
+                    "自定义规则命中（仅记录）"
+                );
+                self.record_security_event(
+                    ctx,
+                    EventKind::Acl,
+                    &app.id,
+                    &hit.normalized_path,
+                    &format!("自定义规则（仅记录）：{name}"),
+                    0,
+                    "log",
+                );
             }
             None => {}
         }
@@ -907,6 +986,13 @@ impl ProxyHttp for WafProxy {
             ctx.exemption = Some(exemption.clone());
 
             if !verdict.is_clean() {
+                // 规则名写进上下文：事件表展示中文名比展示 id 可读得多
+                ctx.matched_rule_names = verdict
+                    .findings
+                    .iter()
+                    .map(|f| f.rule_name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",");
                 tracing::warn!(
                     target: "homewaf.security",
 
@@ -940,7 +1026,11 @@ impl ProxyHttp for WafProxy {
                     .with_path(hit.normalized_path.clone())
                     .with_rules(verdict.rule_ids().join(","))
                     .with_score(verdict.score)
-                    .with_action(action);
+                    .with_action(action)
+                    .with_request(ctx.request_id.clone(), ctx.method.clone())
+                    .with_query(query.clone().unwrap_or_default())
+                    .with_user_agent(ctx.user_agent.clone())
+                    .with_rule_names(ctx.matched_rule_names.clone());
                     if let Err(e) = store.insert_event(&event) {
                         tracing::warn!(error = %e, "写入检测事件失败");
                     }
@@ -1369,15 +1459,20 @@ impl ProxyHttp for WafProxy {
 
             req = %ctx.request_id,
             method = %method,
+            host = %ctx.original_host,
             path = %path,
+            query = ctx.query.as_deref().unwrap_or(""),
+            user_agent = ctx.user_agent.as_str(),
             status = status,
             upstream = ctx.upstream.as_deref().unwrap_or("-"),
             backup = ctx.upstream_backup,
             app = ctx.app_index.map(|i| i.to_string()).unwrap_or_else(|| "-".to_string()),
+            app_id = ctx.app_id.as_str(),
             client_ip = ctx.client_ip.map(|i| i.to_string()).unwrap_or_else(|| "-".to_string()),
             direct_ip = ctx.direct_ip.map(|i| i.to_string()).unwrap_or_else(|| "-".to_string()),
             ip_source = ctx.ip_source.as_ref().map(|s| s.as_str()).unwrap_or("-"),
             acl = ctx.acl_reason.as_deref().unwrap_or("-"),
+            rules = ctx.matched_rule_names.as_str(),
             latency_us = elapsed_us,
             "request"
         );

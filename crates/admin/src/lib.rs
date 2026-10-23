@@ -24,7 +24,7 @@ use axum::{
 use homewaf_acl::BanTable;
 use homewaf_config::Application;
 use homewaf_proxy::{RuntimeState, SharedState, TrafficMetrics};
-use homewaf_store::{AclRuleRow, CertificateRow, Store};
+use homewaf_store::{CertificateRow, Store};
 use serde::{Deserialize, Serialize};
 
 /// 管理服务的共享状态。
@@ -1705,92 +1705,153 @@ async fn delete_app(
 }
 
 // ============================================================
-// ACL 规则
+// 访问控制规则（雷池式条件规则）
 // ============================================================
+//
+// 规则存在 settings.custom_rules，与雷池的 custom_rule 模型一致：
+// 「条件组（外层 OR / 内层 AND） + 动作 + 应用范围」。
+// `acl_rules` 表从此只保留订阅生成的规则（id 以 `feed:` 开头），
+// 历史遗留的纯 IP 规则在重载时迁移成条件规则，见 `migrate_legacy_acl`。
 
+/// 规则列表 + 编辑表单需要的上下文（应用与 IP 组）。
 async fn list_rules(State(ctx): State<Ctx>, headers: HeaderMap) -> Response {
     if !authorized(&ctx, &headers) {
         return unauthorized();
     }
-    match ctx.store.list_acl_rules() {
-        Ok(rules) => Json(rules).into_response(),
-        Err(e) => internal(e).into_response(),
-    }
+    let rules: Vec<homewaf_config::CustomRule> = match ctx
+        .store
+        .get_setting(leichi::CUSTOM_RULES_KEY)
+        .map_err(|e| e.to_string())
+    {
+        Ok(v) => v.unwrap_or_default(),
+        Err(e) => return internal(e).into_response(),
+    };
+
+    let apps: Vec<serde_json::Value> = ctx
+        .store
+        .list_applications::<homewaf_config::Application>()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|a| serde_json::json!({"id": a.id, "name": a.name}))
+        .collect();
+
+    let groups: Vec<serde_json::Value> = ctx
+        .store
+        .list_ip_groups()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|g| serde_json::from_str::<homewaf_config::IpGroup>(&g.body).ok())
+        .map(|g| {
+            serde_json::json!({
+                "name": g.name,
+                "label": if g.label.is_empty() { g.name.clone() } else { g.label.clone() },
+            })
+        })
+        .collect();
+
+    Json(serde_json::json!({ "rules": rules, "apps": apps, "ip_groups": groups })).into_response()
 }
 
-#[derive(Deserialize)]
-struct RuleInput {
-    id: Option<String>,
-    cidr: String,
-    action: String,
-    scope: Option<String>,
-    expires_at: Option<i64>,
-    note: Option<String>,
+/// 用完整配置校验一条规则：能查出错引用的应用与 IP 组。
+fn validate_rule(ctx: &AdminState, rule: &homewaf_config::CustomRule) -> Result<(), String> {
+    let mut rules: Vec<homewaf_config::CustomRule> = ctx
+        .store
+        .get_setting(leichi::CUSTOM_RULES_KEY)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    match rules.iter_mut().find(|r| r.id == rule.id) {
+        Some(existing) => *existing = rule.clone(),
+        None => rules.push(rule.clone()),
+    }
+
+    let applications = ctx
+        .store
+        .list_applications::<homewaf_config::Application>()
+        .unwrap_or_default();
+    let ip_groups: Vec<homewaf_config::IpGroup> = ctx
+        .store
+        .list_ip_groups()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|g| serde_json::from_str(&g.body).ok())
+        .collect();
+
+    let report = homewaf_config::Config {
+        custom_rules: rules,
+        applications,
+        ip_groups,
+        ..Default::default()
+    }
+    .validate();
+
+    let errors: Vec<String> = report
+        .errors
+        .iter()
+        .filter(|e| e.path.starts_with("custom_rules"))
+        .map(|e| e.message.clone())
+        .collect();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("；"))
+    }
 }
 
 async fn upsert_rule(
     State(ctx): State<Ctx>,
     headers: HeaderMap,
-    Json(input): Json<RuleInput>,
+    Json(mut rule): Json<homewaf_config::CustomRule>,
 ) -> Response {
     if !authorized(&ctx, &headers) {
         return unauthorized();
     }
 
-    // 先验证网段合法，避免把坏数据写进库
-    if input.cidr.parse::<ipnet::IpNet>().is_err() {
-        return (StatusCode::BAD_REQUEST, "网段格式非法").into_response();
+    rule.id = rule.id.trim().to_string();
+    rule.name = rule.name.trim().to_string();
+    if rule.id.is_empty() {
+        // 秒级时间戳会撞车：同一秒内建两条规则会互相覆盖，用纳秒保证唯一
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        rule.id = format!("rule-{:x}{:03x}", homewaf_acl::now_unix(), nanos % 4096);
     }
-    if !matches!(input.action.as_str(), "allow" | "deny") {
-        return (StatusCode::BAD_REQUEST, "action 只能是 allow 或 deny").into_response();
-    }
-
-    // 防重复：同网段 + 同动作 + 同作用域视为同一条规则。
-    // 不检查的话，用户连点两次就会得到两条一模一样的规则。
-    if let Ok(existing) = ctx.store.list_acl_rules() {
-        if let Some(dup) = existing.iter().find(|r| {
-            r.cidr == input.cidr
-                && r.action == input.action
-                && r.scope.as_deref() == input.scope.as_deref()
-        }) {
-            return (
-                StatusCode::CONFLICT,
-                format!(
-                    "相同规则已存在（{}）：{} → {}",
-                    dup.id,
-                    dup.cidr,
-                    if dup.action == "allow" {
-                        "放行"
-                    } else {
-                        "拒绝"
-                    }
-                ),
-            )
-                .into_response();
-        }
+    if rule.id.chars().count() > 64
+        || !rule
+            .id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            "规则 ID 只能包含字母、数字、横线、下划线和点",
+        )
+            .into_response();
     }
 
-    let id = input
-        .id
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| format!("ui-{}", homewaf_acl::now_unix()));
+    if let Err(e) = validate_rule(&ctx, &rule) {
+        return (StatusCode::BAD_REQUEST, e).into_response();
+    }
 
-    let row = AclRuleRow {
-        id,
-        cidr: input.cidr,
-        action: input.action,
-        scope: input.scope,
-        expires_at: input.expires_at,
-        note: input.note,
-    };
+    let mut rules: Vec<homewaf_config::CustomRule> = ctx
+        .store
+        .get_setting(leichi::CUSTOM_RULES_KEY)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    match rules.iter_mut().find(|r| r.id == rule.id) {
+        Some(existing) => *existing = rule.clone(),
+        None => rules.push(rule.clone()),
+    }
 
     let now = homewaf_acl::now_unix();
-    if let Err(e) = ctx.store.upsert_acl_rule(&row, now) {
+    if let Err(e) = ctx.store.set_setting(leichi::CUSTOM_RULES_KEY, &rules, now) {
         return internal(e).into_response();
     }
 
     match reload_state(&ctx) {
-        Ok(()) => Json(serde_json::json!({"ok": true, "id": row.id})).into_response(),
+        Ok(()) => Json(serde_json::json!({"ok": true, "id": rule.id})).into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, format!("已写入，但重载失败：{e}")).into_response(),
     }
 }
@@ -1803,14 +1864,84 @@ async fn delete_rule(
     if !authorized(&ctx, &headers) {
         return unauthorized();
     }
-    match ctx.store.delete_acl_rule(&id) {
-        Ok(true) => match reload_state(&ctx) {
-            Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
-            Err(e) => (StatusCode::BAD_REQUEST, format!("已删除，但重载失败：{e}")).into_response(),
-        },
-        Ok(false) => (StatusCode::NOT_FOUND, "规则不存在").into_response(),
-        Err(e) => internal(e).into_response(),
+
+    let mut rules: Vec<homewaf_config::CustomRule> = ctx
+        .store
+        .get_setting(leichi::CUSTOM_RULES_KEY)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let before = rules.len();
+    rules.retain(|r| r.id != id);
+    if rules.len() == before {
+        return (StatusCode::NOT_FOUND, "规则不存在").into_response();
     }
+
+    let now = homewaf_acl::now_unix();
+    if let Err(e) = ctx.store.set_setting(leichi::CUSTOM_RULES_KEY, &rules, now) {
+        return internal(e).into_response();
+    }
+
+    match reload_state(&ctx) {
+        Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, format!("已删除，但重载失败：{e}")).into_response(),
+    }
+}
+
+/// 把历史遗留的纯 IP ACL 规则迁移成条件规则。
+///
+/// 访问控制统一到条件规则后，`acl_rules` 表只保留订阅生成的规则。
+/// 迁移后删除原行——否则同一条规则会同时被 ACL 与自定义规则执行两次。
+fn migrate_legacy_acl(ctx: &AdminState) -> Result<(), String> {
+    let rows = ctx.store.list_acl_rules().map_err(|e| e.to_string())?;
+    let legacy: Vec<_> = rows
+        .into_iter()
+        .filter(|r| !r.id.starts_with("feed:"))
+        .collect();
+    if legacy.is_empty() {
+        return Ok(());
+    }
+
+    let mut rules: Vec<homewaf_config::CustomRule> = ctx
+        .store
+        .get_setting(leichi::CUSTOM_RULES_KEY)
+        .map_err(|e| e.to_string())?
+        .unwrap_or_default();
+
+    for row in &legacy {
+        let rule = homewaf_config::CustomRule {
+            id: row.id.clone(),
+            name: row
+                .note
+                .clone()
+                .filter(|n| !n.trim().is_empty())
+                .unwrap_or_else(|| format!("IP 规则 {}", row.cidr)),
+            enabled: true,
+            action: if row.action == "allow" { 0 } else { 1 },
+            scope: row.scope.clone().map(|s| vec![s]).unwrap_or_default(),
+            expires_at: row.expires_at,
+            pattern: vec![vec![homewaf_config::RuleCondition {
+                k: "src_ip".to_string(),
+                op: "eq".to_string(),
+                v: vec![row.cidr.clone()],
+                sub_k: None,
+            }]],
+        };
+        match rules.iter_mut().find(|r| r.id == rule.id) {
+            Some(existing) => *existing = rule,
+            None => rules.push(rule),
+        }
+    }
+
+    let now = homewaf_acl::now_unix();
+    ctx.store
+        .set_setting(leichi::CUSTOM_RULES_KEY, &rules, now)
+        .map_err(|e| e.to_string())?;
+    for row in &legacy {
+        let _ = ctx.store.delete_acl_rule(&row.id);
+    }
+    tracing::info!(count = legacy.len(), "历史 IP 规则已迁移为条件规则");
+    Ok(())
 }
 
 // ============================================================
@@ -2174,8 +2305,29 @@ async fn list_logs(
     }
     lines.reverse();
 
+    // 解析成结构化条目：前端要按列展示，靠正则拆字符串太脆。
+    // 解析失败的行保留原文，至少不丢信息。
+    let entries: Vec<serde_json::Value> = lines
+        .iter()
+        .map(
+            |line| match serde_json::from_str::<serde_json::Value>(line) {
+                Ok(mut v) => {
+                    if let Some(obj) = v.as_object_mut() {
+                        obj.insert(
+                            "raw".to_string(),
+                            serde_json::Value::String(line.to_string()),
+                        );
+                    }
+                    v
+                }
+                Err(_) => serde_json::json!({ "raw": line }),
+            },
+        )
+        .collect();
+
     Json(serde_json::json!({
         "lines": lines,
+        "entries": entries,
         "file": file.file_name().and_then(|s| s.to_str()).unwrap_or(""),
         "total": total,
     }))
@@ -4298,6 +4450,12 @@ fn reload_state(ctx: &AdminState) -> Result<(), String> {
 
 /// `force` 为 true 时忽略检查间隔与更新窗口，立即拉取全部规则包。
 fn reload_state_with(ctx: &AdminState, force_rule_feeds: bool) -> Result<(), String> {
+    // 迁移放在重载之前：雷池同步会写 acl_rules，这里顺手转成条件规则，
+    // 保证访问控制页面看到的是同一套模型。迁移是幂等的，没有历史行时零成本。
+    if let Err(e) = migrate_legacy_acl(ctx) {
+        tracing::warn!(error = %e, "历史 IP 规则迁移失败，本次跳过");
+    }
+
     let mut new_state: RuntimeState =
         homewaf_proxy::load_state_from_db_with(&ctx.store, ctx.allow_regex, force_rule_feeds)?;
 
@@ -4350,6 +4508,7 @@ mod tests {
             feed_failures: Vec::new(),
             rule_feeds: Vec::new(),
             custom_rules: Vec::new(),
+            ip_groups: Default::default(),
             tamper: Vec::new(),
         }
     }

@@ -48,23 +48,80 @@ pub struct Config {
 /// 与雷池导出的 JSON 字段保持一致：`name` / `is_enabled` / `pattern` / `action`，
 /// 其中 `pattern` 是「OR 的外层 + AND 的内层」，`action` 0 为白名单、1 为黑名单。
 /// `id` 是 HomeWAF 自己的标识，导入时缺失会自动生成。
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct CustomRule {
     pub id: String,
     pub name: String,
     #[serde(rename = "is_enabled", alias = "enabled")]
     pub enabled: bool,
-    /// 0 = 白名单（放行），1 = 黑名单（拦截）
+    /// 处置动作：0 = 放行，1 = 拦截，2 = 人机验证，3 = 仅记录
+    ///
+    /// 沿用雷池的数字编码（0/1），2/3 是 HomeWAF 的扩展。
     pub action: u8,
+    /// 生效应用 id；空表示对所有应用生效
+    pub scope: Vec<String>,
+    /// 到期时间（Unix 秒）；`None` 表示永久
+    pub expires_at: Option<i64>,
     /// 外层 OR，内层 AND
     pub pattern: Vec<Vec<RuleCondition>>,
+}
+
+/// 规则的处置动作。把 `u8` 收敛成枚举，避免求值路径上到处 `== 0`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuleActionKind {
+    /// 放行：跳过检测与自动封禁
+    Allow,
+    /// 直接拦截
+    Deny,
+    /// 人机验证
+    Challenge,
+    /// 只记录，不改变处置
+    Log,
+}
+
+impl Default for CustomRule {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: String::new(),
+            enabled: true,
+            // 缺省必须是拦截：漏填 action 时把恶意流量放行，比误拦严重得多
+            action: 1,
+            scope: Vec::new(),
+            expires_at: None,
+            pattern: Vec::new(),
+        }
+    }
 }
 
 impl CustomRule {
     /// 白名单规则：命中后跳过检测与自动封禁。
     pub fn is_whitelist(&self) -> bool {
         self.action == 0
+    }
+
+    pub fn action_kind(&self) -> RuleActionKind {
+        match self.action {
+            0 => RuleActionKind::Allow,
+            2 => RuleActionKind::Challenge,
+            3 => RuleActionKind::Log,
+            _ => RuleActionKind::Deny,
+        }
+    }
+
+    pub fn is_expired(&self, now: i64) -> bool {
+        self.expires_at.is_some_and(|ts| ts <= now)
+    }
+
+    /// 规则是否对该应用生效。
+    pub fn applies_to(&self, app: &str) -> bool {
+        self.scope.is_empty() || self.scope.iter().any(|s| s == app)
+    }
+
+    /// 规则是否具备可求值的条件。
+    pub fn is_effective(&self) -> bool {
+        self.enabled && self.pattern.iter().any(|group| !group.is_empty())
     }
 }
 
