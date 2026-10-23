@@ -2335,6 +2335,7 @@ function renderGeoList(geo) {
 // ---------- 安全态势 ----------
 async function loadSecurity() {
   try {
+    await ensureAppNames();
     const d = await api('/security?range=' + STATS.range);
     const tot = d.totals || {};
     renderKpis(document.getElementById('sec-kpis'), [
@@ -2381,7 +2382,7 @@ async function loadSecurity() {
           <td>${fmtTime(e.ts)}</td>
           <td>${esc(kindLabel(e.kind))}</td>
           <td class="mono">${esc(e.client_ip)}</td>
-          <td>${esc(e.app || '—')}</td>
+          <td>${esc(appLabel(e.app))}</td>
           <td class="mono">${esc(e.path || '—')}</td>
           <td><span class="tag ${esc(e.action)}">${esc(actionLabel(e.action))}</span></td>
         </tr>`).join('')}</tbody></table>`
@@ -4095,6 +4096,7 @@ const EVENT_PAGE_SIZE = 20;
 
 async function loadEvents() {
   await ensureAppNames();
+  await ensureRuleNames();
   const el = document.getElementById('events');
   const pager = document.getElementById('events-pager');
   const params = new URLSearchParams({ limit: String(EVENT_PAGE_SIZE), offset: String(eventPage * EVENT_PAGE_SIZE) });
@@ -4124,7 +4126,7 @@ async function loadEvents() {
           <div><span class="tag">${esc(e.method || '-')}</span> <code style="font-size:12px">${esc(e.path || '-')}</code></div>
           ${e.query ? `<div class="sub" style="margin:2px 0 0;word-break:break-all">?${esc(e.query)}</div>` : ''}
         </td>
-        <td style="max-width:280px;word-break:break-all">${esc(e.rule_names || e.rules || '-')}</td>
+        <td style="max-width:280px;word-break:break-all">${esc(ruleLabel(e.rule_names || e.rules))}</td>
         <td>${e.score}</td>
         <td><span class="tag ${esc(e.action)}">${esc(actionLabel(e.action))}</span></td>
         <td>${esc(appLabel(e.app))}</td>
@@ -4146,6 +4148,9 @@ async function loadEvents() {
 let eventCache = [];
 let appNames = {};
 
+/// 规则 id → 展示名（内置检测规则 + 自定义检测规则）
+let ruleNames = null;
+
 /// 事件与日志里存的是应用 ID，展示时换成应用名
 async function ensureAppNames() {
   if (Object.keys(appNames).length) return;
@@ -4155,6 +4160,20 @@ async function ensureAppNames() {
   } catch (_) { /* 拿不到就退回显示 ID */ }
 }
 const appLabel = (id) => (id && appNames[id]) || id || '-';
+
+async function ensureRuleNames() {
+  if (ruleNames) return;
+  try {
+    const c = await api('/rule-catalog');
+    ruleNames = Object.fromEntries((c.rules || []).map(r => [r.id, r.name]));
+  } catch (_) { ruleNames = {}; }
+}
+/// 事件里既可能是规则名也可能只有规则 id，统一映射成名称
+const ruleLabel = (raw) => {
+  if (!raw) return '-';
+  return String(raw).split(',').filter(Boolean)
+    .map(s => (ruleNames && ruleNames[s]) || s).join(', ');
+};
 
 function showDetail(title, rows) {
   document.getElementById('detail-title').textContent = title;
@@ -4176,7 +4195,7 @@ function showEventDetail(i) {
     ['查询串', e.query ? `<code style="word-break:break-all">${esc(e.query)}</code>` : '—'],
     ['User-Agent', e.user_agent ? `<span style="word-break:break-all">${esc(e.user_agent)}</span>` : '—'],
     ['命中规则 ID', `<code>${esc(e.rules || '-')}</code>`],
-    ['命中规则名称', esc(e.rule_names || '-')],
+    ['命中规则名称', esc(ruleLabel(e.rule_names || e.rules))],
     ['风险分', String(e.score ?? 0)],
     ['请求 ID', e.request_id
       ? `<code>${esc(e.request_id)}</code> <button onclick="gotoLogsByReq('${esc(e.request_id)}')">查看日志</button>`
@@ -4681,6 +4700,8 @@ async function loadAttackPage() {
 
 async function loadAttack() {
   try {
+    await ensureAppNames();
+    await ensureRuleNames();
     const params = attackFilterParams(false);
     params.set('range', String(attackRange()));
     const eventsParams = attackFilterParams(true);
@@ -4747,9 +4768,9 @@ function renderAttackEvents(res) {
       const rid = 'atk-' + e.id;
       return `<tr style="cursor:pointer" onclick="toggleRaw('${rid}')">
         <td>${fmtTime(e.ts)}</td><td>${esc(kindLabel(e.kind))}</td>
-        <td><code>${esc(e.client_ip)}</code></td><td>${esc(e.app)}</td>
+        <td><code>${esc(e.client_ip)}</code></td><td>${esc(appLabel(e.app))}</td>
         <td class="mono" title="${esc(e.path)}">${esc(e.path)}</td>
-        <td><code>${esc(e.rules)}</code></td><td>${e.score}</td>
+        <td><code>${esc(ruleLabel(e.rule_names || e.rules))}</code></td><td>${e.score}</td>
         <td><span class="tag ${esc(e.action)}">${esc(actionLabel(e.action))}</span></td>
         <td><button onclick="event.stopPropagation();banAttackIp('${esc(e.client_ip)}')">封禁</button></td>
       </tr>

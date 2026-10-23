@@ -492,14 +492,29 @@ fn attack_categories(
 }
 
 /// 规则命中排行。一个事件可能同时命中多条规则，逐条计数。
-fn rule_hits(store: &Store, since: i64, until: i64, limit: usize) -> Vec<NameCount> {
+///
+/// 事件里存的是规则 id，展示时换成规则名（内置规则与自定义检测规则都在
+/// matcher 的元数据里）；查不到名字的（例如订阅规则）保留 id。
+fn rule_hits(
+    state: &homewaf_proxy::RuntimeState,
+    store: &Store,
+    since: i64,
+    until: i64,
+    limit: usize,
+) -> Vec<NameCount> {
+    let matcher = state.engine.matcher();
+    let names: std::collections::HashMap<&str, &str> = matcher
+        .metas()
+        .map(|m| (m.id.as_str(), m.name.as_str()))
+        .collect();
     let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for rules in store
         .event_rule_strings_between(since, until, 50_000)
         .unwrap_or_default()
     {
         for rule in rules.split(',').filter(|s| !s.is_empty()) {
-            *counts.entry(rule.to_string()).or_insert(0) += 1;
+            let label = names.get(rule).copied().unwrap_or(rule);
+            *counts.entry(label.to_string()).or_insert(0) += 1;
         }
     }
     let mut out: Vec<NameCount> = counts
@@ -725,7 +740,7 @@ async fn security(
         .into_iter()
         .map(|(name, count)| NameCount { name, count })
         .collect();
-    let rules = rule_hits(&ctx.store, since, until, 10);
+    let rules = rule_hits(&state, &ctx.store, since, until, 10);
     let top = ctx
         .store
         .top_event_ips(since, until, None, 10)
@@ -867,7 +882,8 @@ async fn attack_overview(
         .into_iter()
         .map(|(name, count)| NameCount { name, count })
         .collect();
-    let rules = rule_hits(&ctx.store, since, until, 10);
+    let state = ctx.shared.load_full();
+    let rules = rule_hits(&state, &ctx.store, since, until, 10);
     let banned = ctx
         .store
         .load_active_bans(now)
@@ -1014,7 +1030,7 @@ fn build_report(
         .into_iter()
         .map(|(name, count)| NameCount { name, count })
         .collect();
-    let rules = rule_hits(&ctx.store, day, until, 10);
+    let rules = rule_hits(&state, &ctx.store, day, until, 10);
     let top = ctx.store.top_event_ips(day, until, None, 50)?;
     let top_ips = ip_rows(&ctx.geoip, &top);
     let geo = geo_stats_from(&ctx.geoip, &ctx.store.top_event_ips(day, until, None, 200)?);
@@ -1229,7 +1245,7 @@ async fn screen(State(ctx): State<Ctx>, headers: HeaderMap) -> Response {
 
     let state = ctx.shared.load_full();
     let categories = attack_categories(&state, &ctx.store, today, now + 1);
-    let blocked_rules = rule_hits(&ctx.store, today, now + 1, 10);
+    let blocked_rules = rule_hits(&state, &ctx.store, today, now + 1, 10);
     let top = ctx
         .store
         .top_event_ips(today, now + 1, None, 10)
