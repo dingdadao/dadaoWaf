@@ -310,6 +310,190 @@
   证书后启用；`home.niao.fun` 经 WAF 返回 400 是 Home Assistant 的 `trusted_proxies` 未包含
   10.0.0.31，非本项目缺陷。
 
+### 09:10 — 人机验证增强：PoW 成本墙 + 环境指纹 + 签名绑定（任务 #23）
+
+- **不做滑块/图形验证码，也不做 JSVMP**：滑块与图片识别在 AI 视觉模型面前基本失守；JSVMP 需要自研
+  编译器 + 解释器并持续对抗逆向，维护成本远超家用 WAF 的收益。改为三道成本低、可验证的叠加防线。
+- **成本墙（PoW）**：`SHA-256(token.fp.nonce)` 前导零十六进制位达到难度（1–8，默认 4），浏览器本地计算、
+  服务端一次哈希校验，零外部依赖；难度可配，抬高批量尝试成本。
+- **环境指纹**：挑战页采集 `navigator.webdriver`、CDP 残留对象、屏幕尺寸/色深、时区、语言、CPU 核数、
+  Canvas/WebGL 渲染特征，合成 16 位十六进制指纹；指纹参与 PoW 输入，服务端校验格式。`wd=1` / `cdp=1` /
+  缺字段 / 未知字段一律按自动化拒绝（缺字段视为客户端故意隐瞒）。
+- **签名绑定 + 一次性解**：挑战令牌与 Cookie 继续用 HMAC-SHA256 绑定应用 + 客户端 IP + 过期时间，
+  密钥进程内随机生成、重启即失效；服务端记录 `sha256(token.nonce.fp)` 摘要（上限 8192，过期清理），
+  同一解答二次提交按重放拒绝。
+- 代码：`crates/proxy/src/challenge.rs` 新增 `Solution` 与 `BadFingerprint` / `Automated` / `Replay` 错误，
+  `server.rs` 采集 `fp` / `env` 参数，`lib.rs` 导出；代理 111 个测试全绿，clippy 零警告。
+- **实测**（`Host: nas.home.lan`）：
+  - 首次访问 403 下发挑战（difficulty=4），客户端解出后 `303 + Set-Cookie`；带 Cookie 再访问 200 到达上游。
+  - 同一解答重放 → 400；`env=wd=1.cdp=0` → 400「检测到自动化浏览器」；缺少 `env` → 400；
+    指纹 `zzzz…` / 全零 → 400「环境指纹缺失或异常」。
+  - 安全日志分别记录「下发人机验证」「人机验证通过」，失败原因按类型落入 DEBUG。
+- **诚实局限**：用 CDP 驱动并剥离自动化标记的 Chrome（`navigator.webdriver=false`、无 `cdc_` 变量）能通过
+  全部前端检查——这与「AI 可绕过验证码」的行业现实一致。指纹只抬高无头爬虫门槛，不承诺挡住定向人工操作；
+  兜底仍是检测引擎评分、频率限制与自动封禁。
+
+### 09:30 — 证书管理排查：API 上传正常，生产证书重新同步（任务 #24）
+
+- 反馈「可以通过 API 添加/更新证书吗？接口有，但证书管理里看不到」。核对代码：`POST /api/UploadSSLCertAPI`
+  （multipart / JSON，`X-SLCE-API-Token`）、`GET` / `DELETE /api/CertAPI` 与控制台 `/api/certs` 共用同一张
+  `certificates` 表；本地实测上传、按 `id` 更新、删除均正常，接口与「证书管理」页面即时可见。
+- 生产排查：`/api/certs` 为空，`PUT /api/certs/1..4` 空请求体均返回 404，确认库中无证书行；而
+  `/api/leichi/last` 报告 `certs.imported = 4` 只是上次同步的历史快照，不反映之后的删除。重新同步后
+  新证书 ID 从 6 起，说明此前确有 1–5 号行被删除。
+- 另一个坑：生产从未生成 `api_token`，第三方上传会直接返回 401 `invalid api token`，容易被误认为「接口没实现」。
+- 处理：对生产执行「预览 → 正式」雷池同步，4 张 ACME 证书（`download` / `speed` / `true.bbroot.com`、
+  `*.niao.fun`）已入库并在控制台显示「缺私钥」；无密钥证书不参与 TLS 加载，未改变 443 行为。
+- 改进：SLCE 三个接口的 401 文案改为「API Token 未配置或无效，请先在『证书管理』页生成」；证书页补充
+  「尚未生成 Token 时第三方接口返回 401」与「雷池同步的 ACME 证书只登记证书链，补传私钥后才可用于 TLS」。
+- 验证：admin 57 个测试全绿、clippy 零警告；本地重建后无 Token 上传返回新文案，证书页提示正常；
+  生产控制台截图确认 4 张证书可见。使用前需先在「证书管理 → 第三方远程部署」生成 Token，且上传必须
+  同时提供证书链与私钥。
+
+### 09:55 — 二次生产部署、证书消失定案与优雅退出修复（任务 #25）
+
+- 部署：改用 `rustup target add x86_64-unknown-linux-gnu` + Homebrew `zig@0.14`（cargo-zigbuild 0.24
+  实际拉取 zig 0.17.0）交叉编译；停服前把 `homewaf.db*` 与旧二进制备份到
+  `/opt/homewaf/backups/20261023-013613/`（`homewaf.prev`）。两次部署的二进制哈希：
+  `e26c7723b13d61c3`（证书状态列布局修复前）→ `a243f3b193bad723`（最终，含 nowrap 状态列）。
+- **证书消失定案：不是持久化缺陷**。本地把证书写入 `/tmp/homewaf-demo.db` 后直接 `kill -9` 再启动，
+  证书仍在；代码中 `DELETE FROM certificates` 只出现在控制台 `DELETE /api/certs/{id}`（含 SLCE
+  `DELETE /api/CertAPI`）路径，启动、重载、同步均无删除逻辑。生产
+  `sqlite_sequence(certificates)=9` 说明历史上写入过 9 行；01:39:14–01:39:26 连续 4 次「配置已重载」
+  正对应 4 张 ACME 证书被逐个删除（每次删除触发一次重载），与「重启丢证书」无关。
+- **安全提醒**：生产控制台以 `HOMEWAF_ADMIN_INSECURE=1` 无 Token 监听 `0.0.0.0:9443`，记录里出现
+  的四次删除也可能来自局域网内任意客户端。证书删除操作已补审计日志；控制台登录/Token 仍待排期。
+- 修复 1：证书新增/更新/删除写入 `homewaf.security` 审计日志（ID、名称、域名、动作），下次再出现
+  删除可直接从 journal 定位。
+- 修复 2：Pingora 默认优雅退出宽限期 300 秒，`systemctl stop` 会干等 5 分钟、只能靠 `kill -9` 收场；
+  在 `crates/proxy/src/server.rs` 把 `grace_period_seconds` 调为 10 秒。实测 SIGTERM 后 10 秒退出，
+  日志完整落盘。
+- 验证：clippy 零警告；本地证书在 SIGKILL 重启后仍存在（测试证书已清理）；审计日志实测输出
+  `证书已保存 cert_id=5 …` 与 `证书已删除 cert_id=5 …`。
+- 遗留：部署收尾时 10.0.0.31 再次失联，生产 `/api/certs` 当前为空；网络恢复后需重新执行「预览 →
+  正式」雷池同步，把 4 张 ACME 证书补回（仍为「缺私钥」，只登记不参与 TLS）。
+
+### 10:05 — 雷池开放 API 与证书同步语义（任务 #26）
+
+- 反馈两件事：①「雷池同步」显示应用 8/8、IP 组 9/10，但证书管理为空；②在雷池的
+  「配置同步 / 授权」抽屉里把地址指向 `https://10.0.0.14:9443`（雷池自己）并填 HomeWAF 的 Token，
+  连通性测试报 `Login required [https://10.0.0.14:9443/api/open/cert]`。
+- **根因一（配置方向反了）**：雷池「配置同步」是主从复制，从端必须是另一套雷池；测试连通性的动作是
+  用 `X-SLCE-API-Token` 请求 `GET /api/open/cert`。要让它指向 HomeWAF，地址应填 **HomeWAF 管理端**
+  （生产为 `http://10.0.0.31:9443`），Token 填 HomeWAF 在「证书管理 → 第三方远程部署」生成的 Token；
+  填雷池自己的地址只会得到雷池侧的 `Login required`。
+- **根因二（开放 API 不完整）**：此前只实现了 `UploadSSLCertAPI` / `CertAPI`（上传/列表/删除），
+  没有 `/api/open/*`，与雷池开放 API 不一致。新增：
+  - `GET /api/open/health` → `{"err":null,"msg":"success","data":{...}}`
+  - `GET /api/open/cert` → `data.nodes[]`（`id` / `domains` / `issuer` / `not_after` / `type` / `has_key`）
+  - `GET /api/open/cert/{id}` → `data.manual.{crt,key}`（无私钥时 `key` 为空）
+  - `POST /api/open/cert` → 接受雷池的 `{"manual":{"crt","key"},"type":2}`、扁平 `{crt,key}` 与 multipart；
+    带 `id` 更新，否则按证书主域名匹配已有证书做续期，都不命中才新增
+  - `DELETE /api/open/cert/{id}`
+  全部走 `X-SLCE-API-Token`，未配置或错误时返回雷池同款 401 `Login required`。
+- **根因三（同步读不到证书）**：`leichi.rs` 只认 `manual.crt/key` 一种形状，且已存在证书按 PEM
+  全等判断，雷池续期后 PEM 变化就会重复插入。现在兼容 `manual.*` 与顶层 `crt` / `key` / `key_pem`，
+  按域名（大小写不敏感、支持逗号列表与通配符重叠）匹配已有行并原地更新；雷池对 ACME 证书不提供私钥时，
+  若已有可用证书则保留旧行并给出 warning，避免用空私钥覆盖导致整站 TLS 失败。预览与正式共用同一套逻辑。
+- **验证**：本地按雷池形状 POST 创建证书（id=6）→ 同域名再次 POST 原地续期（仍 id=6，序列号更新）→
+  列表/详情/删除均正常，无 Token 返回 401；用 mock 雷池跑「预览 → 正式」同步，证书 id 保持不变，
+  无键续期被跳过且现有证书仍可用。admin 60 个测试全绿、clippy 零警告。
+- **诚实局限**：
+  - 雷池的 ACME / 托管证书在服务端就不导出私钥，任何同步手段都只能拿到证书链。HomeWAF 照常登记并标
+    「缺私钥」，但不参与 TLS；要用必须手动上传含私钥的证书（或后续实现 ACME 自动签发）。
+  - 雷池「配置同步」的从端协议属于其私有实现（版本/license 校验等），本次只保证其连通性探测所需的
+    `/api/open/cert` 可用；完整主从复制不承诺，HomeWAF 侧仍是单向「从雷池拉取」。
+- **生产部署（10:10 网络恢复后）**：备份到 `/opt/homewaf/backups/<时间戳>/` 后替换二进制
+  `a243f3b193bad723` → `49039b30248e4b10`，服务正常启动。执行「预览 → 正式」同步，4 张证书恢复为
+  ID 10–13（仍为「缺私钥」）；再次同步仍是 4 张、ID 不变，确认按域名续期不会重复插入。控制台证书页
+  已显示 4 行。开放接口实测：无 Token 401，带 Token 经回环与局域网地址均 200，`/api/open/cert` 返回
+  4 个节点、`/api/open/cert/10` 的 `manual.key` 为空。
+- **生产复测（10:20）**：
+  - 代理与检测：正常请求 200；从生产机回环逐项复测，SQLi 命中 `sqli-union-select`（50 分）、
+    XSS 命中 `xss-script-tag`（50 分）、路径穿越命中 `traversal-sensitive-file`（80 分），均 403、
+    写事件并触发 127.0.0.1 自动封禁（300s），每项测试后已解封、封禁表最终为空。
+    **从 10.0.0.0/24 发起攻击会是 200**（访问日志确认来源为 10.0.0.20），因为雷池同步来的
+    「局域网」ACL 是整段放行，白名单优先属于预期语义；复测攻击面必须换非白名单源。
+  - 开放 API：`POST /api/open/cert` 用临时自签证书创建 id=14，`GET /api/open/cert/14` 返回完整
+    crt/key，`DELETE` 后证书表回到 4 张（ID 10–13）；删除默认证书后系统自动把默认指到 ID 10。
+  - 控制台：统计/攻击/证书/系统设置各页 DOM 正常、无控制台报错；「系统设置 → 雷池同步」显示
+    8/8 应用、4/4 证书、1/3 规则、9/10 IP 组，模式「已写入并热重载」。
+  - TLS：4 张证书均缺私钥，`https://10.0.0.31:443`（SNI `waf.niao.fun`）仍握手失败，与日志
+    `no server certificate chain resolved` 一致；HTTP 80 正常。
+- **给雷池「配置同步」的正确填法**：地址填 HomeWAF 管理端 `http://10.0.0.31:9443`（不是雷池自己的
+  `https://10.0.0.14:9443`），Token 填本次生产已生成的 HomeWAF Token；这样连通性测试请求的就是
+  HomeWAF 的 `/api/open/cert`。但即便测试通过，雷池完整主从复制仍受其版本/license 校验限制，
+  HomeWAF 只保证这套开放接口可用于第三方脚本与探测。
+
+### 10:35 — Certd 自动签发证书推送支持与两个 Token 的用途（任务 #27）
+
+- 需求澄清：目标是 **Certd 流水线自动签发证书后直接推到 HomeWAF**，不是让 HomeWAF 去雷池拉证书。
+  核对 Certd v2 的 `SafelineAccess` 与 `SafelineDeployToWebsitePlugin` 源码后确认，它只调用：
+  - 授权测试 / 远程列证书：`GET /api/open/cert`，请求头 `X-SLCE-API-TOKEN`，读取 `data.nodes[].id/domains`；
+  - 部署证书：`POST /api/open/cert`，body 为 `{"manual":{"crt","key"},"type":2}`，选择已有证书时附加 `id`，
+    新增时 `id` 为 0 或不传。
+  这正是 #26 已实现的接口，HomeWAF 无需再改后端；本轮只补了控制台提示并做生产实测。
+- **两个 Token 的区别（已写进界面）**：
+  - **HomeWAF API Token**（证书管理 → 第三方证书推送）：给 Certd、第三方脚本、雷池「配置同步」探测用；
+  - **雷池 API Token**（系统设置 → 雷池同步）：只给 HomeWAF 从雷池拉取应用/规则/IP 组/证书用，Certd 不需要。
+- Certd 配置方法：授权类型选「长亭雷池授权」，URL 填 `http://10.0.0.31:9443`，ApiToken 填 HomeWAF
+  API Token；流水线添加「雷池-更新证书」，证书 ID 填 0 新增，或选已有证书 ID 做续期。注意 Certd 的
+  远程选择器要求证书列表非空（当前有 4 张），空库时需先手工上传一次或直接填 0。
+- **生产实测（新二进制 `aa17d253e4b54a49`）**：
+  - Certd 新增形状（`manual` + `type:2` + `id:0`）→ 创建 id=15，`has_key=true`，列表可见 → 删除后回到 4 张；
+  - Certd 续期形状（同域名、带已有 id）→ 创建 id=16 后用新证书再次 POST，仍是 id=16、`updated_at` 更新
+    → 删除后回到 4 张；未触碰真实证书 10–13。
+  - 无 Token 仍 401；证书页出现「Certd：」说明和「HomeWAF API Token（Certd / 第三方脚本用）」标签；
+    雷池同步页明确标注该处 Token 只用于从雷池拉取。
+- **限制**：
+  - HomeWAF 管理端只提供 HTTP，Certd 的 URL 必须填 `http://…:9443`；若 Certd 环境强制 HTTPS，需要在
+    前面加 TLS 反向代理。
+  - Certd 的「雷池」插件只覆盖证书接口；雷池的站点、IP 组等其它开放接口未实现，不要拿其它雷池插件
+    直接指向 HomeWAF。
+  - Certd 更新的是证书记录本身，防护应用通过证书 ID 绑定会自动跟随；更新含私钥的证书后才会真正参与
+    TLS，更新成功后控制台会热重载。
+
+### 10:40 — 手动 API 更新实测与并发删除排查
+
+- 按用户要求直接调用生产 `http://10.0.0.31:9443/api/open/cert`（`X-SLCE-API-Token` 为证书页
+  HomeWAF Token）做了一次完整实测，未触碰真实证书：
+  - 新增临时证书 id=17（`manual-check.homewaf.local`，类型 2）→ 返回 `{"data":{"id":17},"err":null}`；
+  - 带 `id=17` 再 POST 新证书 → 仍为 id=17，`not_after` 从 +1 天变为 +3 天，`updated_at` 更新；
+  - 删除 id=17 → `data:null`；接口更新语义正常。
+- **删除事件澄清**：用户确认 10:32 的 10–12 三次删除是本人手动操作，并非异常，本轮测试未触碰真实
+  证书。id=17 是测试证书，脚本在创建后 0.4 秒内就执行了删除，所以控制台来不及显示；这也说明控制台
+  证书页不会自动轮询，新增后需点「刷新」或重新进入页面。
+- 为便于人工确认，随后又创建 id=18（`manual-check.homewaf.local`）并带 `id` 更新为 3 天有效期，
+  `/api/certs` 与控制台刷新后均显示该证书（状态「可用」）；该测试证书先保留，待用户确认后再删除。
+- 管理端仍是无鉴权监听，删除审计不记录来源 IP；这次虽为手动操作，但仍是实际风险。雷池同步预览仍可
+  导入 4/4 证书，未自动执行正式同步。
+
+### 10:45 — Certd 显示成功但 HomeWAF 无证书的定位
+
+- 用户提供 Certd 日志：10:40:29 流水线「雷池-更新证书」向 `/api/open/cert` 发送 POST，HTTP 200，
+  日志写「证书<1>更新成功,ID:1」，但 HomeWAF 仍看不到新证书。
+- 生产核对（10:41–10:43）：
+  - `GET /api/certs` 仍只有 id=18（`manual-check.homewaf.local`），没有新增/更新记录；
+  - HomeWAF 代理访问日志最后一条是 10:17，之后没有 `/api/open/cert` 经过 80/443；
+  - 用「雷池同步 → 预览」查 10.0.0.14：仍是 4 张原证书（`download/speed/true.bbroot.com`、
+    `*.niao.fun`），全部为 ACME / 缺私钥，也没有这次 Certd 更新的内容。
+- 结论：这个 200 既不来自 HomeWAF，也不来自当前同步的雷池。Certd 的「雷池」插件只要 HTTP 200 就报成功，
+  不校验返回的证书 ID，因此请求实际打到了另一个兼容地址/旧实例。HomeWAF 的 API Token 已配置（64 位），
+  雷池同步页的 Token 是 32 位，两者长度可直接区分。
+- 正确配置：Certd 授权 URL 必须是 `http://10.0.0.31:9443`（不是 `https://10.0.0.14:9443`、不是
+  `dns.niao.fun`、不是 80 端口），ApiToken 必须是证书管理页的 HomeWAF API Token（64 位），
+  部署步骤证书 ID 填 0/留空；HomeWAF 会按域名续期，不会重复插入。
+- 说明：`/api/open/cert` 成功时返回 `{"err":null,"data":{"id":…}}`；如果 Certd 日志里的 ID 与
+  HomeWAF 返回不一致或列表没有新增，就说明请求没到 HomeWAF。
+- 用户随后提供 Certd 授权截图，确认根因：URL 填的是 `http://10.0.0.30:9443`（DNS 配置中心，
+  不是 HomeWAF），测试报 `ECONNREFUSED 10.0.0.30:9443`；ApiToken 也不是证书管理页那枚 64 位
+  HomeWAF Token。正确填法：URL 改为 `http://10.0.0.31:9443`，Token 从「证书管理 → HomeWAF API Token」
+  复制，点「测试」通过后再跑流水线；证书 ID 填 0/留空。截图中的 Token 不写入文档。
+- 用户把 URL 改为 `http://10.0.0.31:9443` 后，Certd 测试返回
+  `Login required 【http://10.0.0.31:9443/api/open/cert】`。这是 HomeWAF `open_unauthorized()` 的 401，
+  说明网络与路径已经正确，仅 `X-SLCE-API-Token` 与库中 Token 不一致；换用证书管理页的 64 位
+  HomeWAF API Token 即可。生产库确认该 Token 已配置（64 位）。
+
 ---
 
 ## 下一步开发任务
@@ -329,6 +513,11 @@
 | #20 | 生产部署与压测 | 交叉编译部署到 10.0.0.31，修复上游 SNI / 白名单语义 / 双栈监听三个缺陷，压测 4 万+ 请求零错误 | ✅ |
 | #21 | 生产验收测试 | 功能 / 安全 / 性能三项验收，修复健康检查误判、监听地址展示、运算符路由、配置回滚、连接重试、控制字符、Header 检测、健康度误计共 8 项缺陷并复测，详见 `docs/production-test-report.md` | ✅ |
 | #22 | 雷池同步语义修正 | 策略改落「访问控制」规则（`lei-acl-*`）、IP 组按 reference 建订阅（`lei-ipgroup-*`，支持 allow 动作）、ACME 证书只登记证书链并在控制台标记「缺私钥」、订阅快照落库 + 到期跳过联网 + keep-last 回退、修复内网默认放行被误当白名单跳过检测 | ✅ |
+| #23 | 人机验证增强 | PoW 成本墙 + 环境/自动化指纹 + HMAC 签名绑定与一次性解（防重放）；挑战页自采指纹，重放/自动化/缺失/非法指纹四类拒绝路径实测通过 | ✅ |
+| #24 | 证书管理排查 | 确认上传/更新/删除 API 与页面共用证书表；生产重新同步 4 张 ACME 证书（缺私钥）；补齐 Token 未生成与 ACME 证书提示 | ✅ |
+| #25 | 二次生产部署与退出修复 | Zig 交叉编译部署；证书消失定案为 API 删除而非持久化缺陷；证书变更补审计日志；Pingora 优雅退出宽限 300s → 10s | ✅ |
+| #26 | 雷池开放 API 与证书同步 | 新增 `/api/open/health`、`/api/open/cert`（GET/POST）、`/api/open/cert/{id}`（GET/DELETE）对齐雷池；同步兼容 `manual`/顶层字段并按域名原地续期；无键续期保留现有证书 | ✅ |
+| #27 | Certd 证书推送 | 对齐 Certd 雷池插件的 `GET/POST /api/open/cert`（`manual` + `type:2` + `id`）；控制台明确 HomeWAF Token 与雷池 Token 的用途；生产实测新增与按 ID 续期均通过 | ✅ |
 
 ### 远期遗留（差距分析中未排期）
 
@@ -342,4 +531,4 @@
 
 ### 当前进度估计
 
-基线（初始提交）→ 防护增强 → 规则订阅 → 指标底座 → GeoIP → 统计 API → 深色四页签控制台与防护大屏 → 防护应用 / 攻击防护 / 系统设置 → 网页防篡改 → 证书管理 / 多证书 SNI / 远程部署 API → 雷池配置同步，任务 #12–#19 已全部入库。整体功能完成度约 **82%**（对照差距分析）。
+基线（初始提交）→ 防护增强 → 规则订阅 → 指标底座 → GeoIP → 统计 API → 深色四页签控制台与防护大屏 → 防护应用 / 攻击防护 / 系统设置 → 网页防篡改 → 证书管理 / 多证书 SNI / 远程部署 API → 雷池配置同步 → 人机验证增强 → 证书管理排查 → 二次生产部署 → 雷池开放 API → Certd 证书推送，任务 #12–#27 已全部入库。整体功能完成度约 **86%**（对照差距分析）。
