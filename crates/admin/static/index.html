@@ -858,6 +858,7 @@
         <span id="top-mode">–</span>
         <span>检测规则 <b id="top-rules">–</b></span>
         <span>封禁 <b id="top-bans">–</b></span>
+        <button type="button" id="logout-btn" onclick="logout()" style="display:none">退出登录</button>
       </div>
     </div>
 
@@ -1597,17 +1598,17 @@
     </div>
   </div>
 
-  <!-- 管理面认证（仅当服务端配置了 HOMEWAF_ADMIN_TOKEN 时出现） -->
+  <!-- 管理面登录（服务端配置了 HOMEWAF_ADMIN_PASSWORD 时出现） -->
   <div class="modal-mask" id="login-modal">
     <div class="modal" style="width:min(420px,92vw)">
-      <header><h2>管理面认证</h2></header>
+      <header><h2>管理登录</h2></header>
       <form onsubmit="submitLogin(event)" style="padding:14px 18px">
-        <div class="login-hint sub" style="margin-bottom:10px">需要访问令牌才能使用控制台</div>
-        <div><label for="login-token">访问令牌</label>
-          <input id="login-token" type="password" autocomplete="current-password" placeholder="HOMEWAF_ADMIN_TOKEN">
+        <div class="login-hint sub" style="margin-bottom:10px">请输入管理密码</div>
+        <div><label for="login-password">管理密码</label>
+          <input id="login-password" type="password" autocomplete="current-password" placeholder="管理密码">
         </div>
-        <div style="margin-top:14px;text-align:right"><button type="submit">进入控制台</button></div>
-        <div class="sub" style="margin-top:10px">令牌只保存在本机浏览器，不会上传到服务器。</div>
+        <div style="margin-top:14px;text-align:right"><button type="submit" class="primary" id="login-submit">登录</button></div>
+        <div class="sub" style="margin-top:10px">登录状态只保存在本机浏览器，12 小时后自动失效。</div>
       </form>
     </div>
   </div>
@@ -1654,7 +1655,8 @@
 // ============================================================
 // 基础工具
 // ============================================================
-const TOKEN_KEY = 'homewaf.admin.token';
+/// 登录成功后拿到的会话令牌，只保存在本机浏览器
+const TOKEN_KEY = 'homewaf.admin.session';
 const adminToken = () => localStorage.getItem(TOKEN_KEY) || '';
 
 const api = async (path, opts = {}) => {
@@ -1663,30 +1665,66 @@ const api = async (path, opts = {}) => {
   if (token) headers.Authorization = 'Bearer ' + token;
   const res = await fetch('/api' + path, { ...opts, headers });
   if (res.status === 401) {
-    showLogin('需要访问令牌才能使用控制台');
+    showLogin('请登录管理控制台');
     throw new Error('需要认证');
   }
   if (!res.ok) throw new Error((await res.text()) || res.statusText);
   return res.status === 204 ? null : res.json();
 };
 
-/// 认证失败时弹出令牌输入框；令牌只保存在本机浏览器。
+/// 认证失败时弹出密码登录框。
 function showLogin(msg) {
   const el = document.getElementById('login-modal');
   if (!el) return;
   const hint = el.querySelector('.login-hint');
   if (hint && msg) hint.textContent = msg;
   el.classList.add('show');
-  const input = document.getElementById('login-token');
+  const input = document.getElementById('login-password');
   if (input) setTimeout(() => input.focus(), 30);
 }
 
-function submitLogin(ev) {
+/// 用密码换会话令牌，换取成功后刷新页面重新加载数据。
+async function submitLogin(ev) {
   if (ev) ev.preventDefault();
-  const input = document.getElementById('login-token');
-  const v = (input.value || '').trim();
-  if (!v) return;
-  localStorage.setItem(TOKEN_KEY, v);
+  const input = document.getElementById('login-password');
+  const password = ((input && input.value) || '').trim();
+  if (!password) return;
+  const btn = document.getElementById('login-submit');
+  const hint = document.querySelector('#login-modal .login-hint');
+  if (btn) { btn.disabled = true; btn.textContent = '登录中…'; }
+  try {
+    const res = await fetch('/api/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password }),
+    });
+    if (res.status === 429) {
+      if (hint) hint.textContent = '密码错误次数过多，请稍后再试';
+      return;
+    }
+    if (!res.ok) {
+      if (hint) hint.textContent = '密码错误';
+      if (input) input.select();
+      return;
+    }
+    const data = await res.json();
+    localStorage.setItem(TOKEN_KEY, data.token);
+    location.reload();
+  } catch (e) {
+    if (hint) hint.textContent = '登录失败：' + e.message;
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '登录'; }
+  }
+}
+
+async function logout() {
+  const token = adminToken();
+  localStorage.removeItem(TOKEN_KEY);
+  try {
+    if (token) {
+      await fetch('/api/logout', { method: 'POST', headers: { Authorization: 'Bearer ' + token } });
+    }
+  } catch (e) { /* 会话已失效也无所谓 */ }
   location.reload();
 }
 
@@ -1697,7 +1735,7 @@ async function download(url, fallback = 'export') {
   if (token) headers.Authorization = 'Bearer ' + token;
   try {
     const res = await fetch(url, { headers });
-    if (res.status === 401) { showLogin('需要访问令牌才能导出'); return; }
+    if (res.status === 401) { showLogin('登录已失效，请重新登录'); return; }
     if (!res.ok) { showMsg('下载失败：' + (await res.text()), 'error'); return; }
     const cd = res.headers.get('content-disposition') || '';
     const m = cd.match(/filename\*?=(?:UTF-8'')?["']?([^"';]+)/i);
@@ -5072,6 +5110,8 @@ async function pruneEvents() {
 // ============================================================
 // 启动
 // ============================================================
+// 有会话令牌才显示退出入口
+document.getElementById('logout-btn').style.display = adminToken() ? '' : 'none';
 loadStatisticsApps();
 loadStatistics();
 // 统计页保持轻量轮询；报告页不动，避免打断正在看的日报

@@ -2,7 +2,7 @@
 //!
 //! 设计取舍：
 //! - **API 与前端同一个 crate**，前端是嵌入二进制的静态文件，没有构建步骤
-//! - **认证用 Bearer token**，未配置 token 时只允许回环访问（家用默认安全）
+//! - **认证用登录密码换取的会话令牌**，未配置密码时只允许回环访问（家用默认安全）
 //! - **写操作后显式触发重载**，这是 DB 模式补回热重载的唯一途径
 
 pub mod certs;
@@ -40,8 +40,12 @@ pub struct AdminState {
     /// GeoIP 查询器。只在控制台聚合快照时使用，代理热路径不查库
     pub geoip: Arc<geoip::GeoIp>,
     pub allow_regex: bool,
-    /// 认证 token。`None` 时只允许回环访问
-    pub token: Option<String>,
+    /// 管理面登录密码（`HOMEWAF_ADMIN_PASSWORD`）。`None` 时认证关闭，只允许回环访问
+    pub password: Option<String>,
+    /// 登录后的会话：令牌 -> 过期时间（Unix 秒）。只存内存，重启即失效
+    pub sessions: Arc<std::sync::Mutex<std::collections::HashMap<String, i64>>>,
+    /// 登录失败记录：来源 -> (次数, 窗口起点)，用于限制密码爆破
+    pub login_failures: Arc<std::sync::Mutex<std::collections::HashMap<String, (u32, i64)>>>,
     /// 日志根目录，用于控制台的日志查看
     pub log_dir: std::path::PathBuf,
     /// 数据目录，GeoIP 默认库下载到这里
@@ -108,25 +112,167 @@ async fn security_headers(req: Request, next: Next) -> Response {
 
 /// 校验请求是否被允许。
 ///
-/// 配了 token 就比对 token；没配 token 时只信任回环地址——
+/// 配了密码就校验登录会话；没配密码时只信任回环地址——
 /// 家用场景下管理面本来就不该暴露到局域网。
 fn authorized(state: &AdminState, headers: &HeaderMap) -> bool {
-    match &state.token {
-        Some(expected) => headers
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-            .map(|t| t == expected)
-            .unwrap_or(false),
-        // 无 token：依赖监听地址是回环（启动时已校验），这里放行
-        None => true,
+    if state.password.is_none() {
+        return true;
     }
+    let Some(token) = bearer(headers) else {
+        return false;
+    };
+    let now = homewaf_acl::now_unix();
+    let Ok(mut sessions) = state.sessions.lock() else {
+        return false;
+    };
+    sessions.retain(|_, exp| *exp > now);
+    sessions.contains_key(token)
+}
+
+fn bearer(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")
+}
+
+/// 会话有效期：12 小时。控制台是低频操作，够用且不至于长期驻留。
+const SESSION_TTL: i64 = 12 * 3_600;
+/// 同一来源连续失败多少次后暂时拒绝登录
+const LOGIN_MAX_FAILS: u32 = 5;
+/// 失败计数窗口（秒）
+const LOGIN_WINDOW: i64 = 600;
+
+/// 登录来源。反代（HomeWAF/CDN）会带 X-Forwarded-For，直连时统一归到一个桶。
+fn client_key(headers: &HeaderMap) -> String {
+    headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or("direct")
+        .to_string()
+}
+
+fn login_blocked(state: &AdminState, src: &str, now: i64) -> Option<i64> {
+    let fails = state.login_failures.lock().ok()?;
+    let (count, start) = *fails.get(src)?;
+    if now - start >= LOGIN_WINDOW {
+        return None;
+    }
+    (count >= LOGIN_MAX_FAILS).then(|| LOGIN_WINDOW - (now - start))
+}
+
+fn record_login_failure(state: &AdminState, src: &str, now: i64) {
+    let Ok(mut fails) = state.login_failures.lock() else {
+        return;
+    };
+    if fails.len() > 1_024 {
+        fails.retain(|_, (_, start)| now - *start < LOGIN_WINDOW);
+    }
+    let entry = fails.entry(src.to_string()).or_insert((0, now));
+    if now - entry.1 >= LOGIN_WINDOW {
+        *entry = (0, now);
+    }
+    entry.0 += 1;
+}
+
+/// 定长比较，避免按字节提前返回泄露密码前缀。
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+#[derive(Deserialize)]
+struct LoginBody {
+    password: String,
+}
+
+#[derive(Serialize)]
+struct LoginReply {
+    token: String,
+    expires_in: i64,
+}
+
+/// 管理面登录：用密码换取会话令牌，浏览器不再保存静态密钥。
+async fn login(
+    State(ctx): State<Ctx>,
+    headers: HeaderMap,
+    Json(body): Json<LoginBody>,
+) -> Response {
+    let Some(expected) = ctx.password.as_deref() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "服务端未设置管理密码（HOMEWAF_ADMIN_PASSWORD），无需登录",
+        )
+            .into_response();
+    };
+
+    let now = homewaf_acl::now_unix();
+    let src = client_key(&headers);
+    if let Some(wait) = login_blocked(&ctx, &src, now) {
+        let retry = wait
+            .max(1)
+            .to_string()
+            .parse()
+            .unwrap_or(HeaderValue::from_static("600"));
+        let mut res = (
+            StatusCode::TOO_MANY_REQUESTS,
+            "密码错误次数过多，请稍后再试",
+        )
+            .into_response();
+        res.headers_mut().insert(header::RETRY_AFTER, retry);
+        return res;
+    }
+
+    if !ct_eq(expected.as_bytes(), body.password.as_bytes()) {
+        record_login_failure(&ctx, &src, now);
+        return (StatusCode::UNAUTHORIZED, "密码错误").into_response();
+    }
+
+    if let Ok(mut fails) = ctx.login_failures.lock() {
+        fails.remove(&src);
+    }
+    let token = random_token();
+    if let Ok(mut sessions) = ctx.sessions.lock() {
+        sessions.retain(|_, exp| *exp > now);
+        sessions.insert(token.clone(), now + SESSION_TTL);
+    }
+    Json(LoginReply {
+        token,
+        expires_in: SESSION_TTL,
+    })
+    .into_response()
+}
+
+/// 退出登录：丢弃当前会话令牌。
+async fn logout(State(ctx): State<Ctx>, headers: HeaderMap) -> Response {
+    if !authorized(&ctx, &headers) {
+        return unauthorized();
+    }
+    if let Some(token) = bearer(&headers) {
+        if let Ok(mut sessions) = ctx.sessions.lock() {
+            sessions.remove(token);
+        }
+    }
+    StatusCode::NO_CONTENT.into_response()
 }
 
 /// 构造路由。
 pub fn router(state: Ctx) -> Router {
     Router::new()
         .route("/", get(index))
+        // 登录/退出：登录本身不需要认证，其余接口都要有效会话
+        .route("/api/login", post(login))
+        .route("/api/logout", post(logout))
         .route("/api/stats", get(stats))
         .route("/api/stats/geo", get(geo_stats))
         .route("/api/security", get(security))
@@ -225,10 +371,10 @@ pub fn router(state: Ctx) -> Router {
 
 /// 启动管理服务（独立线程 + 独立 tokio runtime）。
 pub fn spawn(state: AdminState, listen: String) -> anyhow::Result<()> {
-    // 没配 token 时默认只允许监听回环，避免管理面裸奔在局域网。
+    // 没配管理密码时默认只允许监听回环，避免管理面裸奔在局域网。
     // 需要从其它设备直接打开控制台时，显式设置 HOMEWAF_ADMIN_INSECURE=1 放行，
     // 此时启动日志会打出告警——这是用户明确选择的取舍。
-    if state.token.is_none() {
+    if state.password.is_none() {
         let addr: SocketAddr = listen
             .parse()
             .map_err(|e| anyhow::anyhow!("管理面监听地址非法：{listen}（{e}）"))?;
@@ -238,8 +384,8 @@ pub fn spawn(state: AdminState, listen: String) -> anyhow::Result<()> {
                 .unwrap_or(false);
             if !insecure {
                 anyhow::bail!(
-                    "管理面监听 {listen} 不是回环地址，但未配置 admin token。\
-                     请设置 token，或设置 HOMEWAF_ADMIN_INSECURE=1 明确接受无认证暴露"
+                    "管理面监听 {listen} 不是回环地址，但未设置管理密码。\
+                     请设置环境变量 HOMEWAF_ADMIN_PASSWORD，或设置 HOMEWAF_ADMIN_INSECURE=1 明确接受无认证暴露"
                 );
             }
             tracing::warn!(
@@ -4866,7 +5012,9 @@ mod tests {
             metrics: Arc::new(TrafficMetrics::new()),
             geoip: Arc::new(geoip::GeoIp::new()),
             allow_regex: false,
-            token: None,
+            password: None,
+            sessions: Default::default(),
+            login_failures: Default::default(),
             log_dir: std::env::temp_dir(),
             data_dir: std::env::temp_dir(),
             started_at: 0,
@@ -4919,24 +5067,43 @@ mod tests {
     // ============================================================
 
     #[test]
-    fn auth_without_token_allows() {
+    fn auth_without_password_allows() {
         assert!(authorized(&state(), &HeaderMap::new()));
     }
 
     #[test]
-    fn auth_with_token_requires_match() {
+    fn auth_with_password_requires_session() {
         let mut st = state();
-        st.token = Some("secret".to_string());
+        st.password = Some("secret".to_string());
 
-        assert!(!authorized(&st, &HeaderMap::new()), "无头应拒绝");
-
-        let mut h = HeaderMap::new();
-        h.insert("authorization", "Bearer wrong".parse().unwrap());
-        assert!(!authorized(&st, &h), "错 token 应拒绝");
+        assert!(!authorized(&st, &HeaderMap::new()), "无会话应拒绝");
 
         let mut h = HeaderMap::new();
         h.insert("authorization", "Bearer secret".parse().unwrap());
+        assert!(!authorized(&st, &h), "密码本身不能当令牌");
+
+        let expiry = homewaf_acl::now_unix() + SESSION_TTL;
+        st.sessions.lock().unwrap().insert("sess-1".to_string(), expiry);
+
+        let mut h = HeaderMap::new();
+        h.insert("authorization", "Bearer sess-1".parse().unwrap());
         assert!(authorized(&st, &h));
+
+        *st.sessions.lock().unwrap().get_mut("sess-1").unwrap() =
+            homewaf_acl::now_unix() - 1;
+        assert!(!authorized(&st, &h), "过期会话应拒绝");
+    }
+
+    #[test]
+    fn login_lockout_after_repeated_failures() {
+        let st = state();
+        let now = homewaf_acl::now_unix();
+        for _ in 0..LOGIN_MAX_FAILS {
+            record_login_failure(&st, "1.2.3.4", now);
+        }
+        assert!(login_blocked(&st, "1.2.3.4", now).is_some());
+        assert!(login_blocked(&st, "1.2.3.4", now + LOGIN_WINDOW + 1).is_none());
+        assert!(login_blocked(&st, "5.6.7.8", now).is_none());
     }
 
     // ============================================================

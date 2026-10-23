@@ -451,7 +451,10 @@ fn cmd_serve(
     // 启动控制台（独立线程，不阻塞代理）
     let admin_addr = shared.load_full().server.admin.listen.clone();
     if !admin_addr.is_empty() {
-        let token = std::env::var("HOMEWAF_ADMIN_TOKEN").ok();
+        // 管理面用登录密码认证：控制台输入密码换取会话令牌，不在浏览器保存静态密钥
+        let password = std::env::var("HOMEWAF_ADMIN_PASSWORD")
+            .ok()
+            .filter(|p| !p.trim().is_empty());
         let admin_state = homewaf_admin::AdminState {
             store: store.clone(),
             shared: shared.clone(),
@@ -459,7 +462,9 @@ fn cmd_serve(
             metrics: metrics.clone(),
             geoip: std::sync::Arc::new(homewaf_admin::geoip::GeoIp::new()),
             allow_regex,
-            token,
+            password,
+            sessions: Default::default(),
+            login_failures: Default::default(),
             log_dir: std::path::PathBuf::from(&logging_cfg.dir),
             data_dir: std::path::Path::new(db)
                 .parent()

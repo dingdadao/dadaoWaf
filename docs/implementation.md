@@ -812,10 +812,11 @@ INFO HomeWAF 启动（配置来自数据库 /tmp/hw-db-mode.db） apps=1 upstrea
 
 **认证**：
 
-- 配了 `HOMEWAF_ADMIN_TOKEN` 环境变量 → 要求 `Authorization: Bearer <token>`
+- 配了 `HOMEWAF_ADMIN_PASSWORD` 环境变量 → 控制台弹出登录框，`POST /api/login` 用密码换取内存会话令牌（12 小时有效），之后请求带 `Authorization: Bearer <session>`
+- 同一来源连续输错 5 次锁定 10 分钟；退出登录调用 `POST /api/logout` 丢弃会话
 - 没配 → **强制只允许监听回环地址**，启动时校验，非回环直接拒绝启动
 
-家用场景下管理面本来就不该暴露到局域网，所以"没 token 就只允许 127.0.0.1"是更安全的默认。
+家用场景下管理面本来就不该暴露到局域网，所以"没密码就只允许 127.0.0.1"是更安全的默认。
 
 **API**：
 
