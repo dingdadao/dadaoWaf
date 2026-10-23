@@ -1892,8 +1892,8 @@ async fn delete_rule(
 ///
 /// 访问控制统一到条件规则后，`acl_rules` 表只保留订阅生成的规则。
 /// 迁移后删除原行——否则同一条规则会同时被 ACL 与自定义规则执行两次。
-fn migrate_legacy_acl(ctx: &AdminState) -> Result<(), String> {
-    let rows = ctx.store.list_acl_rules().map_err(|e| e.to_string())?;
+pub fn migrate_legacy_acl(store: &Store) -> Result<(), String> {
+    let rows = store.list_acl_rules().map_err(|e| e.to_string())?;
     let legacy: Vec<_> = rows
         .into_iter()
         .filter(|r| !r.id.starts_with("feed:"))
@@ -1902,8 +1902,7 @@ fn migrate_legacy_acl(ctx: &AdminState) -> Result<(), String> {
         return Ok(());
     }
 
-    let mut rules: Vec<homewaf_config::CustomRule> = ctx
-        .store
+    let mut rules: Vec<homewaf_config::CustomRule> = store
         .get_setting(leichi::CUSTOM_RULES_KEY)
         .map_err(|e| e.to_string())?
         .unwrap_or_default();
@@ -1934,11 +1933,11 @@ fn migrate_legacy_acl(ctx: &AdminState) -> Result<(), String> {
     }
 
     let now = homewaf_acl::now_unix();
-    ctx.store
+    store
         .set_setting(leichi::CUSTOM_RULES_KEY, &rules, now)
         .map_err(|e| e.to_string())?;
     for row in &legacy {
-        let _ = ctx.store.delete_acl_rule(&row.id);
+        let _ = store.delete_acl_rule(&row.id);
     }
     tracing::info!(count = legacy.len(), "历史 IP 规则已迁移为条件规则");
     Ok(())
@@ -4452,7 +4451,7 @@ fn reload_state(ctx: &AdminState) -> Result<(), String> {
 fn reload_state_with(ctx: &AdminState, force_rule_feeds: bool) -> Result<(), String> {
     // 迁移放在重载之前：雷池同步会写 acl_rules，这里顺手转成条件规则，
     // 保证访问控制页面看到的是同一套模型。迁移是幂等的，没有历史行时零成本。
-    if let Err(e) = migrate_legacy_acl(ctx) {
+    if let Err(e) = migrate_legacy_acl(&ctx.store) {
         tracing::warn!(error = %e, "历史 IP 规则迁移失败，本次跳过");
     }
 
@@ -4855,6 +4854,66 @@ mod tests {
     // ============================================================
     // 统一订阅源
     // ============================================================
+
+    // ============================================================
+    // 历史规则迁移
+    // ============================================================
+
+    #[test]
+    fn legacy_acl_rules_are_migrated_to_conditions() {
+        use homewaf_store::AclRuleRow;
+
+        let store = homewaf_store::Store::open_memory().unwrap();
+        store
+            .upsert_acl_rule(
+                &AclRuleRow {
+                    id: "ui-1".into(),
+                    cidr: "10.9.0.0/16".into(),
+                    action: "allow".into(),
+                    scope: Some("demo".into()),
+                    expires_at: None,
+                    note: Some("老规则".into()),
+                },
+                0,
+            )
+            .unwrap();
+        // 订阅生成的规则不能被迁移，它每次重载都会重新生成
+        store
+            .upsert_acl_rule(
+                &AclRuleRow {
+                    id: "feed:bad:0:global".into(),
+                    cidr: "1.2.3.0/24".into(),
+                    action: "deny".into(),
+                    scope: None,
+                    expires_at: None,
+                    note: None,
+                },
+                0,
+            )
+            .unwrap();
+
+        migrate_legacy_acl(&store).unwrap();
+
+        let rules: Vec<homewaf_config::CustomRule> =
+            store.get_setting("custom_rules").unwrap().unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].id, "ui-1");
+        assert_eq!(rules[0].name, "老规则");
+        assert_eq!(rules[0].action, 0, "allow 应映射成 0");
+        assert_eq!(rules[0].scope, vec!["demo".to_string()]);
+        assert_eq!(rules[0].pattern[0][0].k, "src_ip");
+        assert_eq!(rules[0].pattern[0][0].v, vec!["10.9.0.0/16".to_string()]);
+
+        let left = store.list_acl_rules().unwrap();
+        assert_eq!(left.len(), 1, "订阅规则应保留");
+        assert_eq!(left[0].id, "feed:bad:0:global");
+
+        // 幂等：再跑一次不会产生重复规则
+        migrate_legacy_acl(&store).unwrap();
+        let again: Vec<homewaf_config::CustomRule> =
+            store.get_setting("custom_rules").unwrap().unwrap();
+        assert_eq!(again.len(), 1);
+    }
 
     #[test]
     fn label_is_kept_and_trimmed() {

@@ -390,6 +390,12 @@ fn cmd_serve(
         return Ok(ExitCode::FAILURE);
     };
 
+    // 启动即迁移历史 IP 规则：迁移只在管理端重载时跑的话，
+    // 升级后不点任何页面就一直看不到旧规则，等于静默丢配置。
+    if let Err(e) = homewaf_admin::migrate_legacy_acl(&store) {
+        eprintln!("迁移历史 IP 规则失败（已跳过）：{e}");
+    }
+
     let mut state = match homewaf_proxy::load_state_from_db(&store, allow_regex) {
         Ok(s) => s,
         Err(e) => {
