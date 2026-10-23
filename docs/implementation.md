@@ -812,18 +812,25 @@ INFO HomeWAF 启动（配置来自数据库 /tmp/hw-db-mode.db） apps=1 upstrea
 
 **认证**：
 
-- 配了 `HOMEWAF_ADMIN_PASSWORD` 环境变量 → 控制台弹出登录框，`POST /api/login` 用密码换取内存会话令牌（7 天有效），之后请求带 `Authorization: Bearer <session>`
-- 配了 `HOMEWAF_ADMIN_TOTP_SECRET`（base32）→ **公网来源登录还需要 6 位 TOTP 动态验证码**；局域网（含本机直连）只校验密码。来源取反代写入的 `X-Real-IP`，客户端无法伪造
+- 凭据保存在 SQLite 的 `settings` 表（key `admin_auth`），不需要任何环境变量。首次启动自动创建初始账号 **admin / admin**，密码用 PBKDF2-HMAC-SHA256（120000 次迭代）加盐存储
+- `POST /api/login` 用账号密码换取内存会话令牌（7 天有效），之后请求带 `Authorization: Bearer <session>`；令牌只存内存，进程重启即失效
+- 首次登录引导：`must_change_password=true` 时控制台顶部提示改密码（`POST /api/auth/password`，新密码 ≥8 位且不能继续用 admin）；未绑定动态口令时 `POST /api/login` 返回 `must_bind_totp` + `otpauth`，前端用内置二维码库渲染绑定二维码，**必须提交一次有效动态码（`POST /api/totp/confirm`）才算真正启用**
+- 已绑定后：**公网来源登录还需要 6 位 TOTP 动态验证码**；局域网（含本机直连）只校验密码，便于应急登录。首次绑定在局域网可「稍后绑定」，公网不允许跳过
+- 来源 IP 按系统设置里「真实 IP」的 `real_ip.header_priority` 顺序解析（反代会覆盖写入真实客户端 IP），不再硬编码 `X-Real-IP`
 - TOTP 允许 ±1 个 30 秒时间步偏差，同一时间步的验证码只能使用一次（防重放）
-- 同一来源连续输错 5 次锁定 10 分钟；退出登录调用 `POST /api/logout` 丢弃会话
-- 没配 → **强制只允许监听回环地址**，启动时校验，非回环直接拒绝启动
-
-家用场景下管理面本来就不该暴露到局域网，所以"没密码就只允许 127.0.0.1"是更安全的默认。
+- 同一来源连续输错 5 次锁定 10 分钟；退出登录调用 `POST /api/logout` 丢弃会话。改密码后其它设备上的会话全部失效
+- 没有任何凭据也能启动（不再强制回环），但管理面在非回环地址监听时会打警告日志，提示登录后立即改密码并绑定动态口令
 
 **API**：
 
 ```
 GET    /api/stats            概览数字
+POST   /api/login            账号密码换会话令牌（未绑定时返回绑定二维码）
+POST   /api/logout           丢弃当前会话
+GET    /api/auth             账号状态（是否需改密码 / 是否已绑动态口令）
+POST   /api/auth/password    修改密码
+POST   /api/totp/start       生成待绑定动态口令密钥
+POST   /api/totp/confirm     提交一次验证码，正式启用动态口令
 GET    /api/apps             应用列表
 POST   /api/apps             新增/更新应用
 DELETE /api/apps/{id}        删除应用
@@ -862,7 +869,6 @@ fn reload_state(ctx) -> Result<(), String> {
 **当前局限**：
 
 - 没有设置编辑界面（`protection`、`real_ip` 等要直接改 DB 或用 API）
-- 没有登录页，token 靠环境变量
 - 事件没有筛选与分页，只显示最近 30 条
 - 应用编辑只覆盖 ID/域名/别名/单上游，多上游与路由要在 API 层传完整 JSON
 

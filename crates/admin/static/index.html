@@ -858,12 +858,20 @@
         <span id="top-mode">–</span>
         <span>检测规则 <b id="top-rules">–</b></span>
         <span>封禁 <b id="top-bans">–</b></span>
+        <button type="button" id="security-btn" onclick="openPasswordModal()" style="display:none">账号安全</button>
         <button type="button" id="logout-btn" onclick="logout()" style="display:none">退出登录</button>
       </div>
     </div>
 
     <div class="content">
       <div class="msg" id="msg"></div>
+
+      <!-- 首次登录引导：仍用初始密码 / 未绑定动态口令 -->
+      <div id="security-banner" style="display:none;align-items:center;gap:10px;flex-wrap:wrap;padding:10px 14px;margin-bottom:16px;border-radius:8px;font-size:13px;background:rgba(227,179,65,.12);color:var(--warn);border:1px solid #5a4a1f">
+        <span id="security-banner-text" style="flex:1;min-width:220px"></span>
+        <button type="button" id="banner-pwd-btn" onclick="openPasswordModal()" style="display:none">修改密码</button>
+        <button type="button" id="banner-totp-btn" onclick="openTotpBind()" style="display:none">绑定动态口令</button>
+      </div>
 
       <!-- ========== 统计报表 ========== -->
       <div class="page active" data-page="statistics">
@@ -1598,22 +1606,75 @@
     </div>
   </div>
 
-  <!-- 管理面登录（服务端配置了 HOMEWAF_ADMIN_PASSWORD 时出现） -->
+  <!-- 管理面登录：初始账号 admin/admin；首次登录引导改密码 + 绑定动态口令 -->
   <div class="modal-mask" id="login-modal">
-    <div class="modal" style="width:min(420px,92vw)">
+    <div class="modal" style="width:min(440px,92vw)">
       <header><h2>管理登录</h2></header>
-      <form onsubmit="submitLogin(event)" style="padding:14px 18px">
-        <div class="login-hint sub" style="margin-bottom:10px">局域网输入管理密码即可；公网访问还需动态验证码</div>
-        <div><label for="login-password">管理密码</label>
-          <input id="login-password" type="password" autocomplete="current-password" placeholder="管理密码">
+      <form id="login-form" onsubmit="submitLogin(event)" style="padding:14px 18px">
+        <div class="login-hint sub" style="margin-bottom:10px">首次使用请用初始账号 <b>admin</b> / <b>admin</b> 登录，登录后会引导修改密码并绑定动态口令。</div>
+        <div><label for="login-username">账号</label>
+          <input id="login-username" autocomplete="username" placeholder="admin" value="admin">
         </div>
-        <div style="margin-top:10px"><label for="login-totp">动态验证码（公网必填）</label>
+        <div style="margin-top:10px"><label for="login-password">密码</label>
+          <input id="login-password" type="password" autocomplete="current-password" placeholder="密码">
+        </div>
+        <div id="login-totp-row" style="margin-top:10px;display:none"><label for="login-totp">动态验证码</label>
           <input id="login-totp" inputmode="numeric" autocomplete="one-time-code" maxlength="6"
-                 placeholder="6 位验证码，局域网可留空">
+                 placeholder="身份验证器上的 6 位数字">
         </div>
+        <div class="login-hint sub" id="login-error" style="margin-top:10px;color:var(--danger);display:none"></div>
         <div style="margin-top:14px;text-align:right"><button type="submit" class="primary" id="login-submit">登录</button></div>
-        <div class="sub" style="margin-top:10px">认证一次后本机浏览器会缓存会话令牌，7 天内免登录。</div>
+        <div class="sub" style="margin-top:10px">公网访问必须绑定动态口令；局域网仅需密码。认证一次后本机浏览器缓存会话，7 天内免登录。</div>
       </form>
+      <!-- 首次登录：扫码绑定动态口令 -->
+      <div id="bind-panel" style="display:none;padding:4px 18px 18px">
+        <div class="sub" style="margin-bottom:10px">用手机上的身份验证器（Google Authenticator、Microsoft Authenticator 等）扫描二维码，再输入它生成的 6 位验证码完成绑定。</div>
+        <div id="bind-qr" style="background:#fff;padding:10px;border-radius:8px;width:200px;margin:0 auto"></div>
+        <div class="sub" style="margin-top:10px;word-break:break-all">无法扫码？手动添加密钥：<code id="bind-secret"></code></div>
+        <div style="margin-top:12px"><label for="bind-totp">动态验证码</label>
+          <input id="bind-totp" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="输入身份验证器上的 6 位数字">
+        </div>
+        <div class="sub" id="bind-error" style="margin-top:10px;color:var(--danger);display:none"></div>
+        <div style="margin-top:14px;display:flex;gap:8px;justify-content:flex-end">
+          <button type="button" id="bind-skip" onclick="skipBind()">稍后绑定（仅局域网）</button>
+          <button type="button" class="primary" id="bind-submit" onclick="confirmBind()">完成绑定并登录</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 修改管理密码 -->
+  <div class="modal-mask" id="password-modal" onclick="if(event.target===this)hidePasswordModal()">
+    <div class="modal" style="width:min(440px,92vw)">
+      <header><h2>修改管理密码</h2><button type="button" onclick="hidePasswordModal()">关闭</button></header>
+      <form onsubmit="submitPasswordChange(event)" style="padding:14px 18px">
+        <div class="sub" style="margin-bottom:4px">不要继续使用初始密码 admin；新密码至少 8 位。</div>
+        <div><label for="pwd-old">当前密码</label><input id="pwd-old" type="password" autocomplete="current-password"></div>
+        <div><label for="pwd-new">新密码（≥8 位）</label><input id="pwd-new" type="password" autocomplete="new-password"></div>
+        <div><label for="pwd-new2">确认新密码</label><input id="pwd-new2" type="password" autocomplete="new-password"></div>
+        <div class="sub" id="pwd-error" style="color:var(--danger);display:none"></div>
+        <div style="display:flex;gap:8px;justify-content:space-between;align-items:center">
+          <button type="button" id="pwd-totp-btn" onclick="openTotpBind()" style="display:none">绑定动态口令</button>
+          <button type="submit" class="primary" id="pwd-submit">保存</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- 已登录后补绑定动态口令 -->
+  <div class="modal-mask" id="totp-modal" onclick="if(event.target===this)hideTotpModal()">
+    <div class="modal" style="width:min(440px,92vw)">
+      <header><h2>绑定动态口令</h2><button type="button" onclick="hideTotpModal()">关闭</button></header>
+      <div style="padding:14px 18px">
+        <div class="sub" style="margin-bottom:10px">扫描二维码把 HomeWAF 加入身份验证器，输入 6 位验证码后正式启用。启用后公网登录需要动态验证码。</div>
+        <div id="totp-qr" style="background:#fff;padding:10px;border-radius:8px;width:200px;margin:0 auto"></div>
+        <div class="sub" style="margin-top:10px;word-break:break-all">无法扫码？手动添加密钥：<code id="totp-secret"></code></div>
+        <div style="margin-top:12px"><label for="totp-code">动态验证码</label>
+          <input id="totp-code" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="身份验证器上的 6 位数字">
+        </div>
+        <div class="sub" id="totp-error" style="margin-top:10px;color:var(--danger);display:none"></div>
+        <div style="margin-top:14px;text-align:right"><button type="button" class="primary" id="totp-submit" onclick="confirmTotpBind()">启用</button></div>
+      </div>
     </div>
   </div>
 
@@ -1655,6 +1716,7 @@
     </div>
   </div>
 
+<script src="/qrcode.js"></script>
 <script>
 // ============================================================
 // 基础工具
@@ -1676,52 +1738,240 @@ const api = async (path, opts = {}) => {
   return res.status === 204 ? null : res.json();
 };
 
-/// 认证失败时弹出密码登录框。
+/// 认证失败时弹出登录框。msg 为空表示静默弹出，不覆盖页面内容。
 function showLogin(msg) {
   const el = document.getElementById('login-modal');
   if (!el) return;
-  const hint = el.querySelector('.login-hint');
-  if (hint && msg) hint.textContent = msg;
+  const form = document.getElementById('login-form');
+  const panel = document.getElementById('bind-panel');
+  if (form) form.style.display = '';
+  if (panel) panel.style.display = 'none';
+  const err = document.getElementById('login-error');
+  if (err) {
+    err.textContent = msg || '';
+    err.style.display = msg ? '' : 'none';
+  }
   el.classList.add('show');
   const input = document.getElementById('login-password');
   if (input) setTimeout(() => input.focus(), 30);
 }
 
-/// 用密码换会话令牌，换取成功后刷新页面重新加载数据。
+function showLoginError(msg) {
+  const err = document.getElementById('login-error');
+  if (!err) return;
+  err.textContent = msg || '';
+  err.style.display = msg ? '' : 'none';
+}
+
+function showBindError(msg) {
+  const err = document.getElementById('bind-error');
+  if (!err) return;
+  err.textContent = msg || '';
+  err.style.display = msg ? '' : 'none';
+}
+
+/// 首次登录时暂存的账号密码，用于「稍后绑定」或提交绑定验证码
+let pendingLogin = null;
+
+/// 用账号密码换会话令牌。首次登录未绑定动态口令时，服务端返回二维码信息。
 async function submitLogin(ev) {
   if (ev) ev.preventDefault();
-  const input = document.getElementById('login-password');
-  const password = ((input && input.value) || '').trim();
+  const username = (document.getElementById('login-username').value || '').trim() || 'admin';
+  const pwdInput = document.getElementById('login-password');
+  const password = (pwdInput && pwdInput.value) || '';
   const totpInput = document.getElementById('login-totp');
   const totp = ((totpInput && totpInput.value) || '').replace(/\s+/g, '');
-  if (!password) return;
+  if (!password) { showLoginError('请输入密码'); return; }
+  pendingLogin = { username, password };
   const btn = document.getElementById('login-submit');
-  const hint = document.querySelector('#login-modal .login-hint');
   if (btn) { btn.disabled = true; btn.textContent = '登录中…'; }
   try {
     const res = await fetch('/api/login', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ password, totp }),
+      body: JSON.stringify({ username, password, totp }),
     });
-    if (res.status === 429) {
-      if (hint) hint.textContent = '密码错误次数过多，请稍后再试';
-      return;
-    }
+    if (res.status === 429) { showLoginError('尝试次数过多，请 10 分钟后再试'); return; }
     if (!res.ok) {
       const msg = (await res.text()) || '登录失败';
-      if (hint) hint.textContent = msg;
-      if (msg.includes('密码')) { if (input) input.select(); }
-      else if (totpInput) totpInput.select();
+      showLoginError(msg);
+      if (msg.includes('动态验证码')) {
+        const row = document.getElementById('login-totp-row');
+        if (row) row.style.display = '';
+        if (totpInput) totpInput.focus();
+      } else if (msg.includes('密码') && pwdInput) {
+        pwdInput.select();
+      }
       return;
     }
+    const data = await res.json();
+    if (data.must_bind_totp) { showBindPanel(data); return; }
+    localStorage.setItem(TOKEN_KEY, data.token);
+    location.reload();
+  } catch (e) {
+    showLoginError('登录失败：' + e.message);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '登录'; }
+  }
+}
+
+/// 首次登录引导：展示动态口令二维码，要求验证一次才真正启用。
+function showBindPanel(reply) {
+  const form = document.getElementById('login-form');
+  const panel = document.getElementById('bind-panel');
+  if (form) form.style.display = 'none';
+  if (panel) panel.style.display = '';
+  showLoginError('');
+  showBindError('');
+  document.getElementById('bind-secret').textContent = reply.secret || '';
+  renderQr(document.getElementById('bind-qr'), reply.otpauth || '');
+  const input = document.getElementById('bind-totp');
+  if (input) { input.value = ''; setTimeout(() => input.focus(), 50); }
+}
+
+/// 局域网可以稍后绑定；公网提交 skip_bind 会被服务端拒绝。
+async function skipBind() {
+  if (!pendingLogin) { showBindError('登录状态已过期，请重新输入密码'); return; }
+  await finishBind({ ...pendingLogin, skip_bind: true });
+}
+
+async function confirmBind() {
+  const input = document.getElementById('bind-totp');
+  const code = ((input && input.value) || '').replace(/\s+/g, '');
+  if (code.length !== 6) { showBindError('请输入身份验证器上的 6 位数字'); return; }
+  if (!pendingLogin) { showBindError('登录状态已过期，请重新输入密码'); return; }
+  await finishBind({ ...pendingLogin, totp: code });
+}
+
+/// 重新登录：带上一次性验证码或「稍后绑定」标记。
+async function finishBind(payload) {
+  const btn = document.getElementById('bind-submit');
+  if (btn) { btn.disabled = true; btn.textContent = '处理中…'; }
+  try {
+    const res = await fetch('/api/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (res.status === 429) { showBindError('尝试次数过多，请 10 分钟后再试'); return; }
+    if (!res.ok) { showBindError((await res.text()) || '绑定失败'); return; }
     const data = await res.json();
     localStorage.setItem(TOKEN_KEY, data.token);
     location.reload();
   } catch (e) {
-    if (hint) hint.textContent = '登录失败：' + e.message;
+    showBindError('绑定失败：' + e.message);
   } finally {
-    if (btn) { btn.disabled = false; btn.textContent = '登录'; }
+    if (btn) { btn.disabled = false; btn.textContent = '完成绑定并登录'; }
+  }
+}
+
+/// 渲染 otpauth 二维码。二维码库随管理面一起提供，离线可用。
+function renderQr(el, text) {
+  if (!el) return;
+  if (typeof qrcode !== 'function') { el.textContent = '二维码库加载失败，请使用下方手动密钥'; return; }
+  try {
+    const qr = qrcode(0, 'M');
+    qr.addData(text);
+    qr.make();
+    el.innerHTML = qr.createSvgTag({ cellSize: 5, margin: 2, scalable: true });
+    const svg = el.querySelector('svg');
+    if (svg) { svg.style.width = '100%'; svg.style.height = 'auto'; }
+  } catch (e) {
+    el.textContent = '二维码生成失败，请使用下方手动密钥';
+  }
+}
+
+/// 登录后引导：仍用初始密码 / 未绑定动态口令时，在页面顶部提示
+async function refreshSecurityBanner() {
+  const banner = document.getElementById('security-banner');
+  if (!banner || !adminToken()) return;
+  let st;
+  try { st = await api('/auth'); } catch (e) { return; }
+  const tips = [];
+  if (st.must_change_password) tips.push('当前仍在用初始密码 admin，请立即修改密码。');
+  if (!st.totp_enabled) tips.push('尚未绑定动态口令，公网登录无法完成二次验证。');
+  document.getElementById('security-banner-text').textContent = tips.length ? '安全提示：' + tips.join(' ') : '';
+  banner.style.display = tips.length ? 'flex' : 'none';
+  document.getElementById('banner-pwd-btn').style.display = st.must_change_password ? '' : 'none';
+  document.getElementById('banner-totp-btn').style.display = st.totp_enabled ? 'none' : '';
+  const inPwdModal = document.getElementById('pwd-totp-btn');
+  if (inPwdModal) inPwdModal.style.display = st.totp_enabled ? 'none' : '';
+}
+
+function openPasswordModal() {
+  const modal = document.getElementById('password-modal');
+  document.getElementById('pwd-old').value = '';
+  document.getElementById('pwd-new').value = '';
+  document.getElementById('pwd-new2').value = '';
+  document.getElementById('pwd-error').style.display = 'none';
+  modal.classList.add('show');
+  setTimeout(() => document.getElementById('pwd-old').focus(), 30);
+}
+
+function hidePasswordModal() {
+  document.getElementById('password-modal').classList.remove('show');
+}
+
+async function submitPasswordChange(ev) {
+  if (ev) ev.preventDefault();
+  const oldPwd = document.getElementById('pwd-old').value;
+  const newPwd = document.getElementById('pwd-new').value;
+  const again = document.getElementById('pwd-new2').value;
+  const err = document.getElementById('pwd-error');
+  const fail = (m) => { err.textContent = m; err.style.display = ''; };
+  if (newPwd.length < 8) return fail('新密码至少 8 位');
+  if (newPwd !== again) return fail('两次输入的新密码不一致');
+  const btn = document.getElementById('pwd-submit');
+  btn.disabled = true;
+  try {
+    await api('/auth/password', {
+      method: 'POST',
+      body: JSON.stringify({ old: oldPwd, new_password: newPwd }),
+    });
+    hidePasswordModal();
+    showMsg('密码已更新，其它设备上的会话已失效');
+    refreshSecurityBanner();
+  } catch (e) {
+    fail('修改失败：' + e.message);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function openTotpBind() {
+  document.getElementById('totp-code').value = '';
+  document.getElementById('totp-error').style.display = 'none';
+  try {
+    const data = await api('/totp/start', { method: 'POST' });
+    document.getElementById('totp-secret').textContent = data.secret || '';
+    renderQr(document.getElementById('totp-qr'), data.otpauth || '');
+    document.getElementById('totp-modal').classList.add('show');
+    setTimeout(() => document.getElementById('totp-code').focus(), 50);
+  } catch (e) {
+    showMsg('获取绑定二维码失败：' + e.message, 'error');
+  }
+}
+
+function hideTotpModal() {
+  document.getElementById('totp-modal').classList.remove('show');
+}
+
+async function confirmTotpBind() {
+  const code = (document.getElementById('totp-code').value || '').replace(/\s+/g, '');
+  const err = document.getElementById('totp-error');
+  if (code.length !== 6) { err.textContent = '请输入 6 位数字'; err.style.display = ''; return; }
+  const btn = document.getElementById('totp-submit');
+  btn.disabled = true;
+  try {
+    await api('/totp/confirm', { method: 'POST', body: JSON.stringify({ totp: code }) });
+    hideTotpModal();
+    showMsg('动态口令已启用，公网登录将要求验证码');
+    refreshSecurityBanner();
+  } catch (e) {
+    err.textContent = '绑定失败：' + e.message;
+    err.style.display = '';
+  } finally {
+    btn.disabled = false;
   }
 }
 
@@ -5120,6 +5370,9 @@ async function pruneEvents() {
 // ============================================================
 // 有会话令牌才显示退出入口
 document.getElementById('logout-btn').style.display = adminToken() ? '' : 'none';
+document.getElementById('security-btn').style.display = adminToken() ? '' : 'none';
+// 仍用初始密码或未绑定动态口令时，顶部提示引导
+refreshSecurityBanner();
 loadStatisticsApps();
 loadStatistics();
 // 统计页保持轻量轮询；报告页不动，避免打断正在看的日报

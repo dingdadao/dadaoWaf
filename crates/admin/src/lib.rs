@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use axum::{
     body::Bytes,
+    extract::ConnectInfo,
     extract::Request,
     extract::{Path, Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
@@ -24,7 +25,7 @@ use axum::{
     Json, Router,
 };
 use homewaf_acl::BanTable;
-use homewaf_config::Application;
+use homewaf_config::{Application, RealIpConfig};
 use homewaf_proxy::{
     HistoricalBucket, RuntimeState, SharedState, TrafficDashboard, TrafficMetrics,
 };
@@ -40,14 +41,10 @@ pub struct AdminState {
     /// GeoIP 查询器。只在控制台聚合快照时使用，代理热路径不查库
     pub geoip: Arc<geoip::GeoIp>,
     pub allow_regex: bool,
-    /// 管理面登录密码（`HOMEWAF_ADMIN_PASSWORD`）。`None` 时认证关闭，只允许回环访问
-    pub password: Option<String>,
     /// 登录后的会话：令牌 -> 过期时间（Unix 秒）。只存内存，重启即失效
     pub sessions: Arc<std::sync::Mutex<std::collections::HashMap<String, i64>>>,
     /// 登录失败记录：来源 -> (次数, 窗口起点)，用于限制密码爆破
     pub login_failures: Arc<std::sync::Mutex<std::collections::HashMap<String, (u32, i64)>>>,
-    /// 公网登录所需的 TOTP 密钥（base32 解码后）。`None` 时不要求二次验证
-    pub totp: Option<Vec<u8>>,
     /// 最近一次通过的 TOTP 时间步，防止同一个验证码被重放
     pub totp_last: Arc<std::sync::Mutex<i64>>,
     /// 日志根目录，用于控制台的日志查看
@@ -114,14 +111,8 @@ async fn security_headers(req: Request, next: Next) -> Response {
     res
 }
 
-/// 校验请求是否被允许。
-///
-/// 配了密码就校验登录会话；没配密码时只信任回环地址——
-/// 家用场景下管理面本来就不该暴露到局域网。
+/// 校验请求是否被允许：必须有登录会话。
 fn authorized(state: &AdminState, headers: &HeaderMap) -> bool {
-    if state.password.is_none() {
-        return true;
-    }
     let Some(token) = bearer(headers) else {
         return false;
     };
@@ -150,20 +141,28 @@ const LOGIN_WINDOW: i64 = 600;
 /// TOTP 时间步长（秒）
 const TOTP_STEP: i64 = 30;
 
-/// 登录来源。优先用反代写入的 `X-Real-IP`（客户端无法伪造），
-/// 其次取 `X-Forwarded-For` 最后一跳；直连时没有这些头，按局域网处理。
-fn source_ip(headers: &HeaderMap) -> Option<IpAddr> {
-    headers
-        .get("x-real-ip")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.trim().parse().ok())
-        .or_else(|| {
-            headers
-                .get("x-forwarded-for")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.rsplit(',').next())
-                .and_then(|v| v.trim().parse().ok())
-        })
+/// 登录来源。按系统设置中「真实 IP」的头部顺序（`real_ip.header_priority`）依次尝试，
+/// 反代会用还原后的客户端 IP 覆盖这些头；单个头含逗号时取最后一跳。
+/// 取不到时说明是本机/局域网直连，按局域网处理。
+fn source_ip(real_ip: &RealIpConfig, headers: &HeaderMap) -> Option<IpAddr> {
+    let names = if real_ip.header_priority.is_empty() {
+        homewaf_config::default_real_ip_headers()
+    } else {
+        real_ip.header_priority.clone()
+    };
+    for name in &names {
+        let Some(value) = headers.get(name.as_str()).and_then(|v| v.to_str().ok()) else {
+            continue;
+        };
+        if let Some(ip) = value
+            .rsplit(',')
+            .next()
+            .and_then(|v| v.trim().parse::<IpAddr>().ok())
+        {
+            return Some(ip);
+        }
+    }
+    None
 }
 
 /// 是否属于局域网/回环。取不到来源时按局域网处理（只可能是本机直连）。
@@ -185,10 +184,8 @@ fn is_lan(ip: Option<IpAddr>) -> bool {
     }
 }
 
-fn client_key(headers: &HeaderMap) -> String {
-    source_ip(headers)
-        .map(|ip| ip.to_string())
-        .unwrap_or_else(|| "direct".to_string())
+fn client_key(real_ip: &RealIpConfig, headers: &HeaderMap, peer: IpAddr) -> String {
+    source_ip(real_ip, headers).unwrap_or(peer).to_string()
 }
 
 /// 解析 base32 编码的 TOTP 密钥（兼容空格、连字符与补位 `=`）。
@@ -227,10 +224,7 @@ fn totp_code(secret: &[u8], counter: u64) -> u32 {
 }
 
 /// 校验 TOTP：允许前后各一个时间步的时钟偏差，且同一时间步只能通过一次。
-fn verify_totp(state: &AdminState, code: &str, now: i64) -> bool {
-    let Some(secret) = state.totp.as_deref() else {
-        return true;
-    };
+fn verify_totp(secret: &[u8], code: &str, now: i64, last: &std::sync::Mutex<i64>) -> bool {
     let code = code.trim();
     if code.len() != 6 || !code.bytes().all(|b| b.is_ascii_digit()) {
         return false;
@@ -244,7 +238,7 @@ fn verify_totp(state: &AdminState, code: &str, now: i64) -> bool {
         return false;
     };
     let counter = step + offset;
-    let Ok(mut last) = state.totp_last.lock() else {
+    let Ok(mut last) = last.lock() else {
         return false;
     };
     if counter <= *last {
@@ -289,36 +283,273 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+// ============================================================
+// 管理员凭据（保存在 SQLite settings 表，默认 admin/admin）
+// ============================================================
+
+const ADMIN_AUTH_KEY: &str = "admin_auth";
+const DEFAULT_ADMIN_USER: &str = "admin";
+const DEFAULT_ADMIN_PASSWORD: &str = "admin";
+const PBKDF2_ITER: u32 = 120_000;
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct AdminAuth {
+    username: String,
+    /// 存储格式：pbkdf2$<迭代数>$<salt hex>$<hash hex>
+    password_hash: String,
+    /// TOTP 密钥（base32）。`totp_enabled=false` 时只是待绑定的临时密钥
+    totp_secret: Option<String>,
+    totp_enabled: bool,
+    /// 仍在使用初始密码，用于首次登录引导
+    must_change_password: bool,
+}
+
+impl AdminAuth {
+    fn default_admin() -> Self {
+        Self {
+            username: DEFAULT_ADMIN_USER.to_string(),
+            password_hash: hash_password(DEFAULT_ADMIN_PASSWORD, &random_bytes(16)),
+            totp_secret: None,
+            totp_enabled: false,
+            must_change_password: true,
+        }
+    }
+}
+
+fn random_bytes(len: usize) -> Vec<u8> {
+    use ring::rand::{SecureRandom, SystemRandom};
+    let mut buf = vec![0u8; len];
+    SystemRandom::new()
+        .fill(&mut buf)
+        .expect("系统随机数不可用");
+    buf
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+        .collect()
+}
+
+fn hash_password(password: &str, salt: &[u8]) -> String {
+    let mut out = [0u8; 32];
+    ring::pbkdf2::derive(
+        ring::pbkdf2::PBKDF2_HMAC_SHA256,
+        std::num::NonZeroU32::new(PBKDF2_ITER).expect("迭代数非零"),
+        salt,
+        password.as_bytes(),
+        &mut out,
+    );
+    format!(
+        "pbkdf2${PBKDF2_ITER}${}${}",
+        hex_encode(salt),
+        hex_encode(&out)
+    )
+}
+
+fn verify_password(stored: &str, password: &str) -> bool {
+    let mut parts = stored.split('$');
+    if parts.next() != Some("pbkdf2") {
+        return false;
+    }
+    let Some(iter) = parts
+        .next()
+        .and_then(|v| v.parse::<u32>().ok())
+        .and_then(std::num::NonZeroU32::new)
+    else {
+        return false;
+    };
+    let Some(salt) = parts.next().and_then(hex_decode) else {
+        return false;
+    };
+    let Some(expected) = parts.next().and_then(hex_decode) else {
+        return false;
+    };
+    let mut out = vec![0u8; expected.len()];
+    ring::pbkdf2::derive(
+        ring::pbkdf2::PBKDF2_HMAC_SHA256,
+        iter,
+        &salt,
+        password.as_bytes(),
+        &mut out,
+    );
+    ct_eq(&expected, &out)
+}
+
+/// 读管理员凭据；首次运行时创建 admin/admin 并落库，保证后续能改密码。
+fn load_admin_auth(store: &Store) -> AdminAuth {
+    match store.get_setting::<AdminAuth>(ADMIN_AUTH_KEY) {
+        Ok(Some(auth)) => auth,
+        Ok(None) => {
+            let auth = AdminAuth::default_admin();
+            if let Err(e) = save_admin_auth(store, &auth) {
+                tracing::error!(error = %e, "初始化管理员凭据失败");
+            }
+            auth
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "读取管理员凭据失败，本次回退到初始账号");
+            AdminAuth::default_admin()
+        }
+    }
+}
+
+fn save_admin_auth(store: &Store, auth: &AdminAuth) -> Result<(), String> {
+    store
+        .set_setting(ADMIN_AUTH_KEY, auth, homewaf_acl::now_unix())
+        .map_err(|e| e.to_string())
+}
+
+fn base32_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+    let mut out = String::with_capacity(bytes.len().div_ceil(5) * 8);
+    let mut buf: u32 = 0;
+    let mut bits = 0u32;
+    for &b in bytes {
+        buf = (buf << 8) | b as u32;
+        bits += 8;
+        while bits >= 5 {
+            bits -= 5;
+            out.push(ALPHABET[((buf >> bits) & 0x1f) as usize] as char);
+        }
+    }
+    if bits > 0 {
+        out.push(ALPHABET[((buf << (5 - bits)) & 0x1f) as usize] as char);
+    }
+    out
+}
+
+fn new_totp_secret() -> String {
+    base32_encode(&random_bytes(20))
+}
+
+fn otpauth_uri(username: &str, secret: &str) -> String {
+    format!(
+        "otpauth://totp/HomeWAF:{username}?secret={secret}&issuer=HomeWAF&algorithm=SHA1&digits=6&period=30"
+    )
+}
+
 #[derive(Deserialize)]
 struct LoginBody {
+    #[serde(default)]
+    username: String,
     password: String,
-    /// 公网访问必填；局域网可留空
+    /// 已绑定动态口令时必填（公网）；未绑定时填入即为绑定确认
     #[serde(default)]
     totp: String,
+    /// 局域网可跳过首次绑定，公网不允许
+    #[serde(default)]
+    skip_bind: bool,
 }
 
 #[derive(Serialize)]
 struct LoginReply {
     token: String,
     expires_in: i64,
+    #[serde(skip_serializing_if = "is_false")]
+    must_change_password: bool,
 }
 
-/// 管理面登录：用密码换取会话令牌，浏览器不再保存静态密钥。
+fn is_false(v: &bool) -> bool {
+    !*v
+}
+
+#[derive(Serialize)]
+struct BindReply {
+    must_bind_totp: bool,
+    username: String,
+    otpauth: String,
+    secret: String,
+}
+
+fn text(status: StatusCode, msg: impl Into<String>) -> Response {
+    (status, msg.into()).into_response()
+}
+
+fn issue_session(ctx: &AdminState, now: i64) -> String {
+    let token = random_token();
+    if let Ok(mut sessions) = ctx.sessions.lock() {
+        sessions.retain(|_, exp| *exp > now);
+        sessions.insert(token.clone(), now + SESSION_TTL);
+    }
+    token
+}
+
+enum BindStep {
+    /// 需要先扫码：把二维码信息返回前端
+    Pending(Response),
+    /// 密码/验证码错误或公网不允许跳过
+    Failed(Response),
+    Done,
+}
+
+/// 未绑定动态口令时的处理：发二维码等扫码，或校验绑定码后正式启用。
+fn bind_step(ctx: &AdminState, auth: &mut AdminAuth, body: &LoginBody, lan: bool, now: i64) -> BindStep {
+    if body.skip_bind {
+        if !lan {
+            return BindStep::Failed(text(
+                StatusCode::FORBIDDEN,
+                "公网访问必须先绑定动态口令才能登录",
+            ));
+        }
+        return BindStep::Done;
+    }
+
+    if body.totp.trim().is_empty() {
+        if auth.totp_secret.is_none() {
+            auth.totp_secret = Some(new_totp_secret());
+            if let Err(e) = save_admin_auth(&ctx.store, auth) {
+                return BindStep::Failed(internal(e).into_response());
+            }
+        }
+        let secret = auth.totp_secret.clone().unwrap_or_default();
+        return BindStep::Pending(
+            Json(BindReply {
+                must_bind_totp: true,
+                username: auth.username.clone(),
+                otpauth: otpauth_uri(&auth.username, &secret),
+                secret,
+            })
+            .into_response(),
+        );
+    }
+
+    let Some(secret) = auth.totp_secret.as_deref().and_then(decode_totp_secret) else {
+        auth.totp_secret = Some(new_totp_secret());
+        let _ = save_admin_auth(&ctx.store, auth);
+        return BindStep::Failed(text(StatusCode::CONFLICT, "请先扫码获取密钥后再提交验证码"));
+    };
+    if !verify_totp(&secret, &body.totp, now, &ctx.totp_last) {
+        return BindStep::Failed(text(StatusCode::UNAUTHORIZED, "动态验证码错误或已过期"));
+    }
+    auth.totp_enabled = true;
+    if let Err(e) = save_admin_auth(&ctx.store, auth) {
+        return BindStep::Failed(internal(e).into_response());
+    }
+    BindStep::Done
+}
+
+/// 管理面登录：账号密码换会话；未绑定动态口令时先引导扫码绑定。
 async fn login(
     State(ctx): State<Ctx>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(body): Json<LoginBody>,
 ) -> Response {
-    let Some(expected) = ctx.password.as_deref() else {
-        return (
-            StatusCode::BAD_REQUEST,
-            "服务端未设置管理密码（HOMEWAF_ADMIN_PASSWORD），无需登录",
-        )
-            .into_response();
-    };
-
     let now = homewaf_acl::now_unix();
-    let src = client_key(&headers);
+    let real_ip = ctx.shared.load_full().real_ip.clone();
+    // 有转发头按系统设置的头序还原，没有则用 TCP 直连地址；据此判断是否公网
+    let ip = source_ip(&real_ip, &headers).unwrap_or(peer.ip());
+    let lan = is_lan(Some(ip));
+    let src = client_key(&real_ip, &headers, peer.ip());
     if let Some(wait) = login_blocked(&ctx, &src, now) {
         let retry = wait
             .max(1)
@@ -334,32 +565,53 @@ async fn login(
         return res;
     }
 
-    if !ct_eq(expected.as_bytes(), body.password.as_bytes()) {
+    let mut auth = load_admin_auth(&ctx.store);
+    let username = if body.username.trim().is_empty() {
+        auth.username.clone()
+    } else {
+        body.username.trim().to_string()
+    };
+    if !ct_eq(auth.username.as_bytes(), username.as_bytes())
+        || !verify_password(&auth.password_hash, &body.password)
+    {
         record_login_failure(&ctx, &src, now);
-        return (StatusCode::UNAUTHORIZED, "密码错误").into_response();
+        return text(StatusCode::UNAUTHORIZED, "账号或密码错误");
     }
 
-    // 公网来源必须再过一层 TOTP；局域网只校验密码
-    if !is_lan(source_ip(&headers)) && !verify_totp(&ctx, &body.totp, now) {
-        record_login_failure(&ctx, &src, now);
-        return (
-            StatusCode::UNAUTHORIZED,
-            "动态验证码错误或已过期，公网访问需要二次验证",
-        )
-            .into_response();
+    if auth.totp_enabled {
+        // 已绑定：公网必须带有效动态码；局域网只校验密码，便于应急登录
+        if !lan {
+            let Some(secret) = auth.totp_secret.as_deref().and_then(decode_totp_secret) else {
+                return internal("动态口令密钥损坏，请在控制台中重新绑定").into_response();
+            };
+            if body.totp.trim().is_empty() {
+                // 没填不算一次失败，只是提示前端补填
+                return text(StatusCode::UNAUTHORIZED, "公网登录需要动态验证码");
+            }
+            if !verify_totp(&secret, &body.totp, now, &ctx.totp_last) {
+                record_login_failure(&ctx, &src, now);
+                return text(StatusCode::UNAUTHORIZED, "动态验证码错误或已过期");
+            }
+        }
+    } else {
+        match bind_step(&ctx, &mut auth, &body, lan, now) {
+            BindStep::Pending(res) => return res,
+            BindStep::Failed(res) => {
+                record_login_failure(&ctx, &src, now);
+                return res;
+            }
+            BindStep::Done => {}
+        }
     }
 
     if let Ok(mut fails) = ctx.login_failures.lock() {
         fails.remove(&src);
     }
-    let token = random_token();
-    if let Ok(mut sessions) = ctx.sessions.lock() {
-        sessions.retain(|_, exp| *exp > now);
-        sessions.insert(token.clone(), now + SESSION_TTL);
-    }
+    let token = issue_session(&ctx, now);
     Json(LoginReply {
         token,
         expires_in: SESSION_TTL,
+        must_change_password: auth.must_change_password,
     })
     .into_response()
 }
@@ -377,13 +629,156 @@ async fn logout(State(ctx): State<Ctx>, headers: HeaderMap) -> Response {
     StatusCode::NO_CONTENT.into_response()
 }
 
+#[derive(Serialize)]
+struct AuthStatus {
+    username: String,
+    totp_enabled: bool,
+    must_change_password: bool,
+}
+
+/// 当前登录态与引导状态，控制台据此展示「改密码 / 绑定动态口令」提示。
+async fn auth_status(State(ctx): State<Ctx>, headers: HeaderMap) -> Response {
+    if !authorized(&ctx, &headers) {
+        return unauthorized();
+    }
+    let auth = load_admin_auth(&ctx.store);
+    Json(AuthStatus {
+        username: auth.username.clone(),
+        totp_enabled: auth.totp_enabled,
+        must_change_password: auth.must_change_password,
+    })
+    .into_response()
+}
+
+#[derive(Deserialize)]
+struct PasswordBody {
+    old: String,
+    new_password: String,
+}
+
+/// 修改管理密码；改完让其它设备上的会话失效，只保留当前浏览器。
+async fn change_password(
+    State(ctx): State<Ctx>,
+    headers: HeaderMap,
+    Json(body): Json<PasswordBody>,
+) -> Response {
+    if !authorized(&ctx, &headers) {
+        return unauthorized();
+    }
+    let mut auth = load_admin_auth(&ctx.store);
+    if !verify_password(&auth.password_hash, &body.old) {
+        return text(StatusCode::UNAUTHORIZED, "当前密码错误");
+    }
+    let new_password = body.new_password.trim();
+    if new_password.chars().count() < 8 {
+        return text(StatusCode::BAD_REQUEST, "新密码至少 8 位");
+    }
+    if new_password == DEFAULT_ADMIN_PASSWORD {
+        return text(StatusCode::BAD_REQUEST, "不能继续使用初始密码");
+    }
+    auth.password_hash = hash_password(new_password, &random_bytes(16));
+    auth.must_change_password = false;
+    if let Err(e) = save_admin_auth(&ctx.store, &auth) {
+        return internal(e).into_response();
+    }
+    if let Some(token) = bearer(&headers).map(str::to_string) {
+        if let Ok(mut sessions) = ctx.sessions.lock() {
+            sessions.clear();
+            sessions.insert(token, homewaf_acl::now_unix() + SESSION_TTL);
+        }
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
+#[derive(Serialize)]
+struct TotpStartReply {
+    otpauth: String,
+    secret: String,
+}
+
+/// 已登录用户补绑定动态口令：生成待绑定密钥并返回二维码内容。
+async fn totp_start(State(ctx): State<Ctx>, headers: HeaderMap) -> Response {
+    if !authorized(&ctx, &headers) {
+        return unauthorized();
+    }
+    let mut auth = load_admin_auth(&ctx.store);
+    if auth.totp_enabled {
+        return text(StatusCode::CONFLICT, "动态口令已绑定");
+    }
+    if auth.totp_secret.is_none() {
+        auth.totp_secret = Some(new_totp_secret());
+        if let Err(e) = save_admin_auth(&ctx.store, &auth) {
+            return internal(e).into_response();
+        }
+    }
+    let secret = auth.totp_secret.clone().unwrap_or_default();
+    Json(TotpStartReply {
+        otpauth: otpauth_uri(&auth.username, &secret),
+        secret,
+    })
+    .into_response()
+}
+
+#[derive(Deserialize)]
+struct TotpConfirmBody {
+    totp: String,
+}
+
+/// 校验一次动态码，通过后 TOTP 才真正启用。
+async fn totp_confirm(
+    State(ctx): State<Ctx>,
+    headers: HeaderMap,
+    Json(body): Json<TotpConfirmBody>,
+) -> Response {
+    if !authorized(&ctx, &headers) {
+        return unauthorized();
+    }
+    let mut auth = load_admin_auth(&ctx.store);
+    if auth.totp_enabled {
+        return text(StatusCode::CONFLICT, "动态口令已绑定");
+    }
+    let Some(secret) = auth.totp_secret.as_deref().and_then(decode_totp_secret) else {
+        return text(StatusCode::CONFLICT, "请先获取二维码后再提交验证码");
+    };
+    if !verify_totp(
+        &secret,
+        &body.totp,
+        homewaf_acl::now_unix(),
+        &ctx.totp_last,
+    ) {
+        return text(StatusCode::UNAUTHORIZED, "动态验证码错误或已过期");
+    }
+    auth.totp_enabled = true;
+    if let Err(e) = save_admin_auth(&ctx.store, &auth) {
+        return internal(e).into_response();
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// 控制台内嵌的二维码生成库（离线可用，不走外部 CDN）。
+async fn qrcode_js() -> Response {
+    (
+        [(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        include_str!("../static/qrcode.js"),
+    )
+        .into_response()
+}
+
 /// 构造路由。
 pub fn router(state: Ctx) -> Router {
     Router::new()
         .route("/", get(index))
+        .route("/qrcode.js", get(qrcode_js))
         // 登录/退出：登录本身不需要认证，其余接口都要有效会话
         .route("/api/login", post(login))
         .route("/api/logout", post(logout))
+        .route("/api/auth", get(auth_status))
+        .route("/api/auth/password", post(change_password))
+        .route("/api/totp/start", post(totp_start))
+        .route("/api/totp/confirm", post(totp_confirm))
         .route("/api/stats", get(stats))
         .route("/api/stats/geo", get(geo_stats))
         .route("/api/security", get(security))
@@ -482,28 +877,16 @@ pub fn router(state: Ctx) -> Router {
 
 /// 启动管理服务（独立线程 + 独立 tokio runtime）。
 pub fn spawn(state: AdminState, listen: String) -> anyhow::Result<()> {
-    // 没配管理密码时默认只允许监听回环，避免管理面裸奔在局域网。
-    // 需要从其它设备直接打开控制台时，显式设置 HOMEWAF_ADMIN_INSECURE=1 放行，
-    // 此时启动日志会打出告警——这是用户明确选择的取舍。
-    if state.password.is_none() {
-        let addr: SocketAddr = listen
-            .parse()
-            .map_err(|e| anyhow::anyhow!("管理面监听地址非法：{listen}（{e}）"))?;
-        if !addr.ip().is_loopback() {
-            let insecure = std::env::var("HOMEWAF_ADMIN_INSECURE")
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false);
-            if !insecure {
-                anyhow::bail!(
-                    "管理面监听 {listen} 不是回环地址，但未设置管理密码。\
-                     请设置环境变量 HOMEWAF_ADMIN_PASSWORD，或设置 HOMEWAF_ADMIN_INSECURE=1 明确接受无认证暴露"
-                );
-            }
-            tracing::warn!(
-                listen = %listen,
-                "管理面将无认证对外监听（HOMEWAF_ADMIN_INSECURE=1），请确保仅在可信网络内使用"
-            );
-        }
+    // 管理面始终需要登录（初始账号 admin/admin，存 SQLite 并可在线修改）。
+    // 非回环监听时只做提醒：首次登录会引导改密码与绑定动态口令。
+    let addr: SocketAddr = listen
+        .parse()
+        .map_err(|e| anyhow::anyhow!("管理面监听地址非法：{listen}（{e}）"))?;
+    if !addr.ip().is_loopback() {
+        tracing::warn!(
+            listen = %listen,
+            "管理面在非回环地址监听，若仍在用初始账号 admin/admin，请登录后立即修改密码并绑定动态口令"
+        );
     }
 
     // 启动前加载 GeoIP。失败只告警，不影响控制台其它功能
@@ -542,7 +925,13 @@ pub fn spawn(state: AdminState, listen: String) -> anyhow::Result<()> {
                     }
                 };
                 tracing::info!(listen, "控制台已启动");
-                if let Err(e) = axum::serve(listener, router(ctx)).await {
+                // 需要 TCP 直连地址：没有转发头时用它判断来源是否公网，并作为登录限速的 key
+                if let Err(e) = axum::serve(
+                    listener,
+                    router(ctx).into_make_service_with_connect_info::<SocketAddr>(),
+                )
+                .await
+                {
                     tracing::error!(error = %e, "管理面退出");
                 }
             });
@@ -5123,10 +5512,8 @@ mod tests {
             metrics: Arc::new(TrafficMetrics::new()),
             geoip: Arc::new(geoip::GeoIp::new()),
             allow_regex: false,
-            password: None,
             sessions: Default::default(),
             login_failures: Default::default(),
-            totp: None,
             totp_last: Default::default(),
             log_dir: std::env::temp_dir(),
             data_dir: std::env::temp_dir(),
@@ -5180,23 +5567,15 @@ mod tests {
     // ============================================================
 
     #[test]
-    fn auth_without_password_allows() {
-        assert!(authorized(&state(), &HeaderMap::new()));
-    }
-
-    #[test]
-    fn auth_with_password_requires_session() {
-        let mut st = state();
-        st.password = Some("secret".to_string());
-
+    fn auth_always_requires_session() {
+        let st = state();
         assert!(!authorized(&st, &HeaderMap::new()), "无会话应拒绝");
 
-        let mut h = HeaderMap::new();
-        h.insert("authorization", "Bearer secret".parse().unwrap());
-        assert!(!authorized(&st, &h), "密码本身不能当令牌");
-
         let expiry = homewaf_acl::now_unix() + SESSION_TTL;
-        st.sessions.lock().unwrap().insert("sess-1".to_string(), expiry);
+        st.sessions
+            .lock()
+            .unwrap()
+            .insert("sess-1".to_string(), expiry);
 
         let mut h = HeaderMap::new();
         h.insert("authorization", "Bearer sess-1".parse().unwrap());
@@ -5205,6 +5584,40 @@ mod tests {
         *st.sessions.lock().unwrap().get_mut("sess-1").unwrap() =
             homewaf_acl::now_unix() - 1;
         assert!(!authorized(&st, &h), "过期会话应拒绝");
+    }
+
+    #[test]
+    fn default_admin_credentials_work() {
+        let auth = AdminAuth::default_admin();
+        assert_eq!(auth.username, "admin");
+        assert!(auth.must_change_password);
+        assert!(!auth.totp_enabled);
+        assert!(verify_password(&auth.password_hash, "admin"));
+        assert!(!verify_password(&auth.password_hash, "admin2"));
+        assert!(!verify_password("garbage", "admin"));
+    }
+
+    #[test]
+    fn password_hash_roundtrip() {
+        let stored = hash_password("s3cret-pass", &random_bytes(16));
+        assert!(verify_password(&stored, "s3cret-pass"));
+        assert!(!verify_password(&stored, "s3cret-pas"));
+        // 同一密码不同 salt 应得到不同哈希
+        assert_ne!(stored, hash_password("s3cret-pass", &random_bytes(16)));
+    }
+
+    #[test]
+    fn admin_auth_persists_to_store() {
+        let st = state();
+        let auth = load_admin_auth(&st.store);
+        assert_eq!(auth.username, DEFAULT_ADMIN_USER);
+        let loaded = store_get_auth(&st.store);
+        assert_eq!(loaded.username, DEFAULT_ADMIN_USER);
+        assert!(verify_password(&loaded.password_hash, DEFAULT_ADMIN_PASSWORD));
+    }
+
+    fn store_get_auth(store: &Store) -> AdminAuth {
+        store.get_setting::<AdminAuth>(ADMIN_AUTH_KEY).unwrap().unwrap()
     }
 
     #[test]
@@ -5242,30 +5655,51 @@ mod tests {
 
     #[test]
     fn totp_rejects_replay_and_wrong_code() {
-        let mut st = state();
-        assert!(verify_totp(&st, "", 1_700_000_000), "未配置 TOTP 时放行");
-
-        st.totp = Some(b"12345678901234567890".to_vec());
+        let secret = b"12345678901234567890".to_vec();
+        let last: std::sync::Mutex<i64> = Default::default();
         let now = 1_700_000_003;
-        let code = format!(
-            "{:06}",
-            totp_code(st.totp.as_deref().unwrap(), (now / TOTP_STEP) as u64)
+        let code = format!("{:06}", totp_code(&secret, (now / TOTP_STEP) as u64));
+        assert!(verify_totp(&secret, &code, now, &last));
+        assert!(
+            !verify_totp(&secret, &code, now, &last),
+            "同一时间步不能重放"
         );
-        assert!(verify_totp(&st, &code, now));
-        assert!(!verify_totp(&st, &code, now), "同一时间步不能重放");
-        assert!(!verify_totp(&st, "abcdef", now + 60));
+        assert!(!verify_totp(&secret, "abcdef", now + 60, &last));
     }
 
     #[test]
-    fn source_ip_prefers_real_ip_header() {
+    fn base32_encode_roundtrip() {
+        let raw = vec![0x01, 0x02, 0x03, 0xff, 0xfe];
+        let encoded = base32_encode(&raw);
+        assert_eq!(decode_totp_secret(&encoded).unwrap(), raw);
+
+        let secret = new_totp_secret();
+        assert_eq!(secret.len(), 32, "20 字节应编码成 32 个 base32 字符");
+        assert_eq!(decode_totp_secret(&secret).unwrap().len(), 20);
+    }
+
+    #[test]
+    fn source_ip_follows_configured_header_priority() {
+        // 默认头序：CF-Connecting-IP > True-Client-IP > X-Real-IP > X-Forwarded-For
+        let cfg = RealIpConfig::default();
         let mut h = HeaderMap::new();
         h.insert("x-real-ip", "8.8.8.8".parse().unwrap());
         h.insert("x-forwarded-for", "10.0.0.1, 9.9.9.9".parse().unwrap());
-        assert_eq!(source_ip(&h), Some("8.8.8.8".parse().unwrap()));
+        assert_eq!(source_ip(&cfg, &h), Some("8.8.8.8".parse().unwrap()));
 
         let mut h = HeaderMap::new();
         h.insert("x-forwarded-for", "10.0.0.1, 203.0.113.9".parse().unwrap());
-        assert_eq!(source_ip(&h), Some("203.0.113.9".parse().unwrap()));
+        assert_eq!(source_ip(&cfg, &h), Some("203.0.113.9".parse().unwrap()));
+
+        // 系统设置里换成自定义头后，admin 也跟着换
+        let cfg = RealIpConfig {
+            header_priority: vec!["X-Company-Real-IP".to_string()],
+            ..Default::default()
+        };
+        let mut h = HeaderMap::new();
+        h.insert("x-real-ip", "8.8.8.8".parse().unwrap());
+        h.insert("x-company-real-ip", "198.51.100.7".parse().unwrap());
+        assert_eq!(source_ip(&cfg, &h), Some("198.51.100.7".parse().unwrap()));
     }
 
     // ============================================================

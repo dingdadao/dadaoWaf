@@ -451,22 +451,7 @@ fn cmd_serve(
     // 启动控制台（独立线程，不阻塞代理）
     let admin_addr = shared.load_full().server.admin.listen.clone();
     if !admin_addr.is_empty() {
-        // 管理面用登录密码认证：控制台输入密码换取会话令牌，不在浏览器保存静态密钥
-        let password = std::env::var("HOMEWAF_ADMIN_PASSWORD")
-            .ok()
-            .filter(|p| !p.trim().is_empty());
-        // 公网登录的二次验证（TOTP，base32 密钥）。局域网登录不要求
-        let totp = std::env::var("HOMEWAF_ADMIN_TOTP_SECRET")
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .and_then(|s| match homewaf_admin::decode_totp_secret(&s) {
-                Some(v) => Some(v),
-                None => {
-                    tracing::warn!("HOMEWAF_ADMIN_TOTP_SECRET 不是合法 base32，已忽略 TOTP");
-                    None
-                }
-            });
+        // 管理面账号密码与动态口令都存 SQLite：默认 admin/admin，首次登录引导修改与绑定
         let admin_state = homewaf_admin::AdminState {
             store: store.clone(),
             shared: shared.clone(),
@@ -474,10 +459,8 @@ fn cmd_serve(
             metrics: metrics.clone(),
             geoip: std::sync::Arc::new(homewaf_admin::geoip::GeoIp::new()),
             allow_regex,
-            password,
             sessions: Default::default(),
             login_failures: Default::default(),
-            totp,
             totp_last: Default::default(),
             log_dir: std::path::PathBuf::from(&logging_cfg.dir),
             data_dir: std::path::Path::new(db)
