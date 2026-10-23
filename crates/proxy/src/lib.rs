@@ -23,7 +23,7 @@ pub use challenge::{ChallengeService, Solution, CHALLENGE_PATH, COOKIE_NAME};
 pub use custom_rule::{evaluate as evaluate_custom_rules, CustomDecision, RuleRequest};
 pub use headers::ForwardedCtx;
 pub use metrics::{
-    BucketSnapshot, Count as TrafficCount, DashboardData as TrafficDashboard,
+    BucketSnapshot, Count as TrafficCount, DashboardData as TrafficDashboard, HistoricalBucket,
     Point as TrafficPoint, TrafficMetrics, TrafficSample,
 };
 pub use policy::{EffectivePolicy, PolicySet};

@@ -2024,6 +2024,7 @@ pub fn run(state: SharedState, settings: ProxySettings) -> anyhow::Result<()> {
                         unique_visitors: b.unique_visitors,
                         ips: b.ips,
                         visitors: b.visitors,
+                        detail: b.detail,
                     })
                     .collect();
                 if let Err(e) = store.save_traffic(&rows) {

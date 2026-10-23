@@ -214,6 +214,23 @@ pub struct TrafficBucketRow {
     pub ips: Vec<u128>,
     /// (IP, UA) 哈希，用于日报独立访客。
     pub visitors: Vec<u64>,
+    /// 明细快照 JSON（状态码分布、Top、来源 IP）。旧库行为空字符串。
+    pub detail: String,
+}
+
+/// 一条分钟级聚合的明细行，供控制台把历史与当前进程内存合并。
+#[derive(Debug, Clone, Default)]
+pub struct TrafficDetailRow {
+    pub minute: i64,
+    pub app: String,
+    pub requests: u64,
+    pub pv: u64,
+    pub blocked: u64,
+    pub status_4xx: u64,
+    pub status_5xx: u64,
+    pub unique_ips: u64,
+    pub unique_visitors: u64,
+    pub detail: String,
 }
 
 /// 一段时间的流量汇总。
@@ -416,6 +433,8 @@ impl Store {
                 status_5xx      INTEGER NOT NULL,
                 unique_ips      INTEGER NOT NULL,
                 unique_visitors INTEGER NOT NULL,
+                -- 明细快照（状态码分布、Top、来源 IP），用于重启后补齐控制台 24 小时视图
+                detail          TEXT NOT NULL DEFAULT '',
                 PRIMARY KEY (minute, app)
             );
             CREATE INDEX IF NOT EXISTS idx_traffic_minute ON traffic_minutes(minute);
@@ -443,6 +462,8 @@ impl Store {
         ] {
             ensure_column(&conn, "events", column, decl);
         }
+        // 流量分钟表同理：detail 是后加的列，老库必须能平滑升级。
+        ensure_column(&conn, "traffic_minutes", "detail", "TEXT NOT NULL DEFAULT ''");
         Ok(())
     }
 
@@ -974,8 +995,8 @@ impl Store {
                 r#"
                 INSERT INTO traffic_minutes
                     (minute, app, requests, pv, blocked, status_4xx, status_5xx,
-                     unique_ips, unique_visitors)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                     unique_ips, unique_visitors, detail)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                 ON CONFLICT(minute, app) DO UPDATE SET
                     requests        = excluded.requests,
                     pv              = excluded.pv,
@@ -983,7 +1004,8 @@ impl Store {
                     status_4xx      = excluded.status_4xx,
                     status_5xx      = excluded.status_5xx,
                     unique_ips      = excluded.unique_ips,
-                    unique_visitors = excluded.unique_visitors
+                    unique_visitors = excluded.unique_visitors,
+                    detail          = excluded.detail
                 "#,
                 params![
                     row.minute,
@@ -995,6 +1017,7 @@ impl Store {
                     row.status_5xx as i64,
                     row.unique_ips as i64,
                     row.unique_visitors as i64,
+                    row.detail,
                 ],
             )?;
 
@@ -1062,6 +1085,48 @@ impl Store {
             status_5xx: status_5xx as u64,
             unique_ips: distinct("ip")?,
             unique_visitors: distinct("visitor")?,
+        })
+    }
+
+    /// 读取分钟明细，用于控制台把「重启前已落库的分钟」与「当前进程内存」合并。
+    ///
+    /// 只返回聚合与明细 JSON，不返回 `traffic_unique` 的哈希集合——合并时
+    /// 明细里已经带了来源 IP 与访客哈希。
+    pub fn traffic_details(
+        &self,
+        since: i64,
+        until: i64,
+        app: Option<&str>,
+    ) -> Result<Vec<TrafficDetailRow>, StoreError> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT minute, app, requests, pv, blocked,
+                       status_4xx, status_5xx, unique_ips, unique_visitors, detail
+                FROM traffic_minutes
+                WHERE minute >= ?1 AND minute < ?2 AND (?3 IS NULL OR app = ?3)
+                ORDER BY minute
+                "#,
+            )?;
+            let rows = stmt.query_map(params![since, until, app], |r| {
+                Ok(TrafficDetailRow {
+                    minute: r.get(0)?,
+                    app: r.get(1)?,
+                    requests: r.get::<_, i64>(2)? as u64,
+                    pv: r.get::<_, i64>(3)? as u64,
+                    blocked: r.get::<_, i64>(4)? as u64,
+                    status_4xx: r.get::<_, i64>(5)? as u64,
+                    status_5xx: r.get::<_, i64>(6)? as u64,
+                    unique_ips: r.get::<_, i64>(7)? as u64,
+                    unique_visitors: r.get::<_, i64>(8)? as u64,
+                    detail: r.get(9)?,
+                })
+            })?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
         })
     }
 
@@ -1966,6 +2031,7 @@ mod tests {
             unique_visitors: 2,
             ips: vec![1, 2],
             visitors: vec![11, 12],
+            detail: String::new(),
         }
     }
 
@@ -2013,6 +2079,28 @@ mod tests {
         let days = s.traffic_days(minute - 86_400, 10).unwrap();
         assert_eq!(days.len(), 1);
         assert_eq!(days[0].requests, 18);
+    }
+
+    #[test]
+    fn traffic_details_round_trip() {
+        let s = store();
+        let minute = NOW - NOW.rem_euclid(60);
+        let mut row = traffic_row(minute, "nas", 10);
+        row.detail = r#"{"statuses":{"200":9,"403":1}}"#.to_string();
+        s.save_traffic(&[row]).unwrap();
+
+        let rows = s.traffic_details(minute, minute + 60, Some("nas")).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].requests, 10);
+        assert_eq!(rows[0].detail, r#"{"statuses":{"200":9,"403":1}}"#);
+
+        // 重复写入同一分钟会覆盖明细，而不是累加
+        let mut again = traffic_row(minute, "nas", 4);
+        again.detail = r#"{"statuses":{"200":4}}"#.to_string();
+        s.save_traffic(&[again]).unwrap();
+        let rows = s.traffic_details(minute, minute + 60, None).unwrap();
+        assert_eq!(rows[0].requests, 4);
+        assert!(rows[0].detail.contains(r#""200":4"#));
     }
 
     #[test]

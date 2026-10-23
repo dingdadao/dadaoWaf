@@ -1964,8 +1964,12 @@ function mapHtml(region, geo, hot) {
     return `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="${r}" class="geo-point${hot ? ' hot' : ''}">`
       + `<title>${p.latitude.toFixed(2)}, ${p.longitude.toFixed(2)} · ${fmtNum(p.count)} 次</title></circle>`;
   }).join('');
+  const internal = geo && geo.available && !geo.resolved_ips && geo.total_ips > 0;
   const note = geo && geo.available === false
-    ? '<div class="map-note">未启用 GeoIP：在「设置 → 地理信息」填写 mmdb 路径</div>' : '';
+    ? '<div class="map-note">未启用 GeoIP：在「设置 → 地理信息」填写 mmdb 路径</div>'
+    : internal
+      ? `<div class="map-note">来源 IP 均为内网 / 保留地址，无法解析归属地（共 ${fmtNum(geo.total_ips)} 个）</div>`
+      : '';
   const badge = geo && geo.available ? `<div class="map-badge">已解析 ${fmtNum(geo.resolved_ips)} 个 IP</div>` : '';
   return `<svg viewBox="0 0 ${cfg.W} ${cfg.H}">${base}${pins}</svg>${note}${badge}`;
 }
@@ -2000,7 +2004,7 @@ async function loadTraffic() {
       { label: 'UV', value: t.uv || 0, sub: '按 IP + UA 去重' },
       { label: '独立 IP', value: t.unique_ips || 0, sub: '含放行与拦截' },
       { label: '拦截次数', value: t.blocked || 0, cls: 'hot', sub: `拦截率 ${fmtPct(req ? t.blocked / req * 100 : 0)}` },
-      { label: '攻击 IP', value: t.attack_ips || 0, cls: 'hot', sub: '被拦截来源去重' },
+      { label: '攻击 IP', value: t.attack_ips || 0, cls: 'hot', sub: t.blocked > 0 && !t.attack_ips ? '历史分钟未记录来源 IP' : '被拦截来源去重' },
       { label: '4xx 率', value: req ? c4 / req * 100 : 0, decimals: 2, suffix: '%', sub: `${fmtNum(c4)} 次客户端错误` },
       { label: '5xx 率', value: req ? c5 / req * 100 : 0, decimals: 2, suffix: '%', sub: `${fmtNum(c5)} 次服务端错误` },
     ]);
@@ -2012,13 +2016,17 @@ async function loadTraffic() {
     ]);
 
     const groups = [
-      { name: '2xx 成功', count: sumStatus('2') },
-      { name: '3xx 跳转', count: sumStatus('3') },
-      { name: '4xx 客户端', count: sumStatus('4') },
-      { name: '5xx 服务端', count: sumStatus('5') },
+      { name: '2xx 成功', count: sumStatus('2'), color: '#3ddc97' },
+      { name: '3xx 跳转', count: sumStatus('3'), color: '#4a9eda' },
+      { name: '4xx 客户端', count: sumStatus('4'), color: '#e3b341' },
+      { name: '5xx 服务端', count: sumStatus('5'), color: '#f06a6a' },
     ].filter(g => g.count > 0);
+    // 状态码明细缺失（旧版本落库的分钟、未写响应）用残差补齐，
+    // 保证环形图合计与「请求次数」一致，不会出现 22 万请求只显示 23 个状态码。
+    const missing = Math.max(0, req - groups.reduce((n, g) => n + g.count, 0));
+    if (missing > 0) groups.push({ name: '其他 / 未记录', count: missing, color: '#6b7785' });
     donut(document.getElementById('traffic-status'), groups,
-      { colors: ['#3ddc97', '#4a9eda', '#e3b341', '#f06a6a'], center: '状态码' });
+      { colors: groups.map(g => g.color), center: '状态码' });
 
     rankList(document.getElementById('top-hosts'), (t.hosts || []).slice(0, 8));
     rankList(document.getElementById('top-paths'), (t.paths || []).slice(0, 8));
@@ -2061,6 +2069,12 @@ function renderGeoList(geo) {
   const el = document.getElementById('traffic-geo-list');
   if (!geo || !geo.available) {
     el.innerHTML = `<div class="empty">${geo && geo.error ? 'GeoIP 加载失败：' + esc(geo.error) : '未启用 GeoIP'}</div>`;
+    return;
+  }
+  if (!geo.resolved_ips) {
+    el.innerHTML = geo.total_ips
+      ? `<div class="empty">来源 IP 均为内网 / 保留地址，无法解析归属地（共 ${fmtNum(geo.total_ips)} 个）</div>`
+      : '<div class="empty">该范围内没有来源 IP</div>';
     return;
   }
   const block = (title, items) => {

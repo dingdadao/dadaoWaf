@@ -79,6 +79,8 @@ pub struct GeoStats {
     pub error: Option<String>,
     /// 实际解析成功的 IP 数
     pub resolved_ips: usize,
+    /// 本次快照的来源 IP 总数（含无法解析的内网 / 保留地址）
+    pub total_ips: usize,
     pub countries: Vec<GeoCount>,
     pub provinces: Vec<GeoCount>,
     pub cities: Vec<GeoCount>,
@@ -215,6 +217,7 @@ impl GeoIp {
             available: status.enabled,
             path: status.path,
             error: status.error,
+            total_ips: ips.len(),
             ..Default::default()
         };
         if !stats.available {

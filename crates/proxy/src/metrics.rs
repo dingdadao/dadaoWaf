@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
 use std::sync::Mutex;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// 指标保留时长：24 小时。
 pub const RETENTION_MINUTES: i64 = 24 * 60;
@@ -107,6 +107,9 @@ struct AppBucket {
     paths: HashMap<String, u32>,
     referer_hosts: HashMap<String, u32>,
     referer_urls: HashMap<String, u32>,
+    /// 旧版本落库行没有明细，只能用分钟级去重计数做近似补齐。
+    legacy_ips: u64,
+    legacy_visitors: u64,
 }
 
 impl AppBucket {
@@ -199,8 +202,25 @@ impl TrafficMetrics {
         }
     }
 
-    /// 聚合一个时间范围的仪表盘数据。
+    // 聚合一个时间范围的仪表盘数据。
     pub fn dashboard(&self, range_secs: i64, app: Option<&str>, now: i64) -> DashboardData {
+        self.dashboard_merged(range_secs, app, now, &[], i64::MAX)
+    }
+
+    /// 合并「已落库的历史分钟」与「当前进程内存」。
+    ///
+    /// 控制台的 24 小时视图必须两项一起算：只看内存，进程重启一次历史就丢了；
+    /// 只看数据库，明细（状态码分布、Top、来源 IP）又对不上请求数。
+    /// `history` 只应包含启动前已落库的分钟（`minute < before_minute`），
+    /// 否则同一分钟会被内存与数据库各算一次。
+    pub fn dashboard_merged(
+        &self,
+        range_secs: i64,
+        app: Option<&str>,
+        now: i64,
+        history: &[HistoricalBucket],
+        before_minute: i64,
+    ) -> DashboardData {
         let range_secs = range_secs.clamp(60, RETENTION_MINUTES * 60);
         let now_minute = now - now.rem_euclid(60);
         let start = now_minute - (range_secs / 60).max(1) * 60 + 60;
@@ -220,6 +240,24 @@ impl TrafficMetrics {
         };
 
         let mut points: HashMap<i64, (u64, u64)> = HashMap::new();
+
+        // 历史分钟（重启前已落库）：与内存桶走同一套聚合，口径自然一致。
+        for row in history {
+            if row.minute < start || row.minute >= before_minute {
+                continue;
+            }
+            if let Some(id) = app {
+                if row.app != id {
+                    continue;
+                }
+            }
+            agg.add(&row.to_bucket());
+            let slot = row.minute - row.minute.rem_euclid(group);
+            let p = points.entry(slot).or_default();
+            p.0 += row.requests;
+            p.1 += row.blocked;
+        }
+
         for bucket in inner.buckets.iter().filter(|b| b.minute >= start) {
             if let Some(id) = app {
                 if let Some(b) = bucket.apps.get(id) {
@@ -310,6 +348,7 @@ impl TrafficMetrics {
                         unique_visitors: v.visitors.len() as u64,
                         ips: v.ips.keys().copied().collect(),
                         visitors: v.visitors.iter().copied().collect(),
+                        detail: detail_of(v),
                     })
                     .collect::<Vec<_>>()
             })
@@ -341,6 +380,8 @@ struct Agg {
     paths: HashMap<String, u32>,
     referer_hosts: HashMap<String, u32>,
     referer_urls: HashMap<String, u32>,
+    legacy_ips: u64,
+    legacy_visitors: u64,
 }
 
 impl Agg {
@@ -348,6 +389,8 @@ impl Agg {
         self.requests += b.requests;
         self.pv += b.pv;
         self.blocked += b.blocked;
+        self.legacy_ips += b.legacy_ips;
+        self.legacy_visitors += b.legacy_visitors;
         for (s, n) in &b.statuses {
             *self.statuses.entry(*s).or_insert(0) += n;
         }
@@ -374,18 +417,18 @@ impl Agg {
             .into_iter()
             .filter_map(|(k, n)| decode_ip(k).map(|ip| (ip, n)))
             .collect();
-        let unique_ips = ips.len() as u64;
+        let unique_ips = ips.len() as u64 + self.legacy_ips;
         ips.sort_by_key(|a| std::cmp::Reverse(a.1));
         ips.truncate(5_000);
 
         DashboardData {
             requests: self.requests,
             pv: self.pv,
-            uv: self.visitors.len() as u64,
+            uv: self.visitors.len() as u64 + self.legacy_visitors,
             unique_ips,
             blocked: self.blocked,
             attack_ips: self.blocked_ips.len() as u64,
-            statuses: counts(
+            statuses: all_counts(
                 self.statuses
                     .into_iter()
                     .map(|(k, v)| (k.to_string(), v as u64)),
@@ -453,15 +496,160 @@ pub struct BucketSnapshot {
     pub unique_visitors: u64,
     pub ips: Vec<u128>,
     pub visitors: Vec<u64>,
+    /// 明细快照 JSON（状态码分布、Top、来源 IP）
+    pub detail: String,
+}
+
+/// 已落库的分钟明细，用于重启后补齐控制台视图。
+#[derive(Debug, Clone, Default)]
+pub struct HistoricalBucket {
+    pub minute: i64,
+    pub app: String,
+    pub requests: u64,
+    pub pv: u64,
+    pub blocked: u64,
+    /// `BucketDetail` 的 JSON；升级前落库的行为空
+    pub detail: String,
+    /// 升级前的落库行只有汇总列，作为明细缺失时的降级来源
+    pub status_4xx: u64,
+    pub status_5xx: u64,
+    pub unique_ips: u64,
+    pub unique_visitors: u64,
+}
+
+impl HistoricalBucket {
+    /// 还原成内存桶，交给同一套聚合逻辑，保证与实时数据口径一致。
+    fn to_bucket(&self) -> AppBucket {
+        let d: BucketDetail = serde_json::from_str(&self.detail).unwrap_or_default();
+        let mut b = AppBucket {
+            requests: self.requests,
+            pv: self.pv,
+            blocked: self.blocked,
+            statuses: d.statuses,
+            ips: HashMap::new(),
+            visitors: d.visitors.into_iter().collect(),
+            blocked_ips: HashSet::new(),
+            os: [0; OS_LABELS.len()],
+            browsers: [0; BROWSER_LABELS.len()],
+            hosts: d.hosts.into_iter().collect(),
+            paths: d.paths.into_iter().collect(),
+            referer_hosts: d.referer_hosts.into_iter().collect(),
+            referer_urls: d.referer_urls.into_iter().collect(),
+            legacy_ips: 0,
+            legacy_visitors: 0,
+        };
+        for (ip, n) in d.ips {
+            if let Ok(ip) = ip.parse::<IpAddr>() {
+                b.ips.insert(ip_key(ip), n);
+            }
+        }
+        for ip in d.blocked_ips {
+            if let Ok(ip) = ip.parse::<IpAddr>() {
+                b.blocked_ips.insert(ip_key(ip));
+            }
+        }
+        for (i, n) in d.os.iter().enumerate().take(OS_LABELS.len()) {
+            b.os[i] = *n;
+        }
+        for (i, n) in d.browsers.iter().enumerate().take(BROWSER_LABELS.len()) {
+            b.browsers[i] = *n;
+        }
+        // 明细缺失（升级前的落库行）：用汇总列补回 4xx/5xx 与去重计数。
+        if b.statuses.is_empty() {
+            if self.status_4xx > 0 {
+                b.statuses
+                    .insert(400, self.status_4xx.min(u32::MAX as u64) as u32);
+            }
+            if self.status_5xx > 0 {
+                b.statuses
+                    .insert(500, self.status_5xx.min(u32::MAX as u64) as u32);
+            }
+        }
+        // 明细里的 IP 有截断上限，差集用分钟级去重计数补齐。
+        b.legacy_ips = self.unique_ips.saturating_sub(b.ips.len() as u64);
+        b.legacy_visitors = self.unique_visitors.saturating_sub(b.visitors.len() as u64);
+        b
+    }
+}
+
+/// 落库的分钟明细。字段与内存桶一一对应。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct BucketDetail {
+    #[serde(default)]
+    statuses: HashMap<u16, u32>,
+    /// 来源 IP → 请求数。只保留前若干条，避免 JSON 体积失控。
+    #[serde(default)]
+    ips: Vec<(String, u32)>,
+    #[serde(default)]
+    blocked_ips: Vec<String>,
+    /// (IP, UA) 哈希。跨重启仍是同一套哈希，UV 可以正确去重。
+    #[serde(default)]
+    visitors: Vec<u64>,
+    #[serde(default)]
+    os: Vec<u32>,
+    #[serde(default)]
+    browsers: Vec<u32>,
+    #[serde(default)]
+    hosts: Vec<(String, u32)>,
+    #[serde(default)]
+    paths: Vec<(String, u32)>,
+    #[serde(default)]
+    referer_hosts: Vec<(String, u32)>,
+    #[serde(default)]
+    referer_urls: Vec<(String, u32)>,
+}
+
+/// 单分钟明细里保留的来源 IP 条数上限。
+const DETAIL_IP_CAP: usize = 200;
+
+fn detail_of(bucket: &AppBucket) -> String {
+    let mut ips: Vec<(String, u32)> = bucket
+        .ips
+        .iter()
+        .filter_map(|(k, n)| decode_ip(*k).map(|ip| (ip.to_string(), *n)))
+        .collect();
+    ips.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    ips.truncate(DETAIL_IP_CAP);
+
+    let detail = BucketDetail {
+        statuses: bucket.statuses.clone(),
+        ips,
+        blocked_ips: bucket
+            .blocked_ips
+            .iter()
+            .filter_map(|k| decode_ip(*k).map(|ip| ip.to_string()))
+            .collect(),
+        visitors: bucket.visitors.iter().copied().collect(),
+        os: bucket.os.to_vec(),
+        browsers: bucket.browsers.to_vec(),
+        hosts: pairs(&bucket.hosts),
+        paths: pairs(&bucket.paths),
+        referer_hosts: pairs(&bucket.referer_hosts),
+        referer_urls: pairs(&bucket.referer_urls),
+    };
+    serde_json::to_string(&detail).unwrap_or_default()
+}
+
+/// 排行榜 Map 转成按次数倒序的数组，保证落库内容稳定可比。
+fn pairs(map: &HashMap<String, u32>) -> Vec<(String, u32)> {
+    let mut v: Vec<(String, u32)> = map.iter().map(|(k, n)| (k.clone(), *n)).collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    v
 }
 
 fn counts(it: impl Iterator<Item = (String, u64)>) -> Vec<Count> {
+    let mut v = all_counts(it);
+    v.truncate(10);
+    v
+}
+
+/// 完整保留所有条目的计数（状态码分布不能截断，否则总量与请求数对不上）。
+fn all_counts(it: impl Iterator<Item = (String, u64)>) -> Vec<Count> {
     let mut v: Vec<Count> = it
         .filter(|(name, count)| !name.is_empty() && *count > 0)
         .map(|(name, count)| Count { name, count })
         .collect();
     v.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.name.cmp(&b.name)));
-    v.truncate(10);
     v
 }
 
@@ -746,5 +934,65 @@ mod tests {
         assert_eq!(buckets[0].blocked, 1);
         assert_eq!(buckets[0].unique_ips, 2);
         assert_eq!(buckets[0].ips.len(), 2);
+        assert!(buckets[0].detail.contains(r#""403":1"#));
+    }
+
+    #[test]
+    fn merges_history_with_memory_without_overlap() {
+        let m = TrafficMetrics::new();
+        m.record(sample(NOW, "1.1.1.1", "/live", false));
+        m.record(sample(NOW, "1.1.1.3", "/live", true));
+
+        let boundary = NOW - NOW.rem_euclid(60);
+        let detail = r#"{"statuses":{"200":2,"403":1},"ips":[["9.9.9.9",3]],"blocked_ips":["9.9.9.9"],"visitors":[42],"os":[0,0,0,0,0,0,3],"browsers":[0,0,0,0,0,0,0,0,0,3],"hosts":[["nas.home.lan",3]],"paths":[["/old",3]],"referer_hosts":[],"referer_urls":[]}"#;
+        let history = vec![
+            HistoricalBucket {
+                minute: boundary - 60,
+                app: "nas".to_string(),
+                requests: 3,
+                pv: 2,
+                blocked: 1,
+                detail: detail.to_string(),
+                ..Default::default()
+            },
+            // 升级前的落库行：没有明细，只有汇总列
+            HistoricalBucket {
+                minute: boundary - 120,
+                app: "nas".to_string(),
+                requests: 2,
+                pv: 1,
+                status_4xx: 2,
+                unique_ips: 4,
+                unique_visitors: 3,
+                ..Default::default()
+            },
+            // 边界分钟同时存在于数据库与内存时只算内存一份
+            HistoricalBucket {
+                minute: boundary,
+                app: "nas".to_string(),
+                requests: 99,
+                ..Default::default()
+            },
+        ];
+
+        let d = m.dashboard_merged(3_600, Some("nas"), NOW, &history, boundary);
+        assert_eq!(d.requests, 7);
+        assert_eq!(d.pv, 5);
+        assert_eq!(d.blocked, 2);
+        assert_eq!(d.unique_ips, 7, "明细 IP + 旧行去重计数");
+        assert_eq!(d.attack_ips, 2);
+        assert_eq!(d.uv, 6, "明细访客 + 旧行去重计数");
+        let status = |code: &str| {
+            d.statuses
+                .iter()
+                .find(|c| c.name == code)
+                .map(|c| c.count)
+                .unwrap_or(0)
+        };
+        assert_eq!(status("200"), 3);
+        assert_eq!(status("403"), 2);
+        assert_eq!(status("400"), 2, "旧行用 4xx 汇总降级");
+        assert_eq!(d.paths[0].name, "/old");
+        assert_eq!(d.hosts[0].name, "nas.home.lan");
     }
 }

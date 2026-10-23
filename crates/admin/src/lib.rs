@@ -23,7 +23,9 @@ use axum::{
 };
 use homewaf_acl::BanTable;
 use homewaf_config::Application;
-use homewaf_proxy::{RuntimeState, SharedState, TrafficMetrics};
+use homewaf_proxy::{
+    HistoricalBucket, RuntimeState, SharedState, TrafficDashboard, TrafficMetrics,
+};
 use homewaf_store::{CertificateRow, Store};
 use serde::{Deserialize, Serialize};
 
@@ -344,21 +346,7 @@ async fn stats(
     }
 
     let categories = attack_categories(&state, &ctx.store, start, now + 1);
-    // 内存指标随进程重启清零，所以 KPI 与趋势以落库的分钟聚合为准，
-    // 否则刚重启时是一片空白、来一个请求又变成 1，数字会跳。
-    // 域名、路径、UA、Referer 这些明细维度没有落库，只能来自内存。
-    let mem = ctx.metrics.dashboard(range, app, now);
-    let mut traffic = traffic_from_store(&ctx, range, app, now).unwrap_or_else(|| mem.clone());
-    traffic.hosts = mem.hosts;
-    traffic.paths = mem.paths;
-    traffic.os = mem.os;
-    traffic.browsers = mem.browsers;
-    traffic.referer_hosts = mem.referer_hosts;
-    traffic.referer_urls = mem.referer_urls;
-    traffic.ops = mem.ops;
-    if !mem.statuses.is_empty() {
-        traffic.statuses = mem.statuses;
-    }
+    let traffic = merged_traffic(&ctx, range, app, now);
 
     Json(Stats {
         apps: state.router.len(),
@@ -382,76 +370,6 @@ async fn stats(
 // GeoIP / 地理分布
 // ============================================================
 
-/// 用落库的分钟聚合拼一份仪表盘数据。
-///
-/// 只在内存指标为空（进程刚重启）时兜底使用。请求数、PV、拦截数、
-/// 独立 IP/UV、状态码与趋势都能从库里还原；Top 域名/路径、UA、地图
-/// 这些明细维度没有落库，回退后为空。
-fn traffic_from_store(
-    ctx: &Ctx,
-    range: i64,
-    app: Option<&str>,
-    now: i64,
-) -> Option<homewaf_proxy::TrafficDashboard> {
-    let minute = now - now.rem_euclid(60);
-    let start = minute - (range / 60).max(1) * 60 + 60;
-
-    let totals = ctx.store.traffic_totals(start, now + 1, app).ok()?;
-    if totals.requests == 0 {
-        return None;
-    }
-
-    let group = if range <= 3_600 {
-        60
-    } else if range <= 6 * 3_600 {
-        120
-    } else {
-        300
-    };
-    let series = ctx
-        .store
-        .traffic_series(start, now + 1, app, group)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|p| homewaf_proxy::TrafficPoint {
-            ts: p.ts,
-            requests: p.requests,
-            blocked: p.blocked,
-        })
-        .collect();
-
-    // 库里只按 4xx / 5xx 汇总，控制台的状态码饼图只看这些前缀，够用。
-    let mut statuses = Vec::new();
-    if totals.status_4xx > 0 {
-        statuses.push(homewaf_proxy::TrafficCount {
-            name: "400".to_string(),
-            count: totals.status_4xx,
-        });
-    }
-    if totals.status_5xx > 0 {
-        statuses.push(homewaf_proxy::TrafficCount {
-            name: "500".to_string(),
-            count: totals.status_5xx,
-        });
-    }
-
-    Some(homewaf_proxy::TrafficDashboard {
-        requests: totals.requests,
-        pv: totals.pv,
-        blocked: totals.blocked,
-        unique_ips: totals.unique_ips,
-        uv: totals.unique_visitors,
-        attack_ips: ctx
-            .store
-            .event_ip_count(start, now + 1, Some("block"))
-            .unwrap_or(0) as u64,
-        statuses,
-        series,
-        range_secs: range,
-        ..Default::default()
-    })
-}
-
 #[derive(Deserialize)]
 struct RangeQuery {
     /// 时间范围（秒），默认 24 小时
@@ -467,6 +385,41 @@ struct RangeQuery {
 /// 统一去掉空白的应用过滤，`""` 视为不过滤。
 fn norm_app(app: &Option<String>) -> Option<&str> {
     app.as_deref().map(str::trim).filter(|s| !s.is_empty())
+}
+
+/// 合并「启动前已落库的分钟」与「当前进程内存」，让控制台各项统计同口径。
+///
+/// 只读取 `minute < 启动分钟` 的历史行，避免与内存里的同一分钟重复计数；
+/// 历史行的明细（状态码、Top、来源 IP）随明细列一起落库，因此重启后
+/// 请求数、状态码分布和地图仍能互相对得上。
+fn merged_traffic(ctx: &AdminState, range: i64, app: Option<&str>, now: i64) -> TrafficDashboard {
+    let now_minute = now - now.rem_euclid(60);
+    let start = now_minute - (range / 60).max(1) * 60 + 60;
+    let boundary = (ctx.started_at - ctx.started_at.rem_euclid(60)).min(now_minute + 60);
+
+    let history: Vec<HistoricalBucket> = if start < boundary {
+        ctx.store
+            .traffic_details(start, boundary, app)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| HistoricalBucket {
+                minute: r.minute,
+                app: r.app,
+                requests: r.requests,
+                pv: r.pv,
+                blocked: r.blocked,
+                detail: r.detail,
+                status_4xx: r.status_4xx,
+                status_5xx: r.status_5xx,
+                unique_ips: r.unique_ips,
+                unique_visitors: r.unique_visitors,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    ctx.metrics.dashboard_merged(range, app, now, &history, boundary)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -662,7 +615,7 @@ async fn geo_stats(
         geo_stats_from(&ctx.geoip, &pairs)
     } else {
         ctx.geoip
-            .resolve(&ctx.metrics.dashboard(range, app, now).ips)
+            .resolve(&merged_traffic(&ctx, range, app, now).ips)
     };
     Json(stats).into_response()
 }
@@ -1300,10 +1253,10 @@ async fn screen(State(ctx): State<Ctx>, headers: HeaderMap) -> Response {
         })
         .collect();
 
-    // 访问来源取内存快照（24 小时），攻击来源取事件表（30 天）
+    // 访问来源取合并快照（24 小时），攻击来源取事件表（30 天）
     let geo = ctx
         .geoip
-        .resolve(&ctx.metrics.dashboard(86_400, None, now).ips);
+        .resolve(&merged_traffic(&ctx, 86_400, None, now).ips);
     let attack_pairs = ctx
         .store
         .top_event_ips(since_30d, now + 1, Some("block"), 500)
@@ -1395,7 +1348,7 @@ async fn get_app(State(ctx): State<Ctx>, headers: HeaderMap, Path(id): Path<Stri
         .collect();
 
     let now = homewaf_acl::now_unix();
-    let dashboard = ctx.metrics.dashboard(86_400, Some(&app.id), now);
+    let dashboard = merged_traffic(&ctx, 86_400, Some(&app.id), now);
     let stats = serde_json::json!({
         "requests": dashboard.requests,
         "blocked": dashboard.blocked,
@@ -5459,6 +5412,7 @@ mod tests {
                 unique_visitors: 2,
                 ips: vec![1, 2],
                 visitors: vec![10, 20],
+                detail: String::new(),
             }])
             .unwrap();
         st.store

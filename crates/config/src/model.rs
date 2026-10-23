@@ -237,7 +237,24 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::CustomRule;
+    use super::{CustomRule, IpGroup};
+
+    #[test]
+    fn parses_ip_group_with_label_from_leichi() {
+        // 雷池同步写入的 IP 组会带展示名，旧库已有这种数据，必须能继续解析。
+        let json = r#"{
+            "name": "lei-ipgroup-3", "label": "蜜罐捕获IP", "enabled": true,
+            "source": {"url": "https://example.com/list", "format": "cidr",
+                       "interval": "1h", "timeout": "15s", "headers": {}},
+            "action": "block", "scope": [], "expires": "1d",
+            "guards": {"max_entries": 200000, "min_prefix_v4": 8, "min_prefix_v6": 32,
+                       "max_delta_ratio": 0.5, "max_response_bytes": "10MB"},
+            "on_failure": "keep-last"
+        }"#;
+        let g: IpGroup = serde_json::from_str(json).unwrap();
+        assert_eq!(g.name, "lei-ipgroup-3");
+        assert_eq!(g.label, "蜜罐捕获IP");
+    }
 
     #[test]
     fn parses_leichi_custom_rule_payload() {
