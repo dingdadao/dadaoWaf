@@ -296,6 +296,9 @@
     background: rgba(11,15,20,.72); padding: 2px 8px; border-radius: 4px;
   }
   .map-badge { position: absolute; right: 14px; top: 10px; font-size: 11px; color: var(--s-muted); }
+  .globe-canvas { display: block; width: 100%; height: 300px; cursor: grab; touch-action: none; }
+  .globe-canvas:active { cursor: grabbing; }
+  .screen-shell .globe-canvas { height: 320px; }
 
   .rank-h { padding: 10px 14px 0; font-size: 11px; color: var(--s-muted); }
   .ranklist { padding: 6px 14px 12px; display: grid; gap: 7px; }
@@ -909,10 +912,14 @@
                     <button data-mode="blocked">仅拦截</button>
                   </div>
                 </header>
-                <div style="padding:8px 14px 0">
+                <div style="padding:8px 14px 0; display:flex; gap:8px; flex-wrap:wrap">
                   <div class="seg" id="map-region">
                     <button data-region="world" class="on">世界</button>
                     <button data-region="cn">中国</button>
+                  </div>
+                  <div class="seg" id="map-style">
+                    <button data-style="flat" class="on">平面</button>
+                    <button data-style="globe">地球</button>
                   </div>
                 </div>
                 <div class="mapbox" id="traffic-map"></div>
@@ -1508,6 +1515,10 @@
       <section class="dcard screen-card">
         <header>
           <h2>访问来源地图（24 小时）</h2>
+          <div class="seg" id="screen-map-style">
+            <button data-style="flat" class="on">平面</button>
+            <button data-style="globe">地球</button>
+          </div>
           <div class="seg" id="screen-map-region">
             <button data-region="world" class="on">世界</button>
             <button data-region="cn">中国</button>
@@ -1736,9 +1747,9 @@ document.getElementById('nav').addEventListener('click', (e) => {
 // ============================================================
 const STATS = {
   tab: 'traffic', range: 86400, app: '',
-  mapRegion: 'world', mapMode: 'all', geoCache: {},
+  mapRegion: 'world', mapMode: 'all', geoCache: {}, mapStyle: 'flat',
   reports: [], reportDay: null,
-  screenTimer: null, screenLight: false, screenRegion: 'world', screenGeo: null,
+  screenTimer: null, screenLight: false, screenRegion: 'world', screenGeo: null, screenMapStyle: 'flat',
 };
 
 const CAT_LABELS = {
@@ -1951,7 +1962,25 @@ function mapDots(region) {
   return MAP_DOTS[region];
 }
 
-function mapHtml(region, geo, hot) {
+// 地图上方的提示与角标
+function mapNotes(geo) {
+  const internal = geo && geo.available && !geo.resolved_ips && geo.total_ips > 0;
+  const note = geo && geo.available === false
+    ? '<div class="map-note">未启用 GeoIP：在「设置 → 地理信息」填写 mmdb 路径</div>'
+    : internal
+      ? `<div class="map-note">来源 IP 均为内网 / 保留地址，无法解析归属地（共 ${fmtNum(geo.total_ips)} 个）</div>`
+      : '';
+  const badge = geo && geo.available ? `<div class="map-badge">已解析 ${fmtNum(geo.resolved_ips)} 个 IP</div>` : '';
+  return note + badge;
+}
+
+function syncMapChrome(el, geo) {
+  el.querySelectorAll('.map-note,.map-badge').forEach(n => n.remove());
+  el.insertAdjacentHTML('beforeend', mapNotes(geo));
+}
+
+function mapHtml(region, geo, hot, style) {
+  if (style === 'globe') return `<canvas class="globe-canvas"></canvas>${mapNotes(geo)}`;
   const cfg = mapConfig(region);
   const base = mapDots(region);
   const pts = (geo && geo.points ? geo.points : []).filter(p =>
@@ -1964,15 +1993,217 @@ function mapHtml(region, geo, hot) {
     return `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="${r}" class="geo-point${hot ? ' hot' : ''}">`
       + `<title>${p.latitude.toFixed(2)}, ${p.longitude.toFixed(2)} · ${fmtNum(p.count)} 次</title></circle>`;
   }).join('');
-  const internal = geo && geo.available && !geo.resolved_ips && geo.total_ips > 0;
-  const note = geo && geo.available === false
-    ? '<div class="map-note">未启用 GeoIP：在「设置 → 地理信息」填写 mmdb 路径</div>'
-    : internal
-      ? `<div class="map-note">来源 IP 均为内网 / 保留地址，无法解析归属地（共 ${fmtNum(geo.total_ips)} 个）</div>`
-      : '';
-  const badge = geo && geo.available ? `<div class="map-badge">已解析 ${fmtNum(geo.resolved_ips)} 个 IP</div>` : '';
-  return `<svg viewBox="0 0 ${cfg.W} ${cfg.H}">${base}${pins}</svg>${note}${badge}`;
+  return `<svg viewBox="0 0 ${cfg.W} ${cfg.H}">${base}${pins}</svg>${mapNotes(geo)}`;
 }
+
+// ---------- 旋转地球（canvas 正交投影） ----------
+// 陆地点阵只算一次：按 2.5° 采样世界轮廓内部，之后每帧只做投影。
+const GLOBE_LAND_DOTS = (() => {
+  const out = [];
+  for (let lon = -180; lon < 180; lon += 2.5) {
+    for (let lat = -56; lat <= 84; lat += 2.5) {
+      if (WORLD_POLYS.some(poly => pointInPoly(lon, lat, poly))) out.push([lon, lat]);
+    }
+  }
+  return out;
+})();
+const GLOBE_RAD = Math.PI / 180;
+const GLOBES = {};
+
+function createGlobe(canvas, region, geo, hot) {
+  const ctx = canvas.getContext('2d');
+  const st = {
+    region, geo, hot: !!hot,
+    // 地球初始朝向：中国视角时让东经 104° 正对屏幕
+    rot: region === 'cn' ? 104 : 20,
+    tilt: 0.34, drag: null, last: 0, raf: 0, W: 0, H: 0, dpr: 0,
+  };
+
+  const isLight = () => {
+    const shell = canvas.closest('.screen-shell');
+    return !!(shell && shell.classList.contains('light'));
+  };
+  const palette = () => (isLight()
+    ? { oceanIn: '#f6f1ea', oceanOut: '#cdc2b5', land: 'rgba(154,128,106,.62)',
+        grid: 'rgba(96,74,58,.10)', rim: 'rgba(130,98,74,.28)', glow: 'rgba(247,208,164,.42)' }
+    : { oceanIn: '#142435', oceanOut: '#060a10', land: 'rgba(122,170,226,.62)',
+        grid: 'rgba(112,192,255,.10)', rim: 'rgba(92,202,255,.38)', glow: 'rgba(56,214,255,.30)' });
+
+  function fit() {
+    const dpr = window.devicePixelRatio || 1;
+    const w = canvas.clientWidth || 520;
+    const h = canvas.clientHeight || 300;
+    if (st.W !== w || st.H !== h || st.dpr !== dpr) {
+      canvas.width = Math.round(w * dpr);
+      canvas.height = Math.round(h * dpr);
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      st.W = w; st.H = h; st.dpr = dpr;
+    }
+    return { W: st.W, H: st.H };
+  }
+
+  function project(lon, lat) {
+    const la = lat * GLOBE_RAD, lo = (lon - st.rot) * GLOBE_RAD;
+    const cl = Math.cos(la);
+    const x = cl * Math.sin(lo);
+    const y = Math.sin(la);
+    const z = cl * Math.cos(lo);
+    const ct = Math.cos(st.tilt), stl = Math.sin(st.tilt);
+    return { x, y: y * ct - z * stl, z: y * stl + z * ct };
+  }
+
+  function meridian(lon, cx, cy, R) {
+    ctx.beginPath();
+    let pen = false;
+    for (let lat = -90; lat <= 90; lat += 3) {
+      const p = project(lon, lat);
+      if (p.z <= 0) { pen = false; continue; }
+      const x = cx + p.x * R, y = cy + p.y * R;
+      if (pen) ctx.lineTo(x, y); else { ctx.moveTo(x, y); pen = true; }
+    }
+    ctx.stroke();
+  }
+
+  function parallel(lat, cx, cy, R) {
+    ctx.beginPath();
+    let pen = false;
+    for (let lon = -180; lon <= 180; lon += 3) {
+      const p = project(lon, lat);
+      if (p.z <= 0) { pen = false; continue; }
+      const x = cx + p.x * R, y = cy + p.y * R;
+      if (pen) ctx.lineTo(x, y); else { ctx.moveTo(x, y); pen = true; }
+    }
+    ctx.stroke();
+  }
+
+  function draw(ts) {
+    const { W, H } = fit();
+    const cx = W / 2, cy = H / 2;
+    const R = Math.min(W, H) / 2 - 10;
+    const c = palette();
+    const TAU = Math.PI * 2;
+    ctx.clearRect(0, 0, W, H);
+
+    // 外发光
+    let g = ctx.createRadialGradient(cx, cy, R * 0.78, cx, cy, R * 1.34);
+    g.addColorStop(0, c.glow);
+    g.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(cx, cy, R * 1.34, 0, TAU); ctx.fill();
+
+    // 球体
+    g = ctx.createRadialGradient(cx - R * 0.36, cy - R * 0.42, R * 0.05, cx, cy, R * 1.12);
+    g.addColorStop(0, c.oceanIn);
+    g.addColorStop(1, c.oceanOut);
+    ctx.beginPath(); ctx.arc(cx, cy, R, 0, TAU); ctx.fillStyle = g; ctx.fill();
+
+    ctx.save();
+    ctx.beginPath(); ctx.arc(cx, cy, R, 0, TAU); ctx.clip();
+
+    // 经纬网
+    ctx.strokeStyle = c.grid;
+    ctx.lineWidth = 0.8;
+    for (let lon = -180; lon < 180; lon += 30) meridian(lon, cx, cy, R);
+    for (let lat = -60; lat <= 60; lat += 30) parallel(lat, cx, cy, R);
+
+    // 陆地点阵
+    ctx.fillStyle = c.land;
+    for (const [lon, lat] of GLOBE_LAND_DOTS) {
+      const p = project(lon, lat);
+      if (p.z <= 0.02) continue;
+      const s = 0.85 + 1.5 * p.z;
+      ctx.fillRect(cx + p.x * R - s / 2, cy + p.y * R - s / 2, s, s);
+    }
+
+    // 来源点：发光 + 脉冲圈
+    const pts = (st.geo && st.geo.points) || [];
+    const max = Math.max(1, ...pts.map(p => p.count || 1));
+    const phase = (ts % 2400) / 2400;
+    for (const p of pts) {
+      const pr = project(p.longitude, p.latitude);
+      if (pr.z <= 0.02) continue;
+      const x = cx + pr.x * R, y = cy + pr.y * R;
+      const base = 2 + Math.sqrt((p.count || 1) / max) * 3.5;
+      const rgb = st.hot ? '255,107,129' : '56,214,255';
+      const halo = ctx.createRadialGradient(x, y, 0, x, y, base * 3.4);
+      halo.addColorStop(0, `rgba(${rgb},${0.30 + 0.30 * pr.z})`);
+      halo.addColorStop(1, `rgba(${rgb},0)`);
+      ctx.fillStyle = halo;
+      ctx.beginPath(); ctx.arc(x, y, base * 3.4, 0, TAU); ctx.fill();
+      ctx.fillStyle = `rgba(${rgb},${0.55 + 0.45 * pr.z})`;
+      ctx.beginPath(); ctx.arc(x, y, base * (0.65 + 0.35 * pr.z), 0, TAU); ctx.fill();
+      ctx.strokeStyle = `rgba(${rgb},${0.55 * (1 - phase) * pr.z})`;
+      ctx.lineWidth = 1.2;
+      ctx.beginPath(); ctx.arc(x, y, base * (1.8 + 3.4 * phase), 0, TAU); ctx.stroke();
+    }
+    ctx.restore();
+
+    // 边缘轮廓
+    ctx.strokeStyle = c.rim;
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.arc(cx, cy, R - 0.5, 0, TAU); ctx.stroke();
+  }
+
+  function frame(ts) {
+    st.raf = 0;
+    // 页面切走 / 元素被替换时停止，避免后台空转
+    if (!canvas.isConnected || canvas.offsetParent === null) return;
+    const dt = st.last ? Math.min(0.06, (ts - st.last) / 1000) : 0;
+    st.last = ts;
+    if (!st.drag) st.rot = (st.rot + dt * 6) % 360;
+    draw(ts);
+    st.raf = requestAnimationFrame(frame);
+  }
+
+  function resume() {
+    if (!st.raf && canvas.isConnected) {
+      st.last = 0;
+      st.raf = requestAnimationFrame(frame);
+    }
+  }
+
+  canvas.addEventListener('pointerdown', (e) => {
+    st.drag = { x: e.clientX };
+    if (canvas.setPointerCapture) canvas.setPointerCapture(e.pointerId);
+  });
+  canvas.addEventListener('pointermove', (e) => {
+    if (!st.drag) return;
+    st.rot = (st.rot - (e.clientX - st.drag.x) * 0.35) % 360;
+    st.drag.x = e.clientX;
+    resume();
+  });
+  const endDrag = () => { st.drag = null; };
+  canvas.addEventListener('pointerup', endDrag);
+  canvas.addEventListener('pointercancel', endDrag);
+
+  return {
+    canvas,
+    set(region, geo, hot) {
+      st.region = region;
+      st.geo = geo;
+      st.hot = !!hot;
+    },
+    resume,
+  };
+}
+
+// 复用已有地球实例，避免定时刷新时把旋转角度重置造成跳动
+function mountGlobe(key, el, region, geo, hot) {
+  const old = GLOBES[key];
+  if (old && old.canvas.isConnected && el.contains(old.canvas)) {
+    old.set(region, geo, hot);
+    old.resume();
+    syncMapChrome(el, geo);
+    return old;
+  }
+  const canvas = el.querySelector('canvas.globe-canvas');
+  if (!canvas) return null;
+  const inst = createGlobe(canvas, region, geo, hot);
+  GLOBES[key] = inst;
+  inst.resume();
+  return inst;
+}
+
 
 // ---------- 流量分析 ----------
 async function loadStatistics() {
@@ -2058,11 +2289,19 @@ async function renderTrafficMap() {
   if (!el) return;
   try {
     const geo = await ensureGeo(STATS.mapMode);
-    el.innerHTML = mapHtml(STATS.mapRegion, geo, STATS.mapMode === 'blocked');
+    renderMapInto(el, 'traffic', STATS.mapRegion, geo, STATS.mapMode === 'blocked', STATS.mapStyle);
     renderGeoList(geo);
   } catch (e) {
     el.innerHTML = `<div class="empty">地图加载失败：${esc(e.message)}</div>`;
   }
+}
+
+// 统一入口：地球模式复用已有 canvas，避免定时刷新把旋转角度重置
+function renderMapInto(el, key, region, geo, hot, style) {
+  const reuse = style === 'globe' && mountGlobe(key, el, region, geo, hot);
+  if (reuse) return;
+  el.innerHTML = mapHtml(region, geo, hot, style);
+  if (style === 'globe') mountGlobe(key, el, region, geo, hot);
 }
 
 function renderGeoList(geo) {
@@ -2334,7 +2573,8 @@ async function loadScreen() {
       { name: 'QPS', color: '#35e0a1', points: ops.map((v, i) => ({ ts: d.generated_at - (ops.length - i) + 1, v })) },
     ], { height: 240, tickFormatter: (ts) => new Date(ts * 1000).toLocaleTimeString('zh-CN', { minute: '2-digit', second: '2-digit', hour12: false }) });
 
-    document.getElementById('screen-map').innerHTML = mapHtml(STATS.screenRegion, d.geo, false);
+    STATS.screenGeo = d.geo;
+    renderMapInto(document.getElementById('screen-map'), 'screen', STATS.screenRegion, d.geo, false, STATS.screenMapStyle);
 
     const cats = d.categories || [];
     document.getElementById('screen-categories').innerHTML = cats.length
@@ -2397,6 +2637,14 @@ document.getElementById('map-region').addEventListener('click', (e) => {
   renderTrafficMap();
 });
 
+document.getElementById('map-style').addEventListener('click', (e) => {
+  const btn = e.target.closest('button[data-style]');
+  if (!btn) return;
+  STATS.mapStyle = btn.dataset.style;
+  document.querySelectorAll('#map-style button').forEach(b => b.classList.toggle('on', b === btn));
+  renderTrafficMap();
+});
+
 document.getElementById('report-list').addEventListener('click', (e) => {
   const item = e.target.closest('.report-item');
   if (!item) return;
@@ -2427,7 +2675,15 @@ document.getElementById('screen-map-region').addEventListener('click', (e) => {
   if (!btn) return;
   STATS.screenRegion = btn.dataset.region;
   document.querySelectorAll('#screen-map-region button').forEach(b => b.classList.toggle('on', b === btn));
-  if (STATS.screenGeo) document.getElementById('screen-map').innerHTML = mapHtml(STATS.screenRegion, STATS.screenGeo, false);
+  if (STATS.screenGeo) renderMapInto(document.getElementById('screen-map'), 'screen', STATS.screenRegion, STATS.screenGeo, false, STATS.screenMapStyle);
+});
+
+document.getElementById('screen-map-style').addEventListener('click', (e) => {
+  const btn = e.target.closest('button[data-style]');
+  if (!btn) return;
+  STATS.screenMapStyle = btn.dataset.style;
+  document.querySelectorAll('#screen-map-style button').forEach(b => b.classList.toggle('on', b === btn));
+  if (STATS.screenGeo) renderMapInto(document.getElementById('screen-map'), 'screen', STATS.screenRegion, STATS.screenGeo, false, STATS.screenMapStyle);
 });
 
 document.addEventListener('keydown', (e) => {
