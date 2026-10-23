@@ -111,6 +111,7 @@ pub fn router(state: Ctx) -> Router {
         )
         .route("/api/detect-rules/{id}", delete(delete_detect_rule))
         .route("/api/detect-rules/test", post(test_detect_rule))
+        .route("/api/rule-catalog", get(list_rule_catalog))
         .route("/api/rules/{id}", delete(delete_rule))
         .route("/api/bans", get(list_bans).post(create_ban))
         .route("/api/bans/{ip}", delete(unban))
@@ -343,7 +344,21 @@ async fn stats(
     }
 
     let categories = attack_categories(&state, &ctx.store, start, now + 1);
-    let traffic = ctx.metrics.dashboard(range, app, now);
+    // 内存指标随进程重启清零，所以 KPI 与趋势以落库的分钟聚合为准，
+    // 否则刚重启时是一片空白、来一个请求又变成 1，数字会跳。
+    // 域名、路径、UA、Referer 这些明细维度没有落库，只能来自内存。
+    let mem = ctx.metrics.dashboard(range, app, now);
+    let mut traffic = traffic_from_store(&ctx, range, app, now).unwrap_or_else(|| mem.clone());
+    traffic.hosts = mem.hosts;
+    traffic.paths = mem.paths;
+    traffic.os = mem.os;
+    traffic.browsers = mem.browsers;
+    traffic.referer_hosts = mem.referer_hosts;
+    traffic.referer_urls = mem.referer_urls;
+    traffic.ops = mem.ops;
+    if !mem.statuses.is_empty() {
+        traffic.statuses = mem.statuses;
+    }
 
     Json(Stats {
         apps: state.router.len(),
@@ -366,6 +381,76 @@ async fn stats(
 // ============================================================
 // GeoIP / 地理分布
 // ============================================================
+
+/// 用落库的分钟聚合拼一份仪表盘数据。
+///
+/// 只在内存指标为空（进程刚重启）时兜底使用。请求数、PV、拦截数、
+/// 独立 IP/UV、状态码与趋势都能从库里还原；Top 域名/路径、UA、地图
+/// 这些明细维度没有落库，回退后为空。
+fn traffic_from_store(
+    ctx: &Ctx,
+    range: i64,
+    app: Option<&str>,
+    now: i64,
+) -> Option<homewaf_proxy::TrafficDashboard> {
+    let minute = now - now.rem_euclid(60);
+    let start = minute - (range / 60).max(1) * 60 + 60;
+
+    let totals = ctx.store.traffic_totals(start, now + 1, app).ok()?;
+    if totals.requests == 0 {
+        return None;
+    }
+
+    let group = if range <= 3_600 {
+        60
+    } else if range <= 6 * 3_600 {
+        120
+    } else {
+        300
+    };
+    let series = ctx
+        .store
+        .traffic_series(start, now + 1, app, group)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|p| homewaf_proxy::TrafficPoint {
+            ts: p.ts,
+            requests: p.requests,
+            blocked: p.blocked,
+        })
+        .collect();
+
+    // 库里只按 4xx / 5xx 汇总，控制台的状态码饼图只看这些前缀，够用。
+    let mut statuses = Vec::new();
+    if totals.status_4xx > 0 {
+        statuses.push(homewaf_proxy::TrafficCount {
+            name: "400".to_string(),
+            count: totals.status_4xx,
+        });
+    }
+    if totals.status_5xx > 0 {
+        statuses.push(homewaf_proxy::TrafficCount {
+            name: "500".to_string(),
+            count: totals.status_5xx,
+        });
+    }
+
+    Some(homewaf_proxy::TrafficDashboard {
+        requests: totals.requests,
+        pv: totals.pv,
+        blocked: totals.blocked,
+        unique_ips: totals.unique_ips,
+        uv: totals.unique_visitors,
+        attack_ips: ctx
+            .store
+            .event_ip_count(start, now + 1, Some("block"))
+            .unwrap_or(0) as u64,
+        statuses,
+        series,
+        range_secs: range,
+        ..Default::default()
+    })
+}
 
 #[derive(Deserialize)]
 struct RangeQuery {
@@ -1779,6 +1864,30 @@ async fn list_detect_rules(State(ctx): State<Ctx>, headers: HeaderMap) -> Respon
         .ok()
         .flatten()
         .unwrap_or_default();
+    Json(serde_json::json!({ "rules": rules })).into_response()
+}
+
+/// 检测规则清单：内置 + 订阅 + 自定义。
+///
+/// 控制台里要按名称选规则（例如白名单豁免某条规则）就得知道规则 ID 对应什么，
+/// 这里直接把引擎当前加载的规则以 id / 名称 / 来源吐出来。
+async fn list_rule_catalog(State(ctx): State<Ctx>, headers: HeaderMap) -> Response {
+    if !authorized(&ctx, &headers) {
+        return unauthorized();
+    }
+    let state = ctx.shared.load();
+    let matcher = state.engine.matcher();
+    let rules: Vec<serde_json::Value> = matcher
+        .metas()
+        .map(|m| {
+            serde_json::json!({
+                "id": m.id,
+                "name": m.name,
+                "category": m.category.as_str(),
+                "source": m.source.as_str(),
+            })
+        })
+        .collect();
     Json(serde_json::json!({ "rules": rules })).into_response()
 }
 

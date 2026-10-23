@@ -760,6 +760,40 @@
   .modal header { display: flex; justify-content: space-between; align-items: center; padding: 14px 18px; border-bottom: 1px solid var(--border); }
   .modal header h2 { margin: 0; font-size: 15px; }
   .modal form { border-bottom: none; }
+
+  /* 多选下拉：原生 multiple select 是列表框不是下拉，包一层做成点击展开 + 复选框 */
+  .ms { position: relative; }
+  .ms-btn {
+    width: 100%; display: flex; align-items: center; justify-content: space-between; gap: 8px;
+    background: #1f1f1f; border: 1px solid #3a3a3a; color: var(--text);
+    border-radius: 8px; padding: 7px 10px; font: inherit; font-size: 13px; cursor: pointer; text-align: left;
+  }
+  .ms-btn span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ms-btn::after { content: '▾'; color: var(--muted); font-size: 11px; flex: none; }
+  .ms-menu {
+    display: none; position: absolute; z-index: 40; top: calc(100% + 4px); left: 0; right: 0;
+    max-height: 220px; overflow: auto; padding: 4px; background: #1f1f1f;
+    border: 1px solid #3a3a3a; border-radius: 8px; box-shadow: 0 10px 24px rgba(0,0,0,.45);
+  }
+  .ms.open .ms-menu { display: block; }
+  .ms-opt {
+    display: flex; align-items: center; gap: 8px; padding: 6px 8px; margin: 0;
+    border-radius: 6px; font-size: 13px; color: var(--text); cursor: pointer;
+  }
+  .ms-opt:hover { background: #2a2a2a; }
+  .ms-opt input { width: auto; }
+  .ms-opt.muted { color: var(--muted); cursor: default; }
+
+  /* 页面用途说明：告诉用户这个页面干嘛的、字段怎么填 */
+  .page-help {
+    margin: 0 16px 12px; padding: 10px 12px; border: 1px solid var(--border);
+    border-radius: 8px; font-size: 12px; line-height: 1.75; color: var(--muted);
+  }
+  .page-help summary { cursor: pointer; color: var(--text); font-size: 13px; font-weight: 600; }
+  .page-help p { margin: 8px 0 0; }
+  .page-help ul { margin: 6px 0 0; padding-left: 18px; }
+  .page-help li { margin: 3px 0; }
+  .page-help b { color: var(--text); font-weight: 600; }
   .cond-group { border: 1px solid var(--border); border-radius: 8px; padding: 10px; margin-bottom: 10px; display: grid; gap: 8px; }
   .cond-group-head { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); }
   .cond-group-head span { margin-right: auto; }
@@ -1112,9 +1146,21 @@
             <a data-ruletab="1">黑名单 <span id="cnt-1">0</span></a>
             <a data-ruletab="other">人机验证 / 仅记录 <span id="cnt-other">0</span></a>
           </div>
-          <div class="hint" style="padding:0 16px 10px;font-size:12px;color:var(--muted)">
-            组内条件是「且」，条件组之间按「匹配方式」组合（任意 = 或，全部 = 且）。序号越大越新，匹配时从新到旧。
-          </div>
+          <details class="page-help" open>
+            <summary>这个页面是干嘛的</summary>
+            <p>
+              按<b>请求本身</b>（源 IP、路径、Host、User-Agent、请求头、查询参数）直接处置请求，
+              不做内容特征匹配、不参与计分。适合「只让内网访问后台」「拉黑某个来源」这类按来源或入口做的管控。
+            </p>
+            <ul>
+              <li><b>规则类型</b>：白名单 = 命中直接放行，<b>并跳过后续所有检测与封禁</b>；黑名单 = 命中直接拦截；人机验证 = 要求过验证；仅记录 = 只记事件不拦。</li>
+              <li><b>匹配方式</b>：任意 = 满足任一个条件组即可；全部 = 所有条件组都要满足；<b>组内多个条件始终是「且」</b>。</li>
+              <li><b>生效应用</b>：可多选，不选 = 对所有应用生效。</li>
+              <li><b>匹配条件</b>：字段 + 运算符 + 值。IP 组来自「订阅源」里类型为 IP 组的订阅。</li>
+              <li><b>规则 ID</b>：创建时自动生成，之后不能改（雷池同步来的形如 <code>lei-acl-*</code>）。</li>
+              <li>序号越大越新，匹配时从新到旧。</li>
+            </ul>
+          </details>
           <div id="rules"></div>
         </section>
       </div>
@@ -1126,10 +1172,25 @@
             <h2>检测白名单（误报豁免）</h2>
             <button class="primary" onclick="showWlForm()">+ 添加白名单</button>
           </header>
+          <details class="page-help" open>
+            <summary>这个页面是干嘛的</summary>
+            <p>
+              用来<b>消除误报</b>：正常业务请求被检测规则拦了，在这里给它开豁免，
+              而不用把整类检测关掉。只影响<b>内容检测</b>（内置规则、订阅规则、检测黑名单），
+              不影响黑白名单的放行与拦截。
+            </p>
+            <ul>
+              <li><b>应用 / 路径前缀 / 只豁免某条规则</b>：三个条件<b>同时满足</b>才生效；<b>至少要填一个</b>，
+                  全空等于对所有请求关闭全部检测，很危险。</li>
+              <li><b>路径前缀</b>：按前缀匹配，必须以 <code>/</code> 开头。填 <code>/admin/editor</code> 会同时命中 <code>/admin/editor/post</code>，但不会命中 <code>/public/admin/editor</code>。</li>
+              <li><b>只豁免某条规则</b>：选具体规则 = 只跳过这一条；留空 = 跳过该范围内的<b>全部检测</b>。</li>
+              <li>举例：博客后台提交 HTML 正文老被 XSS 规则误拦 → 应用选「博客」、路径填 <code>/admin/editor</code>、规则选那条 XSS 规则。</li>
+            </ul>
+          </details>
           <form id="wl-form" onsubmit="submitWl(event)" style="display:none">
-            <div><label for="wl-app">应用（留空为全部）</label><input id="wl-app" placeholder="nas"></div>
+            <div><label for="wl-app">应用（留空为全部）</label><select id="wl-app"></select></div>
             <div><label for="wl-path">路径前缀（留空为不限）</label><input id="wl-path" placeholder="/admin/editor"></div>
-            <div><label for="wl-rule">只豁免某条规则（留空跳过全部检测）</label><input id="wl-rule" placeholder="xss-script-tag"></div>
+            <div><label for="wl-rule">只豁免某条规则（留空跳过全部检测）</label><select id="wl-rule"></select></div>
             <div><label for="wl-note">备注</label><input id="wl-note" placeholder="文章编辑器需要提交 HTML"></div>
             <div style="display:flex;gap:8px;align-items:center">
               <button type="submit" class="primary" id="wl-submit">添加</button>
@@ -1150,10 +1211,24 @@
               <button class="primary" onclick="showDetectForm()">+ 新建规则</button>
             </div>
           </header>
-          <div class="hint" style="padding:0 16px 10px;font-size:12px;color:var(--muted)">
-            正则作用于归一化后的请求内容，命中后计入检测分数（high 即可越过默认拦截阈值 50）。
-            和黑白名单不同：这里匹配的是<strong>内容特征</strong>，命中会正常参与评分与自动封禁。
-          </div>
+          <details class="page-help" open>
+            <summary>这个页面是干嘛的</summary>
+            <p>
+              用来补内置规则覆盖不到的<b>内容特征</b>：写一条正则，命中后按分值计分（默认累计到 50 分就拦），
+              并参与自动封禁。典型场景是新漏洞（如 PHP2Shell）刚曝光、规则包还没更新时，先自己加一条。
+            </p>
+            <ul>
+              <li><b>正则</b>：作用于<b>归一化后</b>的内容（URL 解码、HTML 实体还原、Unicode 折叠、去 SQL 注释、转小写），所以正则要写<b>小写</b>，不要再加 <code>(?i)</code>。</li>
+              <li><b>预过滤关键词</b>：填正则里必然出现的小写词（如 <code>union</code>），内容只有含它才会跑正则，能显著降低开销。</li>
+              <li><b>作用对象</b>：在哪些位置匹配 —— 路径 / 查询参数 / 请求体 / 请求头 / Cookie / User-Agent，可多选。</li>
+              <li><b>分值</b>：low 10 / medium 25 / high 50 / critical 80；累计到拦截阈值（默认 50）才拦。</li>
+              <li><b>动作</b>：拦截 = <b>命中即拦</b>，不等阈值；仅记录 = 只记事件。</li>
+              <li><b>备注</b>：写清楚为什么加、对应哪个漏洞，方便日后排查。</li>
+            </ul>
+            <p>
+              和「黑白名单」的区别：这里匹配<b>请求内容</b>、要跑正则、参与评分；黑白名单匹配<b>请求元数据</b>，直接放行或拦截。
+            </p>
+          </details>
           <div id="detect-rules"></div>
         </section>
       </div>
@@ -1181,7 +1256,13 @@
             <div class="kind-ip"><label for="sf-action">命中动作</label>
               <select id="sf-action"><option value="block">拒绝</option><option value="allow">放行（白名单）</option><option value="challenge">人机验证</option><option value="log">仅记录</option></select>
             </div>
-            <div class="kind-ip"><label for="sf-scope">作用域（应用 ID，逗号分隔，留空为全部）</label><input id="sf-scope" placeholder="nas, photos"></div>
+            <div class="kind-ip"><label for="sf-scope">作用域</label>
+              <div class="ms" data-empty="全部应用">
+                <button type="button" class="ms-btn" onclick="msToggle(event, this)"><span>全部应用</span></button>
+                <div class="ms-menu"></div>
+                <select id="sf-scope" multiple hidden></select>
+              </div>
+            </div>
 
             <div class="kind-rule"><label for="sf-channel">通道</label>
               <select id="sf-channel" onchange="syncSubKind()">
@@ -1451,7 +1532,7 @@
   <div class="modal-mask" id="rule-modal" onclick="if(event.target===this)hideRuleForm()">
     <div class="modal">
       <header>
-        <h2 id="rule-modal-title">新建规则</h2>
+        <h2 id="rule-modal-title">添加规则</h2>
         <button onclick="hideRuleForm()">关闭</button>
       </header>
       <form id="rule-form" onsubmit="submitRule(event)">
@@ -1470,8 +1551,14 @@
             <option value="all">全部（所有条件组都要满足）</option>
           </select>
         </div>
-        <div><label for="rule-scope">生效应用（ID，逗号分隔，留空为全部）</label><input id="rule-scope" placeholder="nas, blog"></div>
-        <div><label for="rule-id">规则 ID（留空自动生成）</label><input id="rule-id" placeholder="rule-xxx"></div>
+        <div><label for="rule-scope">生效应用</label>
+          <div class="ms" data-empty="全部应用">
+            <button type="button" class="ms-btn" onclick="msToggle(event, this)"><span>全部应用</span></button>
+            <div class="ms-menu"></div>
+            <select id="rule-scope" multiple hidden></select>
+          </div>
+          <div class="hint" style="grid-column:auto;margin-top:4px">不选任何项 = 对所有应用生效</div>
+        </div>
         <div class="wide"><label class="row" style="margin:0;grid-column:auto"><input type="checkbox" id="rule-enabled" checked> 启用</label></div>
         <div class="wide">
           <label style="margin-bottom:8px">匹配条件</label>
@@ -1567,6 +1654,50 @@ const durationToSecs = (d) => {
   const n = parseInt(m[1], 10);
   return n * ({ s: 1, m: 60, h: 3600, d: 86400 }[m[2] || 's'] || 1);
 };
+
+// ============================================================
+// 多选下拉
+// ============================================================
+// 原生 <select multiple> 渲染出来是常驻列表框，不是下拉。这里把 select 藏起来
+// 只当数据源，外面套一层「点击展开 + 复选框」的下拉。收集时照旧读 selectedOptions。
+function msRender(id) {
+  const sel = document.getElementById(id);
+  const box = sel && sel.closest('.ms');
+  if (!box) return;
+  const opts = [...sel.options].filter(o => !o.disabled);
+  box.querySelector('.ms-menu').innerHTML = opts.length
+    ? opts.map(o => `<label class="ms-opt"><input type="checkbox" data-v="${esc(o.value)}"${o.selected ? ' checked' : ''}>${esc(o.textContent)}</label>`).join('')
+    : '<div class="ms-opt muted">（没有可选项）</div>';
+  box.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+    cb.onchange = () => {
+      const opt = [...sel.options].find(o => o.value === cb.dataset.v);
+      if (opt) opt.selected = cb.checked;
+      msSyncLabel(id);
+    };
+  });
+  msSyncLabel(id);
+}
+
+/// 按钮上显示已选项的名称；一项没选就显示空态文案（如「全部应用」）。
+function msSyncLabel(id) {
+  const sel = document.getElementById(id);
+  const box = sel.closest('.ms');
+  const picked = [...sel.selectedOptions].map(o => o.textContent);
+  box.querySelector('.ms-btn span').textContent = picked.length ? picked.join('、') : (box.dataset.empty || '未选择');
+}
+
+function msToggle(ev, btn) {
+  ev.stopPropagation();
+  const box = btn.closest('.ms');
+  const willOpen = !box.classList.contains('open');
+  document.querySelectorAll('.ms.open').forEach(b => b.classList.remove('open'));
+  box.classList.toggle('open', willOpen);
+}
+
+// 点空白处收起所有已展开的多选下拉
+document.addEventListener('click', (ev) => {
+  if (!ev.target.closest('.ms')) document.querySelectorAll('.ms.open').forEach(b => b.classList.remove('open'));
+});
 
 // ============================================================
 // 页面切换
@@ -3049,6 +3180,16 @@ function renumberGroups() {
   });
 }
 
+/// 填充「生效应用」多选下拉。不选任何项表示对所有应用生效。
+function fillRuleScopeOptions(selected) {
+  const sel = document.getElementById('rule-scope');
+  const picked = new Set(selected || []);
+  sel.innerHTML = ruleCtx.apps.length
+    ? ruleCtx.apps.map(a => `<option value="${esc(a.id)}"${picked.has(a.id) ? ' selected' : ''}>${esc(a.name || a.id)}（${esc(a.id)}）</option>`).join('')
+    : '<option value="" disabled>暂无应用</option>';
+  msRender('rule-scope');
+}
+
 function showRuleForm(id) {
   editingRule = id ? ruleCache.find(r => r.id === id) : null;
   const r = editingRule || {
@@ -3056,16 +3197,17 @@ function showRuleForm(id) {
     match_mode: 'any', is_enabled: true, scope: [],
     pattern: [[{ k: 'src_ip', op: 'eq', v: [''] }]],
   };
-  document.getElementById('rule-modal-title').textContent = editingRule ? '编辑规则' : '添加规则';
-  document.getElementById('rule-id').value = r.id || '';
-  document.getElementById('rule-id').readOnly = !!editingRule;
+  // 规则 ID 是主键，建好就不能改，只作为标识挂在标题上
+  document.getElementById('rule-modal-title').innerHTML = editingRule
+    ? `编辑规则 <code style="font-size:11px;font-weight:400;color:var(--muted)">${esc(r.id)}</code>`
+    : '添加规则';
   document.getElementById('rule-name').value = r.name || '';
   document.querySelectorAll('input[name="rule-action"]').forEach(el => {
     el.checked = Number(el.value) === Number(r.action ?? 1);
   });
   document.getElementById('rule-match-mode').value = r.match_mode === 'all' ? 'all' : 'any';
   document.getElementById('rule-enabled').checked = r.is_enabled !== false;
-  document.getElementById('rule-scope').value = (r.scope || []).join(', ');
+  fillRuleScopeOptions(r.scope || []);
   renderCondEditor(r.pattern && r.pattern.length ? r.pattern : [[{ k: 'src_ip', op: 'eq', v: [''] }]]);
   document.getElementById('rule-modal').classList.add('show');
   document.getElementById('rule-name').focus();
@@ -3093,12 +3235,12 @@ function collectRule() {
   const action = document.querySelector('input[name="rule-action"]:checked');
 
   return {
-    id: document.getElementById('rule-id').value.trim(),
+    id: editingRule ? editingRule.id : '',
     name: document.getElementById('rule-name').value.trim(),
     is_enabled: document.getElementById('rule-enabled').checked,
     action: action ? Number(action.value) : 1,
     match_mode: document.getElementById('rule-match-mode').value,
-    scope: document.getElementById('rule-scope').value.split(',').map(s => s.trim()).filter(Boolean),
+    scope: [...document.getElementById('rule-scope').selectedOptions].map(o => o.value),
     expires_at: editingRule?.expires_at ?? null,
     seq: editingRule?.seq ?? 0,
     created_at: editingRule?.created_at ?? null,
@@ -3329,27 +3471,62 @@ async function testDetectPattern() {
 // ============================================================
 // 白名单
 // ============================================================
+let wlCtx = { apps: [], rules: [] };
+
+/// 应用 id → 名称；找不到就退回 id。
+const wlAppName = (id) => {
+  const a = wlCtx.apps.find(x => x.id === id);
+  return a ? (a.name || a.id) : id;
+};
+
+/// 规则 id → 名称；找不到就退回 id。
+const wlRuleName = (id) => {
+  const r = wlCtx.rules.find(x => x.id === id);
+  return r ? (r.name || r.id) : id;
+};
+
 async function loadWhitelist() {
   const el = document.getElementById('whitelist');
   try {
-    const rows = await api('/whitelist');
+    const [rows, apps, catalog] = await Promise.all([
+      api('/whitelist'), api('/apps'), api('/rule-catalog'),
+    ]);
+    wlCtx = { apps: apps || [], rules: (catalog && catalog.rules) || [] };
     if (!rows.length) { el.innerHTML = '<div class="empty">没有白名单。误报时在这里给特定路径开豁免，不要关掉整类检测。</div>'; return; }
     el.innerHTML = `<table>
       <thead><tr><th>ID</th><th>应用</th><th>路径前缀</th><th>豁免规则</th><th>备注</th><th></th></tr></thead>
       <tbody>${rows.map(w => `<tr>
         <td><code>${esc(w.id)}</code></td>
-        <td>${w.app ? esc(w.app) : '<span class="sub" style="margin:0">全部</span>'}</td>
+        <td>${w.app ? esc(wlAppName(w.app)) : '<span class="sub" style="margin:0">全部</span>'}</td>
         <td>${w.path ? `<code>${esc(w.path)}</code>` : '<span class="sub" style="margin:0">不限</span>'}</td>
-        <td>${w.rule_id ? `<code>${esc(w.rule_id)}</code>` : '<span class="tag log">跳过全部检测</span>'}</td>
+        <td>${w.rule_id ? esc(wlRuleName(w.rule_id)) : '<span class="tag log">跳过全部检测</span>'}</td>
         <td>${esc(w.note || '')}</td>
         <td><button class="danger" onclick="deleteWl('${esc(w.id)}')">删除</button></td>
       </tr>`).join('')}</tbody></table>`;
   } catch (e) { el.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`; }
 }
 
+/// 应用下拉：首项为全部应用。
+function fillWlAppOptions() {
+  document.getElementById('wl-app').innerHTML = [
+    '<option value="">全部应用</option>',
+    ...wlCtx.apps.map(a => `<option value="${esc(a.id)}">${esc(a.name || a.id)}（${esc(a.id)}）</option>`),
+  ].join('');
+}
+
+/// 规则下拉：首项为跳过全部检测，其余按名称列出引擎当前加载的规则。
+function fillWlRuleOptions() {
+  document.getElementById('wl-rule').innerHTML = [
+    '<option value="">跳过全部检测</option>',
+    ...wlCtx.rules.map(r => `<option value="${esc(r.id)}">${esc(r.name || r.id)}（${esc(r.id)}）</option>`),
+  ].join('');
+}
+
 function showWlForm() {
   document.getElementById('wl-form').style.display = 'grid';
-  ['wl-app', 'wl-path', 'wl-rule', 'wl-note'].forEach(id => document.getElementById(id).value = '');
+  ['wl-path', 'wl-note'].forEach(id => document.getElementById(id).value = '');
+  fillWlAppOptions();
+  fillWlRuleOptions();
   document.getElementById('wl-app').focus();
 }
 function hideWlForm() { document.getElementById('wl-form').style.display = 'none'; }
@@ -3474,6 +3651,18 @@ function onSubKindChange() {
   syncSubKind();
 }
 
+/// 填充订阅「作用域」多选下拉。不选任何项表示对所有应用生效。
+async function fillSubScope(selected) {
+  const sel = document.getElementById('sf-scope');
+  const picked = new Set(selected || []);
+  let apps = [];
+  try { apps = await api('/apps'); } catch { /* 拉不到就只显示空 */ }
+  sel.innerHTML = apps.length
+    ? apps.map(a => `<option value="${esc(a.id)}"${picked.has(a.id) ? ' selected' : ''}>${esc(a.name || a.id)}（${esc(a.id)}）</option>`).join('')
+    : '<option value="" disabled>暂无应用</option>';
+  msRender('sf-scope');
+}
+
 function showSubForm(sub) {
   editingSub = sub || null;
   const kind = sub ? sub.kind : 'ip_list';
@@ -3491,7 +3680,7 @@ function showSubForm(sub) {
   set('sf-interval', kind === 'ip_list' ? cfg.source?.interval : cfg.check_interval);
   set('sf-timeout', kind === 'ip_list' ? cfg.source?.timeout : cfg.timeout);
   set('sf-action', cfg.action || 'block');
-  set('sf-scope', (cfg.scope || []).join(', '));
+  fillSubScope(cfg.scope || []);
   set('sf-channel', cfg.channel || 'stable');
   set('sf-version', cfg.pinned_version);
   set('sf-shadow', cfg.shadow_period);
@@ -3550,7 +3739,7 @@ async function submitSub(e) {
     cfg.source.format = cfg.source.format || 'auto';
     cfg.source.headers = cfg.source.headers || {};
     cfg.action = document.getElementById('sf-action').value;
-    cfg.scope = document.getElementById('sf-scope').value.split(',').map(s => s.trim()).filter(Boolean);
+    cfg.scope = [...document.getElementById('sf-scope').selectedOptions].map(o => o.value);
   } else {
     const channel = document.getElementById('sf-channel').value;
     const version = document.getElementById('sf-version').value.trim();
