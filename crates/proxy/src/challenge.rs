@@ -1,19 +1,23 @@
-//! 人机验证：JS 工作量证明 + HMAC 签名凭据。
+//! 人机验证：JS 工作量证明 + 环境指纹 + HMAC 签名凭据。
 //!
 //! 为什么不直接上滑块/验证码：家用 WAF 没有外部服务依赖，也不该把
 //! 用户数据送到第三方。工作量证明由浏览器本地计算，服务端只做一次
 //! 哈希校验，零外部依赖。
 //!
-//! 三个安全约束：
-//! - 挑战令牌绑定 **应用 + 客户端 IP + 过期时间**，不能跨站/跨 IP 复用
-//! - 签名用 HMAC-SHA256，密钥进程启动时随机生成，重启后旧凭据全部失效
-//! - 通过验证后下发同样签名的 Cookie，后续请求不再重复计算
+//! 三道防线（对标商用验证码里便宜且有效的部分，不做 JSVMP）：
+//! - **成本墙**：PoW 由浏览器实算，批量通过要付真算力
+//! - **环境指纹**：页内采集 canvas/WebGL/屏幕/时区等哈希，混入 PoW 输入，
+//!   解题结果与运行环境绑定；webdriver/CDP 等自动化标记服务端直接拒收
+//! - **签名绑定**：令牌 HMAC 签名绑定应用 + IP + 过期时间；解题单次使用，
+//!   复制回调 URL 重放无效
 //!
 //! 注意：浏览器端不能用 `crypto.subtle`——家用 WAF 通常走 HTTP，
 //! 而 Web Crypto 只在安全上下文（HTTPS / localhost）可用。所以页内
 //! 自带一份纯 JS SHA-256。
 
+use std::collections::HashMap;
 use std::net::IpAddr;
+use std::sync::Mutex;
 
 use homewaf_config::ChallengeConfig;
 use ring::hmac;
@@ -27,10 +31,15 @@ pub const COOKIE_NAME: &str = "homewaf_challenge";
 
 const TOKEN_VERSION: u8 = 1;
 const MAX_NEXT_LEN: usize = 1_024;
+/// 环境指纹长度：sha256 前 16 个十六进制字符。
+const FP_LEN: usize = 16;
+/// 防重放表上限，超过即按过期时间清理。
+const USED_CAP: usize = 8_192;
 
-/// 挑战服务。持有 HMAC 密钥，整个进程共享一个实例。
+/// 挑战服务。持有 HMAC 密钥与已用解题记录，整个进程共享一个实例。
 pub struct ChallengeService {
     key: hmac::Key,
+    used: Mutex<HashMap<String, u64>>,
 }
 
 impl ChallengeService {
@@ -41,6 +50,7 @@ impl ChallengeService {
             .expect("系统随机数不可用，无法启动人机验证");
         Self {
             key: hmac::Key::new(hmac::HMAC_SHA256, &raw),
+            used: Mutex::new(HashMap::new()),
         }
     }
 
@@ -71,16 +81,15 @@ impl ChallengeService {
         }
     }
 
-    /// 校验挑战令牌与工作量证明。
+    /// 校验挑战令牌、环境指纹与工作量证明。
     pub fn verify(
         &self,
-        token: &str,
-        nonce: &str,
+        sol: &Solution,
         app: &str,
         ip: Option<IpAddr>,
         now: u64,
     ) -> Result<TokenPayload, ChallengeError> {
-        let body = self.verify_signed("token", token)?;
+        let body = self.verify_signed("token", sol.token)?;
         let payload: TokenPayload =
             serde_json::from_slice(&body).map_err(|_| ChallengeError::Malformed)?;
         if payload.v != TOKEN_VERSION {
@@ -92,11 +101,29 @@ impl ChallengeService {
         if payload.a != app || payload.i != ip.map(|i| i.to_string()).unwrap_or_default() {
             return Err(ChallengeError::WrongClient);
         }
+        if automated(sol.env) {
+            return Err(ChallengeError::Automated);
+        }
+        if !fp_ok(sol.fp) {
+            return Err(ChallengeError::BadFingerprint);
+        }
 
         let difficulty = payload.d.clamp(1, 8);
-        if !proof_ok(token, nonce, difficulty) {
+        if !proof_ok(sol.token, sol.fp, sol.nonce, difficulty) {
             return Err(ChallengeError::BadProof);
         }
+
+        // 单次使用：同一 (token, nonce, fp) 的解题只认一次，
+        // 复制回调 URL 到别的会话/机器重放无效。
+        let key = used_key(sol.token, sol.nonce, sol.fp);
+        let mut used = self.used.lock().expect("防重放表锁不应中毒");
+        if used.len() >= USED_CAP {
+            used.retain(|_, exp| *exp > now);
+        }
+        if used.contains_key(&key) {
+            return Err(ChallengeError::Replay);
+        }
+        used.insert(key, payload.e);
         Ok(payload)
     }
 
@@ -172,6 +199,14 @@ pub struct Issued {
     pub page: String,
 }
 
+/// 浏览器回传的一次解题：令牌、nonce、环境指纹与自动化标记。
+pub struct Solution<'a> {
+    pub token: &'a str,
+    pub nonce: &'a str,
+    pub fp: &'a str,
+    pub env: &'a str,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenPayload {
     v: u8,
@@ -207,21 +242,82 @@ pub enum ChallengeError {
     Expired,
     #[error("挑战与当前应用或 IP 不匹配")]
     WrongClient,
+    #[error("环境指纹缺失或异常")]
+    BadFingerprint,
+    #[error("检测到自动化浏览器")]
+    Automated,
+    #[error("解题结果已使用过")]
+    Replay,
     #[error("工作量证明无效")]
     BadProof,
 }
 
-/// 服务端 PoW 校验：`sha256(token + "." + nonce)` 需有 `difficulty` 个前导零十六进制位。
-fn proof_ok(token: &str, nonce: &str, difficulty: u8) -> bool {
+/// 服务端 PoW 校验：`sha256(token + "." + fp + "." + nonce)` 需有
+/// `difficulty` 个前导零十六进制位。指纹混入输入，解题结果即绑定环境。
+fn proof_ok(token: &str, fp: &str, nonce: &str, difficulty: u8) -> bool {
     if nonce.is_empty() || nonce.len() > 32 || !nonce.bytes().all(|b| b.is_ascii_digit()) {
         return false;
     }
-    let mut input = Vec::with_capacity(token.len() + nonce.len() + 1);
+    let mut input = Vec::with_capacity(token.len() + fp.len() + nonce.len() + 2);
     input.extend_from_slice(token.as_bytes());
+    input.push(b'.');
+    input.extend_from_slice(fp.as_bytes());
     input.push(b'.');
     input.extend_from_slice(nonce.as_bytes());
     let digest = ring::digest::digest(&ring::digest::SHA256, &input);
     count_leading_zero_hex(digest.as_ref()) >= difficulty as usize
+}
+
+/// 环境指纹格式校验：16 位十六进制，且不能是全零退化值。
+fn fp_ok(fp: &str) -> bool {
+    fp.len() == FP_LEN
+        && fp.bytes().all(|b| b.is_ascii_hexdigit())
+        && !fp.bytes().all(|b| b == b'0')
+}
+
+/// 自动化标记串形如 `wd=0.cdp=0`；任一标记为 1 即判定自动化环境。
+/// 标记由页内 JS 如实上报：webdriver 与 CDP 注入物是自动化浏览器的
+/// 固有特征，正常浏览器恒为 0。两个标记必须齐全——缺字段视为
+/// 客户端故意隐瞒，同样拒收。
+fn automated(env: &str) -> bool {
+    let mut wd = None;
+    let mut cdp = None;
+    for part in env.split('.') {
+        let (key, val) = match part.split_once('=') {
+            Some(kv) => kv,
+            None => return true,
+        };
+        let flag = match val {
+            "0" => false,
+            "1" => true,
+            _ => return true,
+        };
+        match key {
+            "wd" => wd = Some(flag),
+            "cdp" => cdp = Some(flag),
+            _ => return true,
+        }
+    }
+    match (wd, cdp) {
+        (Some(a), Some(b)) => a || b,
+        _ => true,
+    }
+}
+
+fn used_key(token: &str, nonce: &str, fp: &str) -> String {
+    let mut input = Vec::with_capacity(token.len() + nonce.len() + fp.len() + 2);
+    input.extend_from_slice(token.as_bytes());
+    input.push(b'.');
+    input.extend_from_slice(nonce.as_bytes());
+    input.push(b'.');
+    input.extend_from_slice(fp.as_bytes());
+    let digest = ring::digest::digest(&ring::digest::SHA256, &input);
+    digest
+        .as_ref()
+        .iter()
+        .take(8)
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 fn count_leading_zero_hex(bytes: &[u8]) -> usize {
@@ -407,20 +503,60 @@ fn render_page(token: &str, difficulty: u8) -> String {
     return true;
   }}
 
+  // ---- 环境指纹：canvas / WebGL / 屏幕 / 时区等合成一个哈希 ----
+  function canvasHash() {{
+    try {{
+      var c = document.createElement("canvas");
+      c.width = 200; c.height = 40;
+      var x = c.getContext("2d");
+      x.textBaseline = "top"; x.font = "14px Arial"; x.fillStyle = "#f60";
+      x.fillRect(0, 0, 100, 20);
+      x.fillStyle = "#069"; x.fillText("homewaf", 2, 15);
+      x.fillStyle = "rgba(102,204,0,0.7)"; x.fillText("fp", 60, 18);
+      return sha256(c.toDataURL()).slice(0, 16);
+    }} catch (e) {{ return "nocanvas"; }}
+  }}
+  function glHash() {{
+    try {{
+      var c = document.createElement("canvas");
+      var gl = c.getContext("webgl") || c.getContext("experimental-webgl");
+      var ext = gl.getExtension("WEBGL_debug_renderer_info");
+      var r = ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER);
+      return sha256(String(r)).slice(0, 8);
+    }} catch (e) {{ return "nogl"; }}
+  }}
+  // 自动化标记：webdriver 与 CDP 注入物是自动化浏览器的固有特征
+  var wd = (navigator.webdriver === true) ? 1 : 0;
+  var cdp = (window.domAutomationController || document.$cdc_asdjflasutopfhvcZLmcfl_
+             || window.cdc_adoQpoasnfa76pfcZLmcfl_Array) ? 1 : 0;
+  var env = "wd=" + wd + ".cdp=" + cdp;
+  var fp = sha256([wd, cdp, screen.width, screen.height, screen.colorDepth,
+                   Intl.DateTimeFormat().resolvedOptions().timeZone,
+                   navigator.language, navigator.hardwareConcurrency,
+                   canvasHash(), glHash()].join("|")).slice(0, 16);
+
+  if (wd === 1 || cdp === 1) {{
+    title.textContent = "验证已停止";
+    msg.textContent = "检测到自动化浏览器特征，本验证只面向真实用户浏览器。";
+    document.getElementById("ring").className = "done";
+    return;
+  }}
+
   function tick() {{
     var end = Date.now() + 80;
     while (Date.now() < end) {{
-      if (ok(sha256(token + "." + nonce))) {{
+      if (ok(sha256(token + "." + fp + "." + nonce))) {{
         title.textContent = "验证通过";
         msg.textContent = "正在进入，请稍候…";
         document.getElementById("ring").className = "done";
-        location.replace("{path}?token=" + encodeURIComponent(token) + "&nonce=" + nonce);
+        location.replace("{path}?token=" + encodeURIComponent(token) + "&nonce=" + nonce
+                         + "&fp=" + fp + "&env=" + env);
         return;
       }}
       nonce++;
     }}
     var secs = Math.round((Date.now() - started) / 1000);
-    hint.textContent = "已计算 " + nonce.toLocaleString() + " 次 · " + secs + " 秒";
+    hint.textContent = "已计算 " + nonce.toLocaleString() + " 次 · " + secs + " 秒 · 指纹 " + fp;
     setTimeout(tick, 0);
   }}
   tick();
@@ -448,23 +584,41 @@ mod tests {
         s.parse().unwrap()
     }
 
-    fn solve(token: &str, difficulty: u8) -> String {
+    fn solve(token: &str, fp: &str, difficulty: u8) -> String {
         for nonce in 0u64..1_000_000 {
             let n = nonce.to_string();
-            if proof_ok(token, &n, difficulty) {
+            if proof_ok(token, fp, &n, difficulty) {
                 return n;
             }
         }
         panic!("难度 {difficulty} 在 100 万次内无解");
     }
 
+    const FP: &str = "0123456789abcdef";
+    const ENV: &str = "wd=0.cdp=0";
+
+    macro_rules! v {
+        ($svc:expr, $token:expr, $nonce:expr, $fp:expr, $env:expr, $app:expr, $ip:expr, $now:expr) => {
+            $svc.verify(
+                &Solution {
+                    token: $token,
+                    nonce: $nonce,
+                    fp: $fp,
+                    env: $env,
+                },
+                $app,
+                Some($ip),
+                $now,
+            )
+        };
+    }
+
     #[test]
     fn issue_and_verify_roundtrip() {
         let svc = ChallengeService::new();
         let issued = svc.issue(&cfg(), "nas", Some(ip("192.168.1.9")), "/admin?x=1", 1_000);
-        let nonce = solve(&issued.token, issued.difficulty);
-        let payload = svc
-            .verify(&issued.token, &nonce, "nas", Some(ip("192.168.1.9")), 1_001)
+        let nonce = solve(&issued.token, FP, issued.difficulty);
+        let payload = v!(&svc, &issued.token, &nonce, FP, ENV, "nas", ip("192.168.1.9"), 1_001)
             .expect("应通过验证");
         assert_eq!(payload.next(), "/admin?x=1");
     }
@@ -473,15 +627,9 @@ mod tests {
     fn token_is_bound_to_ip() {
         let svc = ChallengeService::new();
         let issued = svc.issue(&cfg(), "nas", Some(ip("192.168.1.9")), "/", 1_000);
-        let nonce = solve(&issued.token, issued.difficulty);
+        let nonce = solve(&issued.token, FP, issued.difficulty);
         assert_eq!(
-            svc.verify(
-                &issued.token,
-                &nonce,
-                "nas",
-                Some(ip("192.168.1.10")),
-                1_001
-            ),
+            v!(&svc, &issued.token, &nonce, FP, ENV, "nas", ip("192.168.1.10"), 1_001),
             Err(ChallengeError::WrongClient)
         );
     }
@@ -490,15 +638,9 @@ mod tests {
     fn token_is_bound_to_app() {
         let svc = ChallengeService::new();
         let issued = svc.issue(&cfg(), "nas", Some(ip("192.168.1.9")), "/", 1_000);
-        let nonce = solve(&issued.token, issued.difficulty);
+        let nonce = solve(&issued.token, FP, issued.difficulty);
         assert_eq!(
-            svc.verify(
-                &issued.token,
-                &nonce,
-                "blog",
-                Some(ip("192.168.1.9")),
-                1_001
-            ),
+            v!(&svc, &issued.token, &nonce, FP, ENV, "blog", ip("192.168.1.9"), 1_001),
             Err(ChallengeError::WrongClient)
         );
     }
@@ -507,9 +649,9 @@ mod tests {
     fn token_expires() {
         let svc = ChallengeService::new();
         let issued = svc.issue(&cfg(), "nas", Some(ip("192.168.1.9")), "/", 1_000);
-        let nonce = solve(&issued.token, issued.difficulty);
+        let nonce = solve(&issued.token, FP, issued.difficulty);
         assert_eq!(
-            svc.verify(&issued.token, &nonce, "nas", Some(ip("192.168.1.9")), 1_060),
+            v!(&svc, &issued.token, &nonce, FP, ENV, "nas", ip("192.168.1.9"), 1_060),
             Err(ChallengeError::Expired)
         );
     }
@@ -526,7 +668,7 @@ mod tests {
         let repl = if ch == 'A' { 'B' } else { 'A' };
         tampered.replace_range(pos..pos + 1, &repl.to_string());
         assert!(matches!(
-            svc.verify(&tampered, "0", "nas", Some(ip("192.168.1.9")), 1_001),
+            v!(&svc, &tampered, "0", FP, ENV, "nas", ip("192.168.1.9"), 1_001),
             Err(ChallengeError::BadSignature) | Err(ChallengeError::Malformed)
         ));
     }
@@ -536,14 +678,93 @@ mod tests {
         let svc = ChallengeService::new();
         let issued = svc.issue(&cfg(), "nas", Some(ip("192.168.1.9")), "/", 1_000);
         assert_eq!(
-            svc.verify(
+            v!(
+                &svc,
                 &issued.token,
                 "not-a-number",
+                FP,
+                ENV,
                 "nas",
-                Some(ip("192.168.1.9")),
+                ip("192.168.1.9"),
                 1_001
             ),
             Err(ChallengeError::BadProof)
+        );
+    }
+
+    #[test]
+    fn proof_is_bound_to_fingerprint() {
+        let svc = ChallengeService::new();
+        let issued = svc.issue(&cfg(), "nas", Some(ip("192.168.1.9")), "/", 1_000);
+        let other = "fedcba9876543210";
+        // 难度 1 时错误指纹有 1/16 概率碰巧也满足前导零，挑一个只对原指纹成立的解
+        let nonce = (0u64..1_000_000)
+            .map(|n| n.to_string())
+            .find(|n| {
+                proof_ok(&issued.token, FP, n, issued.difficulty)
+                    && !proof_ok(&issued.token, other, n, issued.difficulty)
+            })
+            .expect("应能找到只对原指纹成立的解");
+        // 换个环境（指纹不同）复用同一解题，PoW 不再成立
+        assert_eq!(
+            v!(
+                &svc,
+                &issued.token,
+                &nonce,
+                other,
+                ENV,
+                "nas",
+                ip("192.168.1.9"),
+                1_001
+            ),
+            Err(ChallengeError::BadProof)
+        );
+    }
+
+    #[test]
+    fn degenerate_fingerprints_rejected() {
+        let svc = ChallengeService::new();
+        let issued = svc.issue(&cfg(), "nas", Some(ip("192.168.1.9")), "/", 1_000);
+        let nonce = solve(&issued.token, FP, issued.difficulty);
+        for bad in [
+            "",
+            "0000000000000000",
+            "zzzzzzzzzzzzzzzz",
+            "0123456789abcde",
+            "0123456789abcdef0",
+        ] {
+            assert_eq!(
+                v!(&svc, &issued.token, &nonce, bad, ENV, "nas", ip("192.168.1.9"), 1_001),
+                Err(ChallengeError::BadFingerprint),
+                "指纹 {bad:?} 应被拒"
+            );
+        }
+    }
+
+    #[test]
+    fn automated_environments_rejected() {
+        let svc = ChallengeService::new();
+        let issued = svc.issue(&cfg(), "nas", Some(ip("192.168.1.9")), "/", 1_000);
+        let nonce = solve(&issued.token, FP, issued.difficulty);
+        for bad in ["", "wd=1.cdp=0", "wd=0.cdp=1", "wd=0", "wd=x.cdp=0"] {
+            assert_eq!(
+                v!(&svc, &issued.token, &nonce, FP, bad, "nas", ip("192.168.1.9"), 1_001),
+                Err(ChallengeError::Automated),
+                "标记 {bad:?} 应被拒"
+            );
+        }
+    }
+
+    #[test]
+    fn solution_is_single_use() {
+        let svc = ChallengeService::new();
+        let issued = svc.issue(&cfg(), "nas", Some(ip("192.168.1.9")), "/", 1_000);
+        let nonce = solve(&issued.token, FP, issued.difficulty);
+        v!(&svc, &issued.token, &nonce, FP, ENV, "nas", ip("192.168.1.9"), 1_001)
+            .expect("首次应通过");
+        assert_eq!(
+            v!(&svc, &issued.token, &nonce, FP, ENV, "nas", ip("192.168.1.9"), 1_002),
+            Err(ChallengeError::Replay)
         );
     }
 

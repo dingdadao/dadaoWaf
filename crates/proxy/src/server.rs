@@ -163,12 +163,20 @@ impl WafProxy {
     ) -> Result<bool> {
         let token = query.and_then(|q| query_param(q, "token"));
         let nonce = query.and_then(|q| query_param(q, "nonce"));
+        let fp = query.and_then(|q| query_param(q, "fp")).unwrap_or_default();
+        let env = query.and_then(|q| query_param(q, "env")).unwrap_or_default();
         let (Some(token), Some(nonce)) = (token, nonce) else {
             return write_text(session, 400, "验证参数缺失").await;
         };
 
         let now = homewaf_acl::now_unix().max(0) as u64;
-        match self.challenges.verify(&token, &nonce, app, ip, now) {
+        let sol = challenge::Solution {
+            token: &token,
+            nonce: &nonce,
+            fp: &fp,
+            env: &env,
+        };
+        match self.challenges.verify(&sol, app, ip, now) {
             Ok(payload) => {
                 let cookie = self.challenges.issue_cookie(&state.challenge, app, ip, now);
                 let ttl = state.challenge.ttl.as_secs();
@@ -1828,6 +1836,11 @@ pub fn run(state: SharedState, settings: ProxySettings) -> anyhow::Result<()> {
     }
 
     let mut server = Server::new(None)?;
+    // Pingora 默认优雅退出宽限 300 秒，systemctl stop 会干等 5 分钟，
+    // 只能靠 kill -9 收场。单机部署没有摘流需求，10 秒足够排空短连接。
+    if let Some(conf) = std::sync::Arc::get_mut(&mut server.configuration) {
+        conf.grace_period_seconds = Some(10);
+    }
     server.bootstrap();
 
     // 封禁表由调用方创建并传入（控制台也要用同一个实例）
