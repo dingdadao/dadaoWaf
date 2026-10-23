@@ -1,0 +1,264 @@
+[
+  {
+    "id": "local-pub-scanner-vuln",
+    "name": "扫描器 UA · 漏洞扫描",
+    "pattern": "(?i)(sqlmap|nikto|nuclei|acunetix|nessus|openvas|awvs|wpscan|xray/|appscan)",
+    "keywords": [
+      "sqlmap",
+      "nikto",
+      "nuclei",
+      "acunetix",
+      "nessus",
+      "openvas",
+      "awvs",
+      "wpscan",
+      "xray",
+      "appscan"
+    ],
+    "targets": [
+      "user_agent"
+    ],
+    "category": "scanner",
+    "severity": "high",
+    "action": "block",
+    "note": "公开扫描器默认 UA，来自各工具默认指纹"
+  },
+  {
+    "id": "local-pub-scanner-recon",
+    "name": "扫描器 UA · 资产测绘",
+    "pattern": "(?i)(nmap|masscan|zgrab|shodan|censys|whatweb|fofa|quake)",
+    "keywords": [
+      "nmap",
+      "masscan",
+      "zgrab",
+      "shodan",
+      "censys",
+      "whatweb",
+      "fofa",
+      "quake"
+    ],
+    "targets": [
+      "user_agent"
+    ],
+    "category": "scanner",
+    "severity": "high",
+    "action": "block",
+    "note": "资产测绘/端口扫描工具的 HTTP 指纹"
+  },
+  {
+    "id": "local-pub-scanner-dir",
+    "name": "扫描器 UA · 目录爆破",
+    "pattern": "(?i)(gobuster|dirsearch|ffuf|wfuzz|feroxbuster|\\bdirb/)",
+    "keywords": [
+      "gobuster",
+      "dirsearch",
+      "ffuf",
+      "wfuzz",
+      "feroxbuster",
+      "dirb/"
+    ],
+    "targets": [
+      "user_agent"
+    ],
+    "category": "scanner",
+    "severity": "high",
+    "action": "block",
+    "note": "目录/文件爆破工具默认 UA"
+  },
+  {
+    "id": "local-pub-dotenv",
+    "name": "敏感文件 · .env 探测",
+    "pattern": "(?i)(^|/)\\.env(\\.|/|$)",
+    "keywords": [
+      ".env"
+    ],
+    "targets": [
+      "path"
+    ],
+    "category": "leak",
+    "severity": "high",
+    "action": "block",
+    "note": "Laravel/Node 等项目根目录的密钥文件"
+  },
+  {
+    "id": "local-pub-git",
+    "name": "敏感文件 · .git 泄露",
+    "pattern": "(?i)/\\.git/(config|head|index|logs/)",
+    "keywords": [
+      ".git"
+    ],
+    "targets": [
+      "path"
+    ],
+    "category": "leak",
+    "severity": "high",
+    "action": "block",
+    "note": "源码仓库目录被暴露时可拉走全部代码"
+  },
+  {
+    "id": "local-pub-svn",
+    "name": "敏感文件 · .svn 泄露",
+    "pattern": "(?i)/\\.svn/(entries|wc\\.db|pristine/)",
+    "keywords": [
+      ".svn"
+    ],
+    "targets": [
+      "path"
+    ],
+    "category": "leak",
+    "severity": "medium",
+    "action": "block",
+    "note": "SVN 元数据泄露"
+  },
+  {
+    "id": "local-pub-backup",
+    "name": "敏感文件 · 备份/源码残留",
+    "pattern": "(?i)\\.(bak|old|swp|sql)$",
+    "keywords": [
+      ".bak",
+      ".old",
+      ".swp",
+      ".sql"
+    ],
+    "targets": [
+      "path"
+    ],
+    "category": "leak",
+    "severity": "high",
+    "action": "block",
+    "note": "数据库导出、编辑器残留、源码备份；正常下载的压缩包不受影响"
+  },
+  {
+    "id": "local-pub-aws",
+    "name": "敏感文件 · 云凭证",
+    "pattern": "(?i)/\\.(aws/credentials|kube/config|docker/config\\.json)",
+    "keywords": [
+      ".aws",
+      ".kube",
+      ".docker"
+    ],
+    "targets": [
+      "path"
+    ],
+    "category": "leak",
+    "severity": "critical",
+    "action": "block",
+    "note": "云厂商/容器编排凭证文件"
+  },
+  {
+    "id": "local-pub-phpmyadmin",
+    "name": "管理后台 · phpMyAdmin",
+    "pattern": "(?i)/phpmyadmin(/|$)",
+    "keywords": [
+      "phpmyadmin"
+    ],
+    "targets": [
+      "path"
+    ],
+    "category": "scanner",
+    "severity": "medium",
+    "action": "block",
+    "note": "暴露在公网的数据库管理入口，通常是被扫的重点"
+  },
+  {
+    "id": "local-pub-actuator",
+    "name": "管理后台 · Spring Actuator",
+    "pattern": "(?i)/actuator/(env|heapdump|jolokia|httptrace|mappings)",
+    "keywords": [
+      "/actuator/"
+    ],
+    "targets": [
+      "path"
+    ],
+    "category": "leak",
+    "severity": "high",
+    "action": "block",
+    "note": "Spring Boot 未鉴权的管理端点，可读配置与内存"
+  },
+  {
+    "id": "local-pub-tomcat",
+    "name": "管理后台 · Tomcat Manager",
+    "pattern": "(?i)/manager/html",
+    "keywords": [
+      "/manager/html"
+    ],
+    "targets": [
+      "path"
+    ],
+    "category": "scanner",
+    "severity": "medium",
+    "action": "block",
+    "note": "Tomcat 管理台，弱口令爆破的常见目标"
+  },
+  {
+    "id": "local-pub-webshell-eval",
+    "name": "WebShell · 一句话 eval",
+    "pattern": "(?i)\\b(eval|assert)\\s*\\(\\s*@?\\s*\\$_(post|get|request|cookie)",
+    "keywords": [
+      "eval",
+      "assert"
+    ],
+    "targets": [
+      "body",
+      "query"
+    ],
+    "category": "webshell",
+    "severity": "critical",
+    "action": "block",
+    "note": "菜刀/蚁剑一句话木马的核心特征：eval($_POST[...])"
+  },
+  {
+    "id": "local-pub-webshell-exec",
+    "name": "WebShell · 命令执行函数",
+    "pattern": "(?i)\\b(system|exec|shell_exec|passthru|popen|proc_open)\\s*\\(\\s*@?\\s*\\$_(post|get|request)",
+    "keywords": [
+      "system",
+      "exec",
+      "passthru",
+      "popen"
+    ],
+    "targets": [
+      "body",
+      "query"
+    ],
+    "category": "webshell",
+    "severity": "critical",
+    "action": "block",
+    "note": "参数直接进命令执行函数"
+  },
+  {
+    "id": "local-pub-webshell-b64",
+    "name": "WebShell · base64 载荷",
+    "pattern": "(?i)base64_decode\\s*\\(\\s*@?\\s*\\$_(post|get|request)",
+    "keywords": [
+      "base64_decode"
+    ],
+    "targets": [
+      "body",
+      "query"
+    ],
+    "category": "webshell",
+    "severity": "critical",
+    "action": "block",
+    "note": "菜刀默认用 base64 编码载荷，解码后再 eval"
+  },
+  {
+    "id": "local-pub-log4j",
+    "name": "Log4j · JNDI 注入",
+    "pattern": "\\$\\{jndi:(ldap|rmi|dns|http|iiop)",
+    "keywords": [
+      "jndi:"
+    ],
+    "targets": [
+      "path",
+      "query",
+      "header",
+      "body",
+      "user_agent"
+    ],
+    "category": "cmdi",
+    "severity": "critical",
+    "action": "block",
+    "note": "Log4Shell 及同族 JNDI 注入，头部与参数都可能携带"
+  }
+]

@@ -293,6 +293,11 @@ pub struct RuleMeta {
     pub targets: Vec<Target>,
     pub keywords: Vec<String>,
     pub action: Action,
+    /// 命中即拦：不再等分数累积到阈值。
+    ///
+    /// 用户手写的检测黑名单用这个语义——写一条就是要它拦，
+    /// 而不是"凑够分数才拦"。内置与订阅规则仍走阈值。
+    pub immediate: bool,
     /// 影子期内的规则只记录、不计入拦截分。
     pub shadow: bool,
     pub source: RuleSource,
@@ -309,6 +314,7 @@ impl From<&Rule> for RuleMeta {
             targets: rule.targets.to_vec(),
             keywords: rule.keywords.iter().map(|k| k.to_string()).collect(),
             action: rule.action,
+            immediate: false,
             shadow: false,
             source: RuleSource::Builtin,
         }

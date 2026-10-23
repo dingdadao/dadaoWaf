@@ -217,6 +217,7 @@ mod tests {
             targets: vec![Target::Query, Target::Body],
             keywords: keywords.iter().map(|s| s.to_string()).collect(),
             action: Action::Block,
+            immediate: false,
             shadow: false,
             source: RuleSource::Feed("test".to_string()),
         }

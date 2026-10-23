@@ -260,6 +260,8 @@ fn local_detect_metas(rules: &[homewaf_config::DetectRule]) -> Vec<homewaf_detec
             } else {
                 Action::Block
             },
+            // 用户手写的黑名单：命中即拦，不等分数累积
+            immediate: !rule.action.trim().eq_ignore_ascii_case("log"),
             shadow: false,
             source: RuleSource::Local,
         });

@@ -326,6 +326,7 @@ fn convert_rule(def: RuleDefinition, feed_name: &str) -> Result<RuleMeta, RuleFe
         targets,
         keywords,
         action,
+        immediate: false,
         shadow: false,
         source: RuleSource::Feed(feed_name.to_string()),
     })

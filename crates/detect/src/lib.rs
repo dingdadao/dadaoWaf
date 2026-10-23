@@ -95,6 +95,8 @@ pub struct Finding {
     pub target: Target,
     /// 实际处置。影子期内的订阅规则固定为 [`Action::Log`]。
     pub action: Action,
+    /// 命中即拦（用户手写的检测黑名单）
+    pub immediate: bool,
     /// 归一化后的命中片段，截断后用于日志
     pub evidence: String,
 }
@@ -240,8 +242,13 @@ impl Engine {
             .map(|f| f.severity.score())
             .sum();
 
+        // 用户手写的检测黑名单命中即拦，不等分数累积
+        let immediate = findings
+            .iter()
+            .any(|f| f.immediate && policy.mode(f.category) == CategoryMode::Block);
+
         Verdict {
-            blocked: !policy.observe && blocking_score >= policy.block_threshold,
+            blocked: !policy.observe && (immediate || blocking_score >= policy.block_threshold),
             observe: policy.observe,
             score,
             blocking_score,
@@ -294,6 +301,7 @@ impl Engine {
                 } else {
                     rule.action
                 },
+                immediate: rule.immediate && !rule.shadow,
                 evidence: truncate(&normalized.canonical, 120),
             });
         }
@@ -588,9 +596,49 @@ mod tests {
             targets: vec![Target::Query],
             keywords: vec!["shadow-marker".to_string()],
             action: Action::Block,
+            immediate: false,
             shadow,
             source: RuleSource::Feed("test".to_string()),
         }
+    }
+
+    #[test]
+    fn immediate_rule_blocks_below_threshold() {
+        // 用户手写的黑名单：medium(25) 也要立刻拦，不能等凑到阈值 50
+        let mut rule = feed_rule(false);
+        rule.severity = Severity::Medium;
+        rule.immediate = true;
+        rule.action = Action::Block;
+        let engine = Engine::with_extra_rules(vec![rule], false, 50).unwrap();
+
+        let verdict = engine.inspect(&InspectionInput {
+            path: "/".to_string(),
+            query: Some("x=shadow-marker".to_string()),
+            body: None,
+            user_agent: None,
+            cookie: None,
+            headers: Vec::new(),
+        });
+        assert!(verdict.score < 50, "分数应低于阈值");
+        assert!(verdict.blocked, "命中即拦，不应受阈值限制");
+    }
+
+    #[test]
+    fn non_immediate_rule_still_needs_threshold() {
+        let mut rule = feed_rule(false);
+        rule.severity = Severity::Medium;
+        rule.immediate = false;
+        let engine = Engine::with_extra_rules(vec![rule], false, 50).unwrap();
+
+        let verdict = engine.inspect(&InspectionInput {
+            path: "/".to_string(),
+            query: Some("x=shadow-marker".to_string()),
+            body: None,
+            user_agent: None,
+            cookie: None,
+            headers: Vec::new(),
+        });
+        assert!(!verdict.blocked, "内置/订阅规则仍走阈值");
     }
 
     #[test]
