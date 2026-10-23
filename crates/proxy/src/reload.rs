@@ -146,8 +146,11 @@ impl RuntimeState {
         let tls_certs = crate::tls::build_cert_map(&[], &config.applications, &config.tls)?;
         let router = Router::build(config.applications, allow_regex).map_err(|e| e.to_string())?;
 
+        // 订阅规则包 + 控制台里手工加的本地检测规则，走同一条匹配路径
+        let mut extra_rules = rule_feeds.rules;
+        extra_rules.extend(local_detect_metas(&config.custom_detect_rules));
         let engine = Engine::with_extra_rules(
-            rule_feeds.rules,
+            extra_rules,
             config.protection.observe_mode.enabled,
             config.protection.block_threshold.unwrap_or(50),
         )
@@ -192,6 +195,76 @@ impl RuntimeState {
     pub fn upstream_count(&self) -> usize {
         self.pool.total_upstreams()
     }
+}
+
+/// 把控制台里的本地检测规则转成运行时规则。
+///
+/// 与订阅规则包共用 `RuleMeta`，因此命中后一样计入分数、一样能触发自动封禁。
+/// 只转换启用且有正则的规则：非法正则在校验阶段就该被拦住，
+/// 这里再挡一次，避免一条坏规则让整次重载失败。
+fn local_detect_metas(rules: &[homewaf_config::DetectRule]) -> Vec<homewaf_detect::RuleMeta> {
+    use homewaf_detect::{Action, Category, RuleMeta, RuleSource, Severity, Target};
+
+    let mut out = Vec::new();
+    for rule in rules {
+        if !rule.enabled || rule.pattern.trim().is_empty() {
+            continue;
+        }
+        let category = match rule.category.trim().to_ascii_lowercase().as_str() {
+            "sqli" => Category::Sqli,
+            "xss" => Category::Xss,
+            "cmdi" => Category::CmdInjection,
+            "traversal" => Category::PathTraversal,
+            "ssrf" => Category::Ssrf,
+            "xxe" => Category::Xxe,
+            "ssti" => Category::Ssti,
+            "nosql" => Category::Nosql,
+            "ldap" => Category::LdapXpath,
+            "webshell" => Category::Webshell,
+            "scanner" => Category::Scanner,
+            "deserialization" => Category::Deserialization,
+            "crlf" => Category::Crlf,
+            "upload" => Category::FileUpload,
+            "bruteforce" => Category::Bruteforce,
+            "leak" => Category::SensitiveLeak,
+            _ => Category::Custom,
+        };
+        let severity = match rule.severity.trim().to_ascii_lowercase().as_str() {
+            "low" => Severity::Low,
+            "medium" => Severity::Medium,
+            "critical" => Severity::Critical,
+            _ => Severity::High,
+        };
+        let targets: Vec<Target> = rule
+            .targets
+            .iter()
+            .filter_map(|t| Target::parse(t))
+            .collect();
+        if targets.is_empty() {
+            continue;
+        }
+        out.push(RuleMeta {
+            id: rule.id.clone(),
+            name: if rule.name.trim().is_empty() {
+                rule.id.clone()
+            } else {
+                rule.name.clone()
+            },
+            category,
+            severity,
+            pattern: rule.pattern.clone(),
+            targets,
+            keywords: rule.keywords.iter().map(|k| k.to_lowercase()).collect(),
+            action: if rule.action.trim().eq_ignore_ascii_case("log") {
+                Action::Log
+            } else {
+                Action::Block
+            },
+            shadow: false,
+            source: RuleSource::Local,
+        });
+    }
+    out
 }
 
 /// 从订阅生成的 ACL 规则反解出「组名 → 条目」。
@@ -273,6 +346,7 @@ pub fn load_state_from_db_with(
     load_setting!("storage", config.storage);
     load_setting!("rule_feeds", config.rule_feeds);
     load_setting!("custom_rules", config.custom_rules);
+    load_setting!("custom_detect_rules", config.custom_detect_rules);
 
     // ACL 静态规则
     let rows = store

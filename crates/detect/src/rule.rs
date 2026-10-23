@@ -264,6 +264,8 @@ pub enum RuleSource {
     Builtin,
     /// 规则包订阅名称
     Feed(String),
+    /// 控制台里手工添加的本地规则
+    Local,
 }
 
 impl RuleSource {
@@ -271,6 +273,7 @@ impl RuleSource {
         match self {
             RuleSource::Builtin => "builtin",
             RuleSource::Feed(name) => name,
+            RuleSource::Local => "local",
         }
     }
 

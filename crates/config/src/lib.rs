@@ -23,7 +23,7 @@ use std::path::Path;
 pub use error::{ConfigError, Severity, ValidationError};
 pub use model::*;
 pub use units::{Duration, Size};
-pub use validate::{validate, validate_domain, ValidationReport};
+pub use validate::{regex_test, validate, validate_domain, ValidationReport};
 
 impl Config {
     /// 校验自身，返回报告（含 warning）。

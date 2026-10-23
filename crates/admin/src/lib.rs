@@ -105,6 +105,12 @@ pub fn router(state: Ctx) -> Router {
         )
         .route("/api/apps/{id}/tamper/scan", post(scan_app_tamper))
         .route("/api/rules", get(list_rules).post(upsert_rule))
+        .route(
+            "/api/detect-rules",
+            get(list_detect_rules).post(upsert_detect_rule),
+        )
+        .route("/api/detect-rules/{id}", delete(delete_detect_rule))
+        .route("/api/detect-rules/test", post(test_detect_rule))
         .route("/api/rules/{id}", delete(delete_rule))
         .route("/api/bans", get(list_bans).post(create_ban))
         .route("/api/bans/{ip}", delete(unban))
@@ -1752,6 +1758,183 @@ async fn list_rules(State(ctx): State<Ctx>, headers: HeaderMap) -> Response {
         .collect();
 
     Json(serde_json::json!({ "rules": rules, "apps": apps, "ip_groups": groups })).into_response()
+}
+
+// ============================================================
+// 自定义检测规则（检测黑名单）
+// ============================================================
+//
+// 与黑白名单的区别：这里写的是**内容特征**（正则），命中后计入检测分数，
+// 和内置规则一样能触发拦截与自动封禁；黑白名单是按请求元数据直接放行/拦截。
+
+const DETECT_RULES_KEY: &str = "custom_detect_rules";
+
+async fn list_detect_rules(State(ctx): State<Ctx>, headers: HeaderMap) -> Response {
+    if !authorized(&ctx, &headers) {
+        return unauthorized();
+    }
+    let rules: Vec<homewaf_config::DetectRule> = ctx
+        .store
+        .get_setting(DETECT_RULES_KEY)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    Json(serde_json::json!({ "rules": rules })).into_response()
+}
+
+/// 校验一组检测规则，只返回 custom_detect_rules 下的错误。
+fn validate_detect_rule_set(rules: Vec<homewaf_config::DetectRule>) -> Result<(), String> {
+    let report = homewaf_config::Config {
+        custom_detect_rules: rules,
+        ..Default::default()
+    }
+    .validate();
+
+    let errors: Vec<String> = report
+        .errors
+        .iter()
+        .filter(|e| e.path.starts_with("custom_detect_rules"))
+        .map(|e| e.message.clone())
+        .collect();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("；"))
+    }
+}
+
+async fn upsert_detect_rule(
+    State(ctx): State<Ctx>,
+    headers: HeaderMap,
+    Json(mut rule): Json<homewaf_config::DetectRule>,
+) -> Response {
+    if !authorized(&ctx, &headers) {
+        return unauthorized();
+    }
+
+    rule.id = rule.id.trim().to_string();
+    rule.name = rule.name.trim().to_string();
+    rule.pattern = rule.pattern.trim().to_string();
+    if rule.id.is_empty() {
+        rule.id = format!("local-{}", homewaf_acl::now_unix());
+    }
+    // 统一加 local- 前缀：避免和内置规则/订阅规则的 id 撞车（撞了整次重载会失败）
+    if !rule.id.starts_with("local-") {
+        rule.id = format!("local-{}", rule.id);
+    }
+    if !rule
+        .id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            "规则 ID 只能包含字母、数字、横线、下划线和点",
+        )
+            .into_response();
+    }
+
+    let mut rules: Vec<homewaf_config::DetectRule> = ctx
+        .store
+        .get_setting(DETECT_RULES_KEY)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let now = homewaf_acl::now_unix();
+    match rules.iter_mut().find(|r| r.id == rule.id) {
+        Some(existing) => {
+            rule.created_at = existing.created_at.or(Some(now));
+            *existing = rule.clone();
+        }
+        None => {
+            rule.created_at = Some(now);
+            rules.push(rule.clone());
+        }
+    }
+
+    if let Err(e) = validate_detect_rule_set(rules.clone()) {
+        return (StatusCode::BAD_REQUEST, e).into_response();
+    }
+
+    if let Err(e) = ctx.store.set_setting(DETECT_RULES_KEY, &rules, now) {
+        return internal(e).into_response();
+    }
+
+    match reload_state(&ctx) {
+        Ok(()) => Json(serde_json::json!({"ok": true, "id": rule.id})).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, format!("已写入，但重载失败：{e}")).into_response(),
+    }
+}
+
+/// 用 Rust 的 regex 引擎试跑一条规则。
+///
+/// 不能用前端 JS 的 RegExp：它不认 `(?i)`、`\p{Han}` 这些 Rust 支持的语法，
+/// 会把合法正则误判成非法。测试必须和线上跑的是同一个引擎。
+#[derive(Deserialize)]
+struct DetectTestInput {
+    pattern: String,
+    sample: String,
+    #[serde(default)]
+    keywords: Vec<String>,
+}
+
+async fn test_detect_rule(
+    State(ctx): State<Ctx>,
+    headers: HeaderMap,
+    Json(input): Json<DetectTestInput>,
+) -> Response {
+    if !authorized(&ctx, &headers) {
+        return unauthorized();
+    }
+
+    let matched = match homewaf_config::regex_test(&input.pattern, &input.sample) {
+        Ok(v) => v,
+        Err(e) => return Json(serde_json::json!({"valid": false, "error": e})).into_response(),
+    };
+
+    let lower = input.sample.to_lowercase();
+    let keyword_hit = input.keywords.is_empty()
+        || input
+            .keywords
+            .iter()
+            .any(|k| !k.trim().is_empty() && lower.contains(&k.trim().to_lowercase()));
+
+    Json(serde_json::json!({
+        "valid": true,
+        "matched": keyword_hit && matched,
+        "keyword_hit": keyword_hit,
+    }))
+    .into_response()
+}
+
+async fn delete_detect_rule(
+    State(ctx): State<Ctx>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if !authorized(&ctx, &headers) {
+        return unauthorized();
+    }
+    let mut rules: Vec<homewaf_config::DetectRule> = ctx
+        .store
+        .get_setting(DETECT_RULES_KEY)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let before = rules.len();
+    rules.retain(|r| r.id != id);
+    if rules.len() == before {
+        return (StatusCode::NOT_FOUND, "规则不存在").into_response();
+    }
+
+    let now = homewaf_acl::now_unix();
+    if let Err(e) = ctx.store.set_setting(DETECT_RULES_KEY, &rules, now) {
+        return internal(e).into_response();
+    }
+    match reload_state(&ctx) {
+        Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, format!("已删除，但重载失败：{e}")).into_response(),
+    }
 }
 
 /// 用完整配置校验一条规则：能查出错引用的应用与 IP 组。

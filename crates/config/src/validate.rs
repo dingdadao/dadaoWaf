@@ -79,6 +79,7 @@ pub fn validate(config: &Config) -> ValidationReport {
         &config.ip_groups,
         &mut ctx,
     );
+    validate_detect_rules(&config.custom_detect_rules, &mut ctx);
     validate_applications(&config.applications, &mut ctx);
 
     ctx.finish()
@@ -678,6 +679,124 @@ const KNOWN_OPERATORS: &[&str] = &[
     "match",
     "re",
 ];
+
+/// 用与运行时一致的引擎试跑一条正则。
+///
+/// 控制台的「测试」按钮走这里，而不是浏览器自带的 RegExp：
+/// JS 不认 `(?i)`、`\p{Han}` 这些 Rust 支持的语法，会把合法规则误判成非法。
+pub fn regex_test(pattern: &str, sample: &str) -> Result<bool, String> {
+    regex::Regex::new(pattern)
+        .map(|re| re.is_match(sample))
+        .map_err(|e| e.to_string())
+}
+
+// ============================================================
+// 自定义检测规则（检测黑名单）
+// ============================================================
+
+const DETECT_TARGETS: &[&str] = &["path", "query", "body", "header", "cookie", "user_agent"];
+const DETECT_SEVERITIES: &[&str] = &["low", "medium", "high", "critical"];
+const DETECT_ACTIONS: &[&str] = &["block", "log"];
+const DETECT_CATEGORIES: &[&str] = &[
+    "sqli",
+    "xss",
+    "cmdi",
+    "traversal",
+    "ssrf",
+    "xxe",
+    "ssti",
+    "nosql",
+    "ldap",
+    "webshell",
+    "scanner",
+    "deserialization",
+    "crlf",
+    "upload",
+    "bruteforce",
+    "leak",
+    "custom",
+];
+
+fn validate_detect_rules(rules: &[DetectRule], ctx: &mut Ctx) {
+    let mut seen = HashSet::new();
+
+    for (i, rule) in rules.iter().enumerate() {
+        let base = format!("custom_detect_rules[{i}]");
+
+        if rule.id.trim().is_empty() {
+            ctx.error(format!("{base}.id"), "规则 id 不能为空");
+        } else if rule.id.chars().count() > 64 {
+            ctx.error(format!("{base}.id"), "规则 id 不能超过 64 个字符");
+        } else if !rule
+            .id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        {
+            ctx.error(
+                format!("{base}.id"),
+                "规则 id 只能包含字母、数字、横线、下划线和点",
+            );
+        } else if !seen.insert(rule.id.as_str()) {
+            ctx.error(format!("{base}.id"), format!("规则 id `{}` 重复", rule.id));
+        }
+
+        if rule.name.chars().count() > 64 {
+            ctx.error(format!("{base}.name"), "规则名称不能超过 64 个字符");
+        }
+
+        if rule.pattern.trim().is_empty() {
+            ctx.error(format!("{base}.pattern"), "正则不能为空");
+        } else if let Err(e) = regex::Regex::new(&rule.pattern) {
+            // 写错的正则运行时只会静默不匹配，必须在保存前拦住
+            ctx.error(format!("{base}.pattern"), format!("正则非法：{e}"));
+        }
+
+        if rule.targets.is_empty() {
+            ctx.error(format!("{base}.targets"), "至少要选一个作用对象");
+        }
+        for (j, t) in rule.targets.iter().enumerate() {
+            if !DETECT_TARGETS.contains(&t.trim().to_ascii_lowercase().as_str()) {
+                ctx.error(
+                    format!("{base}.targets[{j}]"),
+                    format!("未知作用对象 `{t}`（支持 path/query/body/header/cookie/user_agent）"),
+                );
+            }
+        }
+
+        let severity = rule.severity.trim().to_ascii_lowercase();
+        if !DETECT_SEVERITIES.contains(&severity.as_str()) {
+            ctx.error(
+                format!("{base}.severity"),
+                format!(
+                    "未知分值档位 `{}`（支持 low/medium/high/critical）",
+                    rule.severity
+                ),
+            );
+        }
+
+        let action = rule.action.trim().to_ascii_lowercase();
+        if !DETECT_ACTIONS.contains(&action.as_str()) {
+            ctx.error(
+                format!("{base}.action"),
+                format!("未知动作 `{}`（支持 block/log）", rule.action),
+            );
+        }
+
+        let category = rule.category.trim().to_ascii_lowercase();
+        if !DETECT_CATEGORIES.contains(&category.as_str()) {
+            ctx.error(
+                format!("{base}.category"),
+                format!("未知分类 `{}`", rule.category),
+            );
+        }
+
+        for (j, kw) in rule.keywords.iter().enumerate() {
+            if kw.trim().is_empty() {
+                ctx.error(format!("{base}.keywords[{j}]"), "关键词不能为空");
+            }
+        }
+    }
+}
 
 fn validate_custom_rules(
     rules: &[CustomRule],
@@ -1518,6 +1637,62 @@ mod tests {
             v: v.iter().map(|s| s.to_string()).collect(),
             sub_k: None,
         }
+    }
+
+    // ============================================================
+    // 自定义检测规则
+    // ============================================================
+
+    fn detect(id: &str, pattern: &str) -> DetectRule {
+        DetectRule {
+            id: id.to_string(),
+            name: "测试规则".to_string(),
+            pattern: pattern.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn valid_detect_rule_passes() {
+        let report = validate(&Config {
+            custom_detect_rules: vec![detect("local-1", r"(?i)evilscanner")],
+            ..Default::default()
+        });
+        assert!(
+            !report
+                .errors
+                .iter()
+                .any(|e| e.path.starts_with("custom_detect_rules")),
+            "{:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn detect_rule_rejects_bad_regex_and_target() {
+        let mut rule = detect("local-1", "([a-z");
+        rule.targets = vec!["bodyy".to_string()];
+        let report = validate(&Config {
+            custom_detect_rules: vec![rule],
+            ..Default::default()
+        });
+        let msgs: Vec<&str> = report
+            .errors
+            .iter()
+            .filter(|e| e.path.starts_with("custom_detect_rules"))
+            .map(|e| e.message.as_str())
+            .collect();
+        assert!(msgs.iter().any(|m| m.contains("正则非法")), "{msgs:?}");
+        assert!(msgs.iter().any(|m| m.contains("未知作用对象")), "{msgs:?}");
+    }
+
+    #[test]
+    fn detect_rule_rejects_duplicate_id() {
+        let report = validate(&Config {
+            custom_detect_rules: vec![detect("local-1", "a"), detect("local-1", "b")],
+            ..Default::default()
+        });
+        assert!(report.errors.iter().any(|e| e.message.contains("重复")));
     }
 
     #[test]

@@ -37,6 +37,8 @@ pub struct Config {
     pub applications: Vec<Application>,
     /// 自定义规则。兼容雷池（长亭）的 pattern / action 0|1 格式。
     pub custom_rules: Vec<CustomRule>,
+    /// 自定义检测规则（本地规则）：命中后计入检测分数，可直接拦截。
+    pub custom_detect_rules: Vec<DetectRule>,
 }
 
 // ============================================================
@@ -76,6 +78,53 @@ pub struct CustomRule {
     pub expires_at: Option<i64>,
     /// 外层 OR，内层 AND
     pub pattern: Vec<Vec<RuleCondition>>,
+}
+
+/// 一条自定义检测规则（「检测黑名单」）。
+///
+/// 与内置检测规则走同一条匹配路径，区别只是来源是用户自己写的。
+/// 用途：攻击者用了某个新特征（特定 UA、特定参数、特定 payload），
+/// 等不到规则包更新，先自己加一条直接拦掉。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct DetectRule {
+    pub id: String,
+    pub name: String,
+    pub enabled: bool,
+    /// 正则，作用于归一化后的文本
+    pub pattern: String,
+    /// 预过滤关键词（小写）。命中任一才跑正则，为空表示每次都跑
+    pub keywords: Vec<String>,
+    /// 作用对象：path / query / body / header / cookie / user_agent
+    pub targets: Vec<String>,
+    /// 分类，用于统计与展示：sqli / xss / scanner / custom ...
+    pub category: String,
+    /// 分值档位：low(10) / medium(25) / high(50) / critical(80)
+    pub severity: String,
+    /// block / log
+    pub action: String,
+    pub note: String,
+    pub created_at: Option<i64>,
+}
+
+impl Default for DetectRule {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: String::new(),
+            enabled: true,
+            pattern: String::new(),
+            keywords: Vec::new(),
+            // 默认扫 URL 与请求体：绝大多数特征都在这里
+            targets: vec!["path".to_string(), "query".to_string(), "body".to_string()],
+            category: "custom".to_string(),
+            // 默认 high：单条即可越过默认拦截阈值 50
+            severity: "high".to_string(),
+            action: "block".to_string(),
+            note: String::new(),
+            created_at: None,
+        }
+    }
 }
 
 /// 条件组之间的组合方式。

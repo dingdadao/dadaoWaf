@@ -798,6 +798,7 @@
         <a data-page="certs">证书管理</a>
         <a data-page="rules">黑白名单</a>
         <a data-page="whitelist">检测白名单</a>
+        <a data-page="detect-rules">检测黑名单</a>
       </div>
       <div class="nav-group">
         <div class="nav-title">订阅</div>
@@ -1136,6 +1137,24 @@
             </div>
           </form>
           <div id="whitelist"></div>
+        </section>
+      </div>
+
+      <!-- ========== 检测黑名单（自定义检测规则） ========== -->
+      <div class="page" data-page="detect-rules">
+        <section class="card">
+          <header>
+            <h2>检测黑名单（自定义检测规则）</h2>
+            <div class="filters">
+              <input id="dr-q" placeholder="搜索名称 / 正则 / 规则 ID" style="min-width:200px" oninput="renderDetectRules()">
+              <button class="primary" onclick="showDetectForm()">+ 新建规则</button>
+            </div>
+          </header>
+          <div class="hint" style="padding:0 16px 10px;font-size:12px;color:var(--muted)">
+            正则作用于归一化后的请求内容，命中后计入检测分数（high 即可越过默认拦截阈值 50）。
+            和黑白名单不同：这里匹配的是<strong>内容特征</strong>，命中会正常参与评分与自动封禁。
+          </div>
+          <div id="detect-rules"></div>
         </section>
       </div>
 
@@ -1480,6 +1499,44 @@
     </div>
   </div>
 
+
+  <!-- 检测规则编辑器 -->
+  <div class="modal-mask" id="dr-modal" onclick="if(event.target===this)hideDetectForm()">
+    <div class="modal" style="width:min(820px,94vw)">
+      <header><h2 id="dr-modal-title">新建检测规则</h2><button onclick="hideDetectForm()">关闭</button></header>
+      <form id="dr-form" onsubmit="submitDetectRule(event)">
+        <div><label for="dr-name">规则名称</label><input id="dr-name" placeholder="例如：拦截某扫描器特征" required></div>
+        <div><label for="dr-id">规则 ID（留空自动生成）</label><input id="dr-id" placeholder="自动加 local- 前缀"></div>
+        <div class="wide"><label for="dr-pattern">正则</label>
+          <textarea id="dr-pattern" rows="3" placeholder="(?i)union[\\s\\S]{0,30}select" style="font-family:ui-monospace,Menlo,monospace"></textarea>
+        </div>
+        <div class="wide"><label for="dr-keywords">预过滤关键词（可选，逗号分隔；命中任一才跑正则，能显著降开销）</label>
+          <input id="dr-keywords" placeholder="union, select">
+        </div>
+        <div class="wide"><label>作用对象</label>
+          <div id="dr-targets" style="display:flex;gap:16px;flex-wrap:wrap"></div>
+        </div>
+        <div><label for="dr-category">分类</label><select id="dr-category"></select></div>
+        <div><label for="dr-severity">分值</label><select id="dr-severity"></select></div>
+        <div><label for="dr-action">动作</label>
+          <select id="dr-action"><option value="block">拦截</option><option value="log">仅记录</option></select>
+        </div>
+        <div class="wide"><label for="dr-test">正则测试（可选）</label>
+          <div style="display:flex;gap:8px">
+            <input id="dr-test" placeholder="粘贴一段样例内容，点测试看是否命中" style="flex:1">
+            <button type="button" onclick="testDetectPattern()">测试</button>
+          </div>
+          <div class="hint" id="dr-test-result" style="min-height:18px"></div>
+        </div>
+        <div class="wide"><label for="dr-note">备注</label><input id="dr-note" placeholder="为什么要加这条"></div>
+        <div style="display:flex;gap:8px">
+          <button type="submit" class="primary" id="dr-submit">提交</button>
+          <button type="button" onclick="hideDetectForm()">取消</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
 <script>
 // ============================================================
 // 基础工具
@@ -1515,7 +1572,7 @@ const durationToSecs = (d) => {
 // 页面切换
 // ============================================================
 const PAGE_TITLES = {
-  statistics: '统计报表', apps: '防护应用', certs: '证书管理', attack: '攻击防护', rules: '黑白名单',
+  statistics: '统计报表', apps: '防护应用', certs: '证书管理', attack: '攻击防护', rules: '黑白名单', 'detect-rules': '检测黑名单',
   whitelist: '检测白名单', subscriptions: '订阅源',
   bans: '封禁', events: '事件', logs: '日志', system: '系统设置',
 };
@@ -1531,7 +1588,8 @@ function gotoPage(page) {
   document.getElementById('page-title').textContent = PAGE_TITLES[page] || page;
 
   // 切换时按需加载
-  ({ apps: loadApps, certs: loadCerts, attack: loadAttackPage, rules: loadRules, whitelist: loadWhitelist, subscriptions: loadSubs,
+  ({ apps: loadApps, certs: loadCerts, attack: loadAttackPage, rules: loadRules, whitelist: loadWhitelist,
+     'detect-rules': loadDetectRules, subscriptions: loadSubs,
      bans: loadBans, events: loadEvents, logs: loadLogs, system: loadSystemPage,
      statistics: loadStatistics }[page] || (() => {}))();
 }
@@ -3083,6 +3141,189 @@ async function deleteRule(id) {
   if (!confirm(`删除规则「${r ? (r.name || id) : id}」？`)) return;
   try { await api('/rules/' + encodeURIComponent(id), { method: 'DELETE' }); showMsg('已删除'); loadRules(); loadStatistics(); }
   catch (e) { showMsg('删除失败：' + e.message, 'error'); }
+}
+
+// ============================================================
+// 检测黑名单（自定义检测规则）
+// ============================================================
+const DR_TARGETS = [
+  ['path', '路径'], ['query', '查询参数'], ['body', '请求体'],
+  ['header', '请求头'], ['cookie', 'Cookie'], ['user_agent', 'User-Agent'],
+];
+const DR_CATEGORIES = [
+  ['custom', '自定义'], ['sqli', 'SQL 注入'], ['xss', 'XSS'], ['cmdi', '命令注入'],
+  ['traversal', '路径穿越'], ['ssrf', 'SSRF'], ['xxe', 'XXE'], ['ssti', '模板注入'],
+  ['nosql', 'NoSQL 注入'], ['ldap', 'LDAP/XPath'], ['webshell', 'Webshell'],
+  ['scanner', '扫描器'], ['deserialization', '反序列化'], ['crlf', 'CRLF 注入'],
+  ['upload', '恶意上传'], ['bruteforce', '暴力破解'], ['leak', '信息泄露'],
+];
+const DR_SEVERITY = [['low', '低（10 分）'], ['medium', '中（25 分）'], ['high', '高（50 分）'], ['critical', '严重（80 分）']];
+const DR_SCORE = { low: 10, medium: 25, high: 50, critical: 80 };
+const DR_CATEGORY_LABEL = Object.fromEntries(DR_CATEGORIES);
+const DR_TARGET_LABEL = Object.fromEntries(DR_TARGETS);
+
+let drCache = [];
+let editingDr = null;
+
+async function loadDetectRules() {
+  const el = document.getElementById('detect-rules');
+  try {
+    const data = await api('/detect-rules');
+    drCache = data.rules || [];
+    renderDetectRules();
+  } catch (e) { el.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`; }
+}
+
+function renderDetectRules() {
+  const el = document.getElementById('detect-rules');
+  const q = (document.getElementById('dr-q')?.value || '').trim().toLowerCase();
+  const rows = drCache.filter(r => !q
+    || (r.name || '').toLowerCase().includes(q)
+    || (r.pattern || '').toLowerCase().includes(q)
+    || r.id.toLowerCase().includes(q));
+
+  if (!rows.length) {
+    el.innerHTML = `<div class="empty">${drCache.length
+      ? '没有匹配的规则'
+      : '还没有自定义检测规则。内置规则覆盖不到的“已知攻击特征”，可以在这里加一条，保存后立刻生效。'}</div>`;
+    return;
+  }
+
+  el.innerHTML = `<table>
+    <thead><tr><th>规则名称</th><th>匹配特征</th><th>作用对象</th><th>分类</th><th>分值</th><th style="width:70px">状态</th><th style="width:140px">创建时间</th><th></th></tr></thead>
+    <tbody>${rows.map(r => `<tr>
+      <td><b>${esc(r.name || r.id)}</b><div class="sub" style="margin:2px 0 0"><code>${esc(r.id)}</code></div>
+        ${r.note ? `<div class="sub" style="margin:2px 0 0">${esc(r.note)}</div>` : ''}</td>
+      <td style="max-width:380px"><code style="word-break:break-all;font-size:12px">${esc(r.pattern)}</code>
+        ${(r.keywords || []).length ? `<div class="sub" style="margin:2px 0 0">关键词：${esc(r.keywords.join(', '))}</div>` : ''}</td>
+      <td>${(r.targets || []).map(t => `<span class="tag">${esc(DR_TARGET_LABEL[t] || t)}</span>`).join(' ')}</td>
+      <td>${esc(DR_CATEGORY_LABEL[r.category] || r.category)}</td>
+      <td><span class="tag ${r.severity === 'critical' ? 'deny' : r.severity === 'high' ? 'deny' : 'log'}">${DR_SCORE[r.severity] || 0}</span></td>
+      <td><label class="rswitch">
+        <input type="checkbox" ${r.enabled !== false ? 'checked' : ''} onchange="toggleDetectRule('${esc(r.id)}', this.checked)">
+        <span></span></label></td>
+      <td class="mono muted">${r.created_at ? fmtTime(r.created_at) : '-'}</td>
+      <td style="white-space:nowrap">
+        <button onclick="showDetectForm('${esc(r.id)}')">编辑</button>
+        <button class="danger" onclick="deleteDetectRule('${esc(r.id)}')">删除</button>
+      </td>
+    </tr>`).join('')}</tbody></table>`;
+}
+
+function renderDetectFormOptions(rule) {
+  document.getElementById('dr-targets').innerHTML = DR_TARGETS.map(([v, label]) => `
+    <label class="row" style="margin:0"><input type="checkbox" class="dr-target" value="${v}"
+      ${(rule.targets || []).includes(v) ? 'checked' : ''}> ${label}</label>`).join('');
+  document.getElementById('dr-category').innerHTML = DR_CATEGORIES.map(([v, label]) =>
+    `<option value="${v}" ${v === rule.category ? 'selected' : ''}>${label}</option>`).join('');
+  document.getElementById('dr-severity').innerHTML = DR_SEVERITY.map(([v, label]) =>
+    `<option value="${v}" ${v === rule.severity ? 'selected' : ''}>${label}</option>`).join('');
+}
+
+function showDetectForm(id) {
+  editingDr = id ? drCache.find(r => r.id === id) : null;
+  const r = editingDr || {
+    id: '', name: '', enabled: true, pattern: '', keywords: [],
+    targets: ['path', 'query', 'body'], category: 'custom', severity: 'high',
+    action: 'block', note: '',
+  };
+  document.getElementById('dr-modal-title').textContent = editingDr ? '编辑检测规则' : '新建检测规则';
+  document.getElementById('dr-id').value = r.id || '';
+  document.getElementById('dr-id').readOnly = !!editingDr;
+  document.getElementById('dr-name').value = r.name || '';
+  document.getElementById('dr-pattern').value = r.pattern || '';
+  document.getElementById('dr-keywords').value = (r.keywords || []).join(', ');
+  document.getElementById('dr-action').value = r.action === 'log' ? 'log' : 'block';
+  document.getElementById('dr-note').value = r.note || '';
+  document.getElementById('dr-test').value = '';
+  document.getElementById('dr-test-result').textContent = '';
+  renderDetectFormOptions(r);
+  document.getElementById('dr-modal').classList.add('show');
+  document.getElementById('dr-name').focus();
+}
+
+function hideDetectForm() {
+  document.getElementById('dr-modal').classList.remove('show');
+  editingDr = null;
+}
+
+function collectDetectRule() {
+  return {
+    id: document.getElementById('dr-id').value.trim(),
+    name: document.getElementById('dr-name').value.trim(),
+    enabled: editingDr ? editingDr.enabled !== false : true,
+    pattern: document.getElementById('dr-pattern').value.trim(),
+    keywords: document.getElementById('dr-keywords').value.split(',').map(s => s.trim()).filter(Boolean),
+    targets: [...document.querySelectorAll('.dr-target:checked')].map(el => el.value),
+    category: document.getElementById('dr-category').value,
+    severity: document.getElementById('dr-severity').value,
+    action: document.getElementById('dr-action').value,
+    note: document.getElementById('dr-note').value.trim(),
+    created_at: editingDr?.created_at ?? null,
+  };
+}
+
+async function submitDetectRule(e) {
+  e.preventDefault();
+  const btn = document.getElementById('dr-submit');
+  const rule = collectDetectRule();
+  if (!rule.name) return showMsg('请填写规则名称', 'error');
+  if (!rule.pattern) return showMsg('请填写正则', 'error');
+  if (!rule.targets.length) return showMsg('至少要选一个作用对象', 'error');
+  // 正则合法性交给服务端判定：浏览器 RegExp 不认 (?i) 这类 Rust 语法
+
+  btn.disabled = true; btn.textContent = '提交中…';
+  try {
+    await api('/detect-rules', { method: 'POST', body: JSON.stringify(rule) });
+    showMsg(`检测规则「${rule.name}」已保存，已生效`);
+    hideDetectForm(); loadDetectRules();
+  } catch (err) { showMsg('保存失败：' + err.message, 'error'); }
+  finally { btn.disabled = false; btn.textContent = '提交'; }
+}
+
+async function toggleDetectRule(id, enabled) {
+  const r = drCache.find(x => x.id === id);
+  if (!r) return;
+  try {
+    await api('/detect-rules', { method: 'POST', body: JSON.stringify({ ...r, enabled }) });
+    showMsg(`${r.name || id} 已${enabled ? '启用' : '停用'}`);
+    loadDetectRules();
+  } catch (e) { showMsg('操作失败：' + e.message, 'error'); loadDetectRules(); }
+}
+
+async function deleteDetectRule(id) {
+  const r = drCache.find(x => x.id === id);
+  if (!confirm(`删除检测规则「${r ? (r.name || id) : id}」？`)) return;
+  try { await api('/detect-rules/' + encodeURIComponent(id), { method: 'DELETE' }); showMsg('已删除'); loadDetectRules(); }
+  catch (e) { showMsg('删除失败：' + e.message, 'error'); }
+}
+
+async function testDetectPattern() {
+  const out = document.getElementById('dr-test-result');
+  const pattern = document.getElementById('dr-pattern').value.trim();
+  const sample = document.getElementById('dr-test').value;
+  const keywords = document.getElementById('dr-keywords').value.split(',').map(s => s.trim()).filter(Boolean);
+  if (!pattern) { out.textContent = '先填正则'; return; }
+  out.textContent = '测试中…';
+  try {
+    const res = await api('/detect-rules/test', {
+      method: 'POST',
+      body: JSON.stringify({ pattern, sample, keywords }),
+    });
+    if (!res.valid) {
+      out.innerHTML = `<span style="color:var(--danger)">正则非法：${esc(res.error || '')}</span>`;
+      return;
+    }
+    if (!res.keyword_hit) {
+      out.innerHTML = '<span style="color:var(--warn)">未命中</span>：关键词预过滤没通过，正则不会执行';
+      return;
+    }
+    out.innerHTML = res.matched
+      ? '<span style="color:var(--danger)">命中</span>：这段内容会被这条规则拦下'
+      : '<span style="color:var(--ok)">未命中</span>：这段内容不会被这条规则拦';
+  } catch (err) {
+    out.innerHTML = `<span style="color:var(--danger)">测试失败：${esc(err.message)}</span>`;
+  }
 }
 
 // ============================================================
