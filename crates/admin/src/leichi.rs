@@ -283,8 +283,25 @@ pub fn sync(store: &Store, req: &SyncRequest) -> Result<SyncReport, String> {
     }
 
     if !req.preview {
-        // 证书
+        // 证书：带 id 的是续期，更新原记录；没有 id 才新增
         for cert in new_certs.drain(..) {
+            if let Some(id) = cert.id {
+                let updated = store
+                    .update_certificate(
+                        id,
+                        &cert.name,
+                        &cert.cert_pem,
+                        &cert.key_pem,
+                        &cert.domains,
+                        cert.not_before,
+                        cert.not_after,
+                        now,
+                    )
+                    .map_err(|e| format!("更新证书失败：{e}"))?;
+                if updated {
+                    continue;
+                }
+            }
             store
                 .insert_certificate(
                     &cert.name,
@@ -547,12 +564,37 @@ fn group_label(node: &Value) -> String {
 }
 
 struct NewCert {
+    /// 已存在的证书续期时带上 id，写库走 update，避免重复插入
+    id: Option<i64>,
     name: String,
     cert_pem: String,
     key_pem: String,
     domains: String,
     not_before: i64,
     not_after: i64,
+}
+
+/// 雷池不同版本的证书字段位置不一致：优先 `manual.crt/key`，也接受顶层
+/// `crt/key`、`cert/key_pem` 等命名。
+fn cert_field(obj: Option<&Value>, keys: &[&str]) -> String {
+    let Some(obj) = obj else {
+        return String::new();
+    };
+    for key in keys {
+        if let Some(s) = obj.get(*key).and_then(|v| v.as_str()) {
+            let s = s.trim();
+            if !s.is_empty() {
+                return s.to_string();
+            }
+        }
+    }
+    String::new()
+}
+
+fn shares_domain(a: &str, b: &str) -> bool {
+    a.split(',')
+        .map(|d| d.trim().to_ascii_lowercase())
+        .any(|d| !d.is_empty() && d == b.trim().to_ascii_lowercase())
 }
 
 fn fetch_certs(
@@ -592,16 +634,14 @@ fn fetch_certs(
             }
         };
         let manual = detail.get("manual");
-        let crt = manual
-            .and_then(|m| m.get("crt"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim();
-        let key = manual
-            .and_then(|m| m.get("key"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim();
+        let mut crt = cert_field(manual, &["crt", "cert", "cert_pem"]);
+        if crt.is_empty() {
+            crt = cert_field(Some(&detail), &["crt", "cert", "cert_pem"]);
+        }
+        let mut key = cert_field(manual, &["key", "key_pem", "private_key"]);
+        if key.is_empty() {
+            key = cert_field(Some(&detail), &["key", "key_pem", "private_key"]);
+        }
         if crt.is_empty() {
             stat.skipped += 1;
             report
@@ -609,18 +649,7 @@ fn fetch_certs(
                 .push(format!("证书 #{id} 没有证书链内容，跳过"));
             continue;
         }
-        // ACME / 托管证书在雷池侧不导出私钥：证书链照常登记（控制台可见），
-        // 但没有私钥无法用于 TLS 握手，只能提示手动补齐。
-        if key.is_empty() {
-            report.warnings.push(format!(
-                "证书 #{id} 为 ACME / 托管证书，雷池不提供私钥，已登记证书链但不会用于 TLS，需手动上传私钥"
-            ));
-        }
-        if existing.iter().any(|row| row.cert_pem == crt) {
-            stat.imported += 1;
-            continue;
-        }
-        let info = match crate::certs::parse_cert(crt) {
+        let info = match crate::certs::parse_cert(&crt) {
             Ok(info) => info,
             Err(e) => {
                 stat.skipped += 1;
@@ -635,15 +664,56 @@ fn fetch_certs(
             .unwrap_or("")
             .trim()
             .to_string();
+        // 同域名视为同一张证书：内容没变就跳过，续期了就更新原记录。
+        let matched = existing
+            .iter()
+            .find(|row| shares_domain(&row.domains, &first));
+        if let Some(row) = matched {
+            if row.cert_pem.trim() == crt {
+                stat.imported += 1;
+                continue;
+            }
+            if key.is_empty() {
+                stat.skipped += 1;
+                report.warnings.push(format!(
+                    "证书 #{id}（{first}）已续期但雷池不提供私钥，保留现有证书不覆盖"
+                ));
+                continue;
+            }
+            if !preview {
+                new_certs.push(NewCert {
+                    id: Some(row.id),
+                    name: row.name.clone(),
+                    cert_pem: crt.clone(),
+                    key_pem: key.clone(),
+                    domains: info.domains.clone(),
+                    not_before: info.not_before,
+                    not_after: info.not_after,
+                });
+            }
+            stat.imported += 1;
+            report
+                .items
+                .push(format!("证书 {}（{}，续期）", first, info.domains));
+            continue;
+        }
+        // ACME / 托管证书在雷池侧不导出私钥：证书链照常登记（控制台可见），
+        // 但没有私钥无法用于 TLS 握手，只能提示手动补齐。
+        if key.is_empty() {
+            report.warnings.push(format!(
+                "证书 #{id} 为 ACME / 托管证书，雷池不提供私钥，已登记证书链但不会用于 TLS，需手动上传私钥"
+            ));
+        }
         if !preview {
             new_certs.push(NewCert {
+                id: None,
                 name: if first.is_empty() {
                     format!("lei-cert-{id}")
                 } else {
                     first.clone()
                 },
-                cert_pem: crt.to_string(),
-                key_pem: key.to_string(),
+                cert_pem: crt.clone(),
+                key_pem: key.clone(),
                 domains: info.domains.clone(),
                 not_before: info.not_before,
                 not_after: info.not_after,
@@ -1149,5 +1219,28 @@ mod tests {
         assert_eq!(app.upstreams[0].tls.as_ref().map(|t| t.verify), Some(false));
         assert_eq!(app.tls.mode, TlsMode::Auto);
         assert!(app.enabled);
+    }
+
+    #[test]
+    fn cert_fields_accept_manual_and_flat_shapes() {
+        let manual = json!({"manual": {"crt": "CERT-A", "key": "KEY-A"}});
+        assert_eq!(
+            cert_field(manual.get("manual"), &["crt", "cert"]),
+            "CERT-A"
+        );
+        assert_eq!(cert_field(manual.get("manual"), &["key"]), "KEY-A");
+        assert_eq!(cert_field(Some(&manual), &["crt"]), "");
+
+        let flat = json!({"crt": "CERT-B", "key_pem": "KEY-B"});
+        assert_eq!(cert_field(Some(&flat), &["crt"]), "CERT-B");
+        assert_eq!(cert_field(Some(&flat), &["key", "key_pem"]), "KEY-B");
+    }
+
+    #[test]
+    fn domain_match_is_case_insensitive_and_handles_lists() {
+        assert!(shares_domain("a.com,www.a.com", "A.COM"));
+        assert!(shares_domain(" www.a.com ", "WWW.A.COM"));
+        assert!(!shares_domain("a.com", "b.com"));
+        assert!(!shares_domain("", "a.com"));
     }
 }

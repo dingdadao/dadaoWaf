@@ -959,6 +959,7 @@
           </header>
           <div class="hint" style="padding:10px 16px;border-bottom:1px solid var(--border)">
             证书按域名（SAN / CN）自动匹配 SNI，未匹配的请求使用默认证书。HTTPS 监听需要至少一张证书。
+            从雷池同步的 ACME 证书只登记证书链，会标记「缺私钥」，补传私钥后才可用于 TLS。
           </div>
           <div id="certs"></div>
         </section>
@@ -983,17 +984,28 @@
         </section>
 
         <section class="card">
-          <header><h2>第三方远程部署（雷池兼容）</h2></header>
+          <header><h2>第三方证书推送（Certd / 雷池兼容）</h2></header>
           <div class="fieldset">
             <div class="wide hint">
-              <code>POST /api/UploadSSLCertAPI</code>（multipart：crt_file / key_file / name / id）、
-              <code>GET /api/CertAPI</code>、<code>DELETE /api/CertAPI</code>，
-              请求头 <code>X-SLCE-API-Token</code>。
+              <strong>Certd：</strong>新建「长亭雷池授权」，地址填本机管理地址
+              （如 <code>http://10.0.0.31:9443</code>），ApiToken 填下方这个 <strong>HomeWAF API Token</strong>；
+              流水线中添加「雷池-更新证书」，证书 ID 选 0 表示新增，或选已有证书做续期。
+              这里用的不是「系统设置 → 雷池同步」里的雷池 Token。
             </div>
-            <div class="wide"><label for="api-token">API Token</label>
+            <div class="wide hint">
+              雷池开放接口：<code>GET /api/open/health</code>、<code>GET /api/open/cert</code>、
+              <code>GET /api/open/cert/{id}</code>、<code>POST /api/open/cert</code>
+              （JSON：<code>{"manual":{"crt","key"}}</code>，同域名自动按续期更新）、
+              <code>DELETE /api/open/cert/{id}</code>。<br>
+              也兼容：<code>POST /api/UploadSSLCertAPI</code>（multipart：crt_file / key_file / name / id）、
+              <code>GET /api/CertAPI</code>、<code>DELETE /api/CertAPI</code>。
+              请求头统一为 <code>X-SLCE-API-Token</code>；雷池「配置同步」把从节点指向本机时也用这套接口。
+            </div>
+            <div class="wide"><label for="api-token">HomeWAF API Token（Certd / 第三方脚本用）</label>
               <input id="api-token" readonly placeholder="尚未生成"></div>
             <div><button class="primary" onclick="rotateApiToken()">生成新 Token</button></div>
-            <div class="wide hint">重新生成后旧 Token 立即失效。第三方脚本只需把证书与私钥 POST 到本机管理端口即可完成部署。</div>
+            <div class="wide hint">重新生成后旧 Token 立即失效。尚未生成 Token 时，第三方接口一律返回 401；
+              第三方脚本只需把证书与私钥 POST 到本机管理端口即可完成部署。</div>
           </div>
         </section>
       </div>
@@ -1319,6 +1331,10 @@
                 带订阅地址的 IP 组建成「IP 组订阅」（<code>lei-ipgroup-组ID</code>）。
                 本地手工创建、未被雷池管理的规则与订阅会保留。ACME 托管证书只登记证书链，
                 没有私钥不会用于 TLS，需要在证书页补传私钥。
+              </div>
+              <div class="wide hint">
+                下面填的是 <strong>雷池自己的 API Token</strong>，只用于从雷池拉取配置。
+                Certd 自动签发后推送证书请在「证书管理」页使用 <strong>HomeWAF API Token</strong>，两者不要混用。
               </div>
               <div class="wide"><label for="leichi-url">雷池地址</label>
                 <input id="leichi-url" placeholder="https://10.0.0.14:9443"></div>
@@ -3321,8 +3337,8 @@ async function loadCerts() {
         <td>${fmtTime(c.not_before)} ~ ${fmtTime(c.not_after)}
           ${c.expired ? '<span class="tag deny">已过期</span>' : ''}</td>
         <td>${esc(c.issuer || '')}</td>
-        <td>${c.has_key === false
-          ? '<span class="tag deny">缺私钥</span><div class="sub" style="margin:2px 0 0">仅登记证书链，需补传私钥才能用于 TLS</div>'
+        <td style="white-space:nowrap">${c.has_key === false
+          ? '<span class="tag deny" title="仅登记证书链，需补传私钥才能用于 TLS">缺私钥</span>'
           : (c.expired ? '<span class="tag deny">不可用</span>' : '<span class="tag allow">可用</span>')}</td>
         <td>${c.is_default ? '<span class="tag allow">默认</span>' : `<button onclick="setDefaultCert(${c.id})">设为默认</button>`}</td>
         <td>

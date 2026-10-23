@@ -132,6 +132,13 @@ pub fn router(state: Ctx) -> Router {
             get(slce_list_certs).delete(slce_delete_cert),
         )
         .route("/api/UploadSSLCertAPI", post(slce_upload_cert))
+        // 雷池开放接口：主从配置同步/第三方脚本按雷池文档直接对接
+        .route("/api/open/health", get(open_health))
+        .route("/api/open/cert", get(open_list_certs).post(open_upsert_cert))
+        .route(
+            "/api/open/cert/{id}",
+            get(open_get_cert).delete(open_delete_cert),
+        )
         .route("/api/settings", get(get_all_settings))
         .route("/api/settings/{key}", get(get_setting).put(put_setting))
         .route("/api/system/info", get(system_info))
@@ -3349,8 +3356,16 @@ async fn set_default_cert(
 }
 
 fn delete_cert_inner(ctx: &AdminState, id: i64) -> Result<(), ApiError> {
+    // 证书删除是不可逆的管理动作，先取出名称留审计线索
+    let name = ctx
+        .store
+        .get_certificate(id)
+        .map_err(internal)?
+        .map(|c| c.name)
+        .unwrap_or_default();
     match ctx.store.delete_certificate(id).map_err(internal)? {
         true => {
+            tracing::info!(target: "homewaf.security", cert_id = id, name = %name, "证书已删除");
             // 删掉的正好是默认证书时，重新指定一张，避免没有兜底证书
             let rows = ctx.store.list_certificates().map_err(internal)?;
             if !rows.iter().any(|r| r.is_default) {
@@ -3466,6 +3481,15 @@ fn save_cert(ctx: &AdminState, id: Option<i64>, body: CertUploadBody) -> Result<
         )
     })?;
 
+    tracing::info!(
+        target: "homewaf.security",
+        cert_id = saved_id,
+        name = %name,
+        domains = %info.domains,
+        action = if id.is_some() { "更新" } else { "新增" },
+        "证书已保存"
+    );
+
     Ok(saved_id)
 }
 
@@ -3560,7 +3584,10 @@ async fn slce_list_certs(
     Query(q): Query<SlcePageQuery>,
 ) -> Response {
     if !api_token_ok(&ctx, &headers) {
-        return slce_err(StatusCode::UNAUTHORIZED, "invalid api token");
+        return slce_err(
+            StatusCode::UNAUTHORIZED,
+            "API Token 未配置或无效，请先在「证书管理」页生成",
+        );
     }
     let rows = match ctx.store.list_certificates() {
         Ok(r) => r,
@@ -3590,7 +3617,10 @@ async fn slce_delete_cert(
     Json(body): Json<serde_json::Value>,
 ) -> Response {
     if !api_token_ok(&ctx, &headers) {
-        return slce_err(StatusCode::UNAUTHORIZED, "invalid api token");
+        return slce_err(
+            StatusCode::UNAUTHORIZED,
+            "API Token 未配置或无效，请先在「证书管理」页生成",
+        );
     }
     let Some(id) = body.get("id").and_then(|v| v.as_i64()) else {
         return slce_err(StatusCode::BAD_REQUEST, "缺少 id");
@@ -3609,13 +3639,218 @@ struct ParsedUpload {
 /// 雷池兼容：`POST /api/UploadSSLCertAPI`（multipart 或 JSON）
 async fn slce_upload_cert(State(ctx): State<Ctx>, headers: HeaderMap, body: Bytes) -> Response {
     if !api_token_ok(&ctx, &headers) {
-        return slce_err(StatusCode::UNAUTHORIZED, "invalid api token");
+        return slce_err(
+            StatusCode::UNAUTHORIZED,
+            "API Token 未配置或无效，请先在「证书管理」页生成",
+        );
     }
     let upload = match parse_cert_upload(&headers, &body) {
         Ok(u) => u,
         Err(e) => return slce_err(StatusCode::BAD_REQUEST, e),
     };
     match save_cert(&ctx, upload.id, upload.body) {
+        Ok(id) => slce_ok(serde_json::json!({"id": id})),
+        Err((status, msg)) => slce_err(status, msg),
+    }
+}
+
+/// 雷池开放接口鉴权失败时的响应。雷池自身用 `Login required` 提示测试失败，
+/// 这里保持一致，便于主从同步页面直接显示原因。
+fn open_unauthorized() -> Response {
+    slce_err(StatusCode::UNAUTHORIZED, "Login required")
+}
+
+/// 雷池兼容：`GET /api/open/health`（主从同步与脚本探活）
+async fn open_health(State(ctx): State<Ctx>, headers: HeaderMap) -> Response {
+    if !api_token_ok(&ctx, &headers) {
+        return open_unauthorized();
+    }
+    slce_ok(serde_json::json!({
+        "status": "ok",
+        "name": "homewaf",
+        "version": env!("CARGO_PKG_VERSION"),
+    }))
+}
+
+fn cert_node(row: &CertificateRow) -> serde_json::Value {
+    serde_json::json!({
+        "id": row.id,
+        "name": row.name,
+        "type": 2,
+        "domains": split_domains(&row.domains),
+        "is_default": row.is_default,
+        "not_before": row.not_before,
+        "not_after": row.not_after,
+        "created_at": row.created_at,
+        "updated_at": row.updated_at,
+        "has_key": !row.key_pem.trim().is_empty(),
+    })
+}
+
+fn cert_detail(row: &CertificateRow) -> serde_json::Value {
+    serde_json::json!({
+        "id": row.id,
+        "name": row.name,
+        "type": 2,
+        "domains": split_domains(&row.domains),
+        "manual": {"crt": row.cert_pem, "key": row.key_pem},
+        "is_default": row.is_default,
+        "not_before": row.not_before,
+        "not_after": row.not_after,
+        "created_at": row.created_at,
+        "updated_at": row.updated_at,
+    })
+}
+
+/// 雷池兼容：`GET /api/open/cert`（列表，`data.nodes`）
+async fn open_list_certs(State(ctx): State<Ctx>, headers: HeaderMap) -> Response {
+    if !api_token_ok(&ctx, &headers) {
+        return open_unauthorized();
+    }
+    let rows = match ctx.store.list_certificates() {
+        Ok(r) => r,
+        Err(e) => return slce_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+    let nodes: Vec<serde_json::Value> = rows.iter().map(cert_node).collect();
+    let total = nodes.len();
+    slce_ok(serde_json::json!({"nodes": nodes, "total": total}))
+}
+
+/// 雷池兼容：`GET /api/open/cert/{id}`（详情，含 `manual.crt` / `manual.key`）
+async fn open_get_cert(
+    State(ctx): State<Ctx>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Response {
+    if !api_token_ok(&ctx, &headers) {
+        return open_unauthorized();
+    }
+    match ctx.store.get_certificate(id) {
+        Ok(Some(row)) => slce_ok(cert_detail(&row)),
+        Ok(None) => slce_err(StatusCode::NOT_FOUND, "证书不存在"),
+        Err(e) => slce_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+/// 雷池兼容：`DELETE /api/open/cert/{id}`
+async fn open_delete_cert(
+    State(ctx): State<Ctx>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Response {
+    if !api_token_ok(&ctx, &headers) {
+        return open_unauthorized();
+    }
+    match delete_cert_inner(&ctx, id) {
+        Ok(()) => slce_ok(serde_json::Value::Null),
+        Err((status, msg)) => slce_err(status, msg),
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct OpenCertManual {
+    #[serde(default)]
+    crt: Option<String>,
+    #[serde(default)]
+    cert: Option<String>,
+    #[serde(default)]
+    key: Option<String>,
+    #[serde(default)]
+    key_pem: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct OpenCertBody {
+    #[serde(default)]
+    id: Option<i64>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    manual: Option<OpenCertManual>,
+    #[serde(default)]
+    crt: Option<String>,
+    #[serde(default)]
+    cert: Option<String>,
+    #[serde(default)]
+    cert_pem: Option<String>,
+    #[serde(default)]
+    key: Option<String>,
+    #[serde(default)]
+    key_pem: Option<String>,
+}
+
+/// 把雷池的 `{"manual":{"crt","key"}}` 或扁平 `{"crt","key"}` 统一成内部上传结构。
+fn parse_open_cert_upload(headers: &HeaderMap, body: &[u8]) -> Result<ParsedUpload, String> {
+    let content_type = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if certs::boundary_from_content_type(content_type).is_some() {
+        return parse_cert_upload(headers, body);
+    }
+
+    let parsed: OpenCertBody =
+        serde_json::from_slice(body).map_err(|e| format!("请求体解析失败：{e}"))?;
+    let manual = parsed.manual.unwrap_or_default();
+    let cert_pem = manual
+        .crt
+        .or(manual.cert)
+        .or(parsed.crt)
+        .or(parsed.cert)
+        .or(parsed.cert_pem);
+    let key_pem = manual.key.or(manual.key_pem).or(parsed.key).or(parsed.key_pem);
+    Ok(ParsedUpload {
+        id: parsed.id,
+        body: CertUploadBody {
+            name: parsed.name,
+            cert_pem,
+            key_pem,
+            cert: None,
+            key: None,
+        },
+    })
+}
+
+/// 同一域名的证书视为续期：雷池主从同步/自动续签每次都会 POST 新证书，
+/// 不能每次都插一条新记录。
+fn find_cert_by_primary_domain(ctx: &AdminState, cert_pem: &str) -> Option<i64> {
+    let info = certs::parse_cert(cert_pem).ok()?;
+    let primary = info.domains.split(',').next()?.trim().to_string();
+    if primary.is_empty() {
+        return None;
+    }
+    ctx.store
+        .list_certificates()
+        .ok()?
+        .into_iter()
+        .find(|row| {
+            split_domains(&row.domains)
+                .iter()
+                .any(|d| d.eq_ignore_ascii_case(&primary))
+        })
+        .map(|row| row.id)
+}
+
+/// 雷池兼容：`POST /api/open/cert`（新增或按域名续期更新）
+async fn open_upsert_cert(State(ctx): State<Ctx>, headers: HeaderMap, body: Bytes) -> Response {
+    if !api_token_ok(&ctx, &headers) {
+        return open_unauthorized();
+    }
+    let upload = match parse_open_cert_upload(&headers, &body) {
+        Ok(u) => u,
+        Err(e) => return slce_err(StatusCode::BAD_REQUEST, e),
+    };
+    let provided = upload
+        .id
+        .filter(|id| *id > 0 && matches!(ctx.store.get_certificate(*id), Ok(Some(_))));
+    let target = provided.or_else(|| {
+        upload
+            .body
+            .cert_pem
+            .as_deref()
+            .and_then(|pem| find_cert_by_primary_domain(&ctx, pem))
+    });
+    match save_cert(&ctx, target, upload.body) {
         Ok(id) => slce_ok(serde_json::json!({"id": id})),
         Err((status, msg)) => slce_err(status, msg),
     }
@@ -4257,5 +4492,24 @@ mod tests {
             5
         );
         assert_eq!(build_report(&st, day, None).unwrap().totals.requests, 12);
+    }
+
+    #[test]
+    fn open_cert_upload_accepts_safeline_and_flat_shapes() {
+        let headers = HeaderMap::new();
+        let manual = parse_open_cert_upload(
+            &headers,
+            br#"{"type":2,"manual":{"crt":"CERT","key":"KEY"}}"#,
+        )
+        .unwrap();
+        assert_eq!(manual.body.cert_pem.as_deref(), Some("CERT"));
+        assert_eq!(manual.body.key_pem.as_deref(), Some("KEY"));
+
+        let flat =
+            parse_open_cert_upload(&headers, br#"{"name":"a.test","crt":"C2","key":"K2"}"#)
+                .unwrap();
+        assert_eq!(flat.body.name.as_deref(), Some("a.test"));
+        assert_eq!(flat.body.cert_pem.as_deref(), Some("C2"));
+        assert_eq!(flat.body.key_pem.as_deref(), Some("K2"));
     }
 }
