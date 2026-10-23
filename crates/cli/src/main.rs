@@ -395,6 +395,9 @@ fn cmd_serve(
     if let Err(e) = homewaf_admin::migrate_legacy_acl(&store) {
         eprintln!("迁移历史 IP 规则失败（已跳过）：{e}");
     }
+    if let Err(e) = homewaf_admin::normalize_rule_seq(&store) {
+        eprintln!("补规则序号失败（已跳过）：{e}");
+    }
 
     let mut state = match homewaf_proxy::load_state_from_db(&store, allow_regex) {
         Ok(s) => s,

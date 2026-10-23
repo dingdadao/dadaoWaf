@@ -55,16 +55,38 @@ pub struct CustomRule {
     pub name: String,
     #[serde(rename = "is_enabled", alias = "enabled")]
     pub enabled: bool,
-    /// 处置动作：0 = 放行，1 = 拦截，2 = 人机验证，3 = 仅记录
+    /// 处置动作：0 = 放行（白名单），1 = 拦截（黑名单），2 = 人机验证，3 = 仅记录
     ///
     /// 沿用雷池的数字编码（0/1），2/3 是 HomeWAF 的扩展。
     pub action: u8,
+    /// 条件组之间的组合方式：任意（默认，组间 OR）/ 全部（组间 AND）
+    ///
+    /// 组内条件始终是 AND。雷池界面上这一项叫「匹配方式」。
+    #[serde(default)]
+    pub match_mode: MatchMode,
+    /// 序号：越大越新，求值时从大到小（新的规则先匹配）
+    #[serde(default)]
+    pub seq: i64,
+    /// 创建时间（Unix 秒）
+    #[serde(default)]
+    pub created_at: Option<i64>,
     /// 生效应用 id；空表示对所有应用生效
     pub scope: Vec<String>,
     /// 到期时间（Unix 秒）；`None` 表示永久
     pub expires_at: Option<i64>,
     /// 外层 OR，内层 AND
     pub pattern: Vec<Vec<RuleCondition>>,
+}
+
+/// 条件组之间的组合方式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MatchMode {
+    /// 任一条件组满足即可（OR）
+    #[default]
+    Any,
+    /// 所有条件组都要满足（AND）
+    All,
 }
 
 /// 规则的处置动作。把 `u8` 收敛成枚举，避免求值路径上到处 `== 0`。
@@ -88,6 +110,9 @@ impl Default for CustomRule {
             enabled: true,
             // 缺省必须是拦截：漏填 action 时把恶意流量放行，比误拦严重得多
             action: 1,
+            match_mode: MatchMode::Any,
+            seq: 0,
+            created_at: None,
             scope: Vec::new(),
             expires_at: None,
             pattern: Vec::new(),

@@ -768,6 +768,14 @@
   .kvtable { width: 100%; border-collapse: collapse; font-size: 13px; }
   .kvtable th { text-align: left; color: var(--muted); font-weight: 500; width: 130px; padding: 7px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
   .kvtable td { padding: 7px 10px; border-bottom: 1px solid var(--border); word-break: break-word; }
+  .sys-tabs a span { margin-left: 4px; font-size: 11px; color: var(--muted); }
+  .sys-tabs a.active span { color: var(--accent); }
+  .rswitch { position: relative; display: inline-block; width: 34px; height: 18px; vertical-align: middle; }
+  .rswitch input { opacity: 0; width: 0; height: 0; }
+  .rswitch span { position: absolute; inset: 0; background: #3a3a3a; border-radius: 9px; transition: .15s; cursor: pointer; margin: 0; }
+  .rswitch span::before { content: ""; position: absolute; width: 14px; height: 14px; left: 2px; top: 2px; background: #bbb; border-radius: 50%; transition: .15s; }
+  .rswitch input:checked + span { background: rgba(102,217,168,.35); }
+  .rswitch input:checked + span::before { transform: translateX(16px); background: var(--ok); }
 </style>
 </head>
 <body>
@@ -788,7 +796,7 @@
         <div class="nav-title">防护</div>
         <a data-page="apps">防护应用</a>
         <a data-page="certs">证书管理</a>
-        <a data-page="rules">访问控制</a>
+        <a data-page="rules">黑白名单</a>
         <a data-page="whitelist">检测白名单</a>
       </div>
       <div class="nav-group">
@@ -1087,19 +1095,24 @@
         </section>
       </div>
 
-      <!-- ========== 访问控制（雷池式条件规则） ========== -->
+      <!-- ========== 黑白名单（雷池式条件规则） ========== -->
       <div class="page" data-page="rules">
         <section class="card">
           <header>
-            <h2>访问控制</h2>
+            <h2>黑白名单</h2>
             <div class="filters">
-              <input id="rule-q" placeholder="搜索名称 / 条件 / 应用" style="min-width:220px"
+              <input id="rule-q" placeholder="搜索名称 / 条件 / 应用" style="min-width:200px"
                      oninput="renderRules()">
               <button class="primary" onclick="showRuleForm()">+ 新建规则</button>
             </div>
           </header>
+          <div class="sys-tabs" id="rule-tabs" style="padding:0 16px">
+            <a data-ruletab="0" class="active">白名单 <span id="cnt-0">0</span></a>
+            <a data-ruletab="1">黑名单 <span id="cnt-1">0</span></a>
+            <a data-ruletab="other">人机验证 / 仅记录 <span id="cnt-other">0</span></a>
+          </div>
           <div class="hint" style="padding:0 16px 10px;font-size:12px;color:var(--muted)">
-            条件组之间是「或」，组内条件是「且」。动作优先级：放行 &gt; 拦截 / 人机验证 &gt; 仅记录。
+            组内条件是「且」，条件组之间按「匹配方式」组合（任意 = 或，全部 = 且）。序号越大越新，匹配时从新到旧。
           </div>
           <div id="rules"></div>
         </section>
@@ -1290,7 +1303,7 @@
           <section class="card">
             <header><h2>关联配置</h2></header>
             <div class="fieldset">
-              <div><button onclick="gotoPage('rules')">访问控制</button></div>
+              <div><button onclick="gotoPage('rules')">黑白名单</button></div>
               <div><button onclick="gotoPage('whitelist')">检测白名单</button></div>
               <div><button onclick="gotoPage('subscriptions')">订阅源</button></div>
             </div>
@@ -1424,27 +1437,34 @@
       </header>
       <form id="rule-form" onsubmit="submitRule(event)">
         <div><label for="rule-name">规则名称</label><input id="rule-name" placeholder="例如：后台只允许内网访问" required></div>
-        <div><label for="rule-action">动作</label>
-          <select id="rule-action">
-            <option value="1">拦截（403）</option>
-            <option value="0">放行（跳过检测与封禁）</option>
-            <option value="2">人机验证</option>
-            <option value="3">仅记录</option>
+        <div class="wide"><label>规则类型</label>
+          <div style="display:flex;gap:18px;align-items:center;flex-wrap:wrap">
+            <label class="row" style="margin:0"><input type="radio" name="rule-action" value="0"> 白名单（放行）</label>
+            <label class="row" style="margin:0"><input type="radio" name="rule-action" value="1" checked> 黑名单（拦截）</label>
+            <label class="row" style="margin:0"><input type="radio" name="rule-action" value="2"> 人机验证</label>
+            <label class="row" style="margin:0"><input type="radio" name="rule-action" value="3"> 仅记录</label>
+          </div>
+        </div>
+        <div><label for="rule-match-mode">匹配方式</label>
+          <select id="rule-match-mode">
+            <option value="any">任意（满足任一条件组即可）</option>
+            <option value="all">全部（所有条件组都要满足）</option>
           </select>
         </div>
         <div><label for="rule-scope">生效应用（ID，逗号分隔，留空为全部）</label><input id="rule-scope" placeholder="nas, blog"></div>
         <div><label for="rule-id">规则 ID（留空自动生成）</label><input id="rule-id" placeholder="rule-xxx"></div>
         <div class="wide"><label class="row" style="margin:0;grid-column:auto"><input type="checkbox" id="rule-enabled" checked> 启用</label></div>
         <div class="wide">
-          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
-            <label style="margin:0">匹配条件</label>
-            <button type="button" onclick="addCondGroup()">+ 添加条件组（或）</button>
-          </div>
+          <label style="margin-bottom:8px">匹配条件</label>
           <div id="rule-conds"></div>
+          <div style="display:flex;gap:8px;margin-top:8px">
+            <button type="button" onclick="addAndCond()">添加一个 AND 条件</button>
+            <button type="button" onclick="addOrCond()">添加一个 OR 条件</button>
+          </div>
         </div>
-        <div class="hint">组内条件是「且」，条件组之间是「或」。IP 组来自「订阅源」里类型为 IP 组的订阅。</div>
+        <div class="hint">AND 条件加在当前条件组内（同时满足），OR 条件新开一个条件组。IP 组来自「订阅源」里类型为 IP 组的订阅。</div>
         <div style="display:flex;gap:8px">
-          <button type="submit" class="primary" id="rule-submit">保存</button>
+          <button type="submit" class="primary" id="rule-submit">提交</button>
           <button type="button" onclick="hideRuleForm()">取消</button>
         </div>
       </form>
@@ -1495,7 +1515,7 @@ const durationToSecs = (d) => {
 // 页面切换
 // ============================================================
 const PAGE_TITLES = {
-  statistics: '统计报表', apps: '防护应用', certs: '证书管理', attack: '攻击防护', rules: '访问控制',
+  statistics: '统计报表', apps: '防护应用', certs: '证书管理', attack: '攻击防护', rules: '黑白名单',
   whitelist: '检测白名单', subscriptions: '订阅源',
   bans: '封禁', events: '事件', logs: '日志', system: '系统设置',
 };
@@ -2792,15 +2812,15 @@ async function deleteApp(id) {
 }
 
 // ============================================================
-// 访问控制（雷池式条件规则）
+// 黑白名单（雷池式条件规则）
 // ============================================================
 const RULE_FIELD_LABEL = {
-  src_ip: '来源 IP', ip_group: 'IP 组', path: '路径', method: '请求方法',
-  user_agent: 'User-Agent', header: '请求头', query: '查询参数', host: '域名', url: '完整 URL',
+  src_ip: '源 IP', ip_group: 'IP 组', path: '路径', url: 'URL', host: 'Host',
+  method: '请求方法', user_agent: 'User-Agent', header: '请求头', query: '查询参数',
 };
 const RULE_OP_LABEL = {
   eq: '等于', ne: '不等于', contain: '包含', not_contain: '不包含',
-  prefix: '前缀是', suffix: '后缀是', regex: '正则匹配',
+  prefix: '前缀', suffix: '后缀', regex: '正则',
 };
 const RULE_ACTION = {
   0: { text: '放行', cls: 'allow' },
@@ -2811,6 +2831,7 @@ const RULE_ACTION = {
 let ruleCtx = { apps: [], groups: [] };
 let ruleCache = [];
 let editingRule = null;
+let ruleTab = '0';
 
 function ruleActionTag(a) {
   const m = RULE_ACTION[a] || RULE_ACTION[1];
@@ -2826,9 +2847,10 @@ function condText(c) {
 }
 
 function ruleSummary(rule) {
-  return (rule.pattern || []).filter(g => g.length)
-    .map(g => g.map(condText).join(' 且 '))
-    .join(' 或 ');
+  const groups = (rule.pattern || []).filter(g => g.length);
+  if (!groups.length) return '';
+  const joiner = rule.match_mode === 'all' ? ' 且 ' : ' 或 ';
+  return groups.map(g => g.map(condText).join(' 且 ')).join(joiner);
 }
 
 function ruleApplies(rule) {
@@ -2839,60 +2861,96 @@ function ruleApplies(rule) {
   }).join('、');
 }
 
+function bindRuleTabs() {
+  const el = document.getElementById('rule-tabs');
+  if (!el || el.dataset.bound) return;
+  el.dataset.bound = '1';
+  el.addEventListener('click', ev => {
+    const a = ev.target.closest('a[data-ruletab]');
+    if (!a) return;
+    ruleTab = a.dataset.ruletab;
+    [...el.querySelectorAll('a')].forEach(x => x.classList.toggle('active', x === a));
+    renderRules();
+  });
+}
+
 async function loadRules() {
   const el = document.getElementById('rules');
   try {
     const data = await api('/rules');
     ruleCtx = { apps: data.apps || [], groups: data.ip_groups || [] };
     ruleCache = data.rules || [];
+    bindRuleTabs();
+    updateRuleCounts();
     renderRules();
   } catch (e) { el.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`; }
+}
+
+function updateRuleCounts() {
+  const count = (fn) => ruleCache.filter(fn).length;
+  const set = (id, n) => { const el = document.getElementById(id); if (el) el.textContent = n; };
+  set('cnt-0', count(r => r.action === 0));
+  set('cnt-1', count(r => r.action === 1));
+  set('cnt-other', count(r => r.action === 2 || r.action === 3));
+}
+
+function tabFilter(r) {
+  if (ruleTab === 'other') return r.action === 2 || r.action === 3;
+  return r.action === Number(ruleTab);
 }
 
 function renderRules() {
   const el = document.getElementById('rules');
   const q = (document.getElementById('rule-q')?.value || '').trim().toLowerCase();
-  const rows = ruleCache.filter(r => !q
+  const rows = ruleCache.filter(tabFilter).filter(r => !q
     || (r.name || '').toLowerCase().includes(q)
     || r.id.toLowerCase().includes(q)
     || ruleSummary(r).toLowerCase().includes(q));
 
   if (!rows.length) {
     el.innerHTML = `<div class="empty">${ruleCache.length
-      ? '没有匹配的规则'
-      : '还没有访问控制规则。新建一条：命中「IP 组」或「路径」时放行 / 拦截 / 人机验证。'}</div>`;
+      ? '这个分类下还没有规则'
+      : '还没有规则。白名单命中后跳过检测与封禁，黑名单直接拦截。'}</div>`;
     return;
   }
+
   el.innerHTML = `<table>
-    <thead><tr><th>规则名称</th><th>匹配条件</th><th>动作</th><th>生效应用</th><th>状态</th><th></th></tr></thead>
+    <thead><tr><th style="width:64px">序号</th><th>规则名称</th><th style="width:70px">状态</th>
+      <th style="width:80px">匹配方式</th><th>匹配条件</th><th>生效应用</th><th style="width:150px">创建时间</th><th></th></tr></thead>
     <tbody>${rows.map(r => `<tr>
+      <td class="mono muted">${r.seq || '-'}</td>
       <td><b>${esc(r.name || r.id)}</b><div class="sub" style="margin:2px 0 0"><code>${esc(r.id)}</code></div></td>
-      <td style="max-width:520px;line-height:1.8">${esc(ruleSummary(r)) || '<span class="sub" style="margin:0">—</span>'}</td>
-      <td>${ruleActionTag(r.action)}</td>
+      <td>
+        <label class="rswitch">
+          <input type="checkbox" ${r.is_enabled !== false ? 'checked' : ''} onchange="toggleRule('${esc(r.id)}', this.checked)">
+          <span></span>
+        </label>
+      </td>
+      <td>${r.match_mode === 'all' ? '全部' : '任意'}</td>
+      <td style="max-width:460px;line-height:1.8">${esc(ruleSummary(r)) || '<span class="sub" style="margin:0">—</span>'}</td>
       <td>${ruleApplies(r)}</td>
-      <td>${r.is_enabled !== false ? '<span class="tag allow">启用</span>' : '<span class="tag">停用</span>'}</td>
+      <td class="mono muted">${r.created_at ? fmtTime(r.created_at) : '-'}</td>
       <td style="white-space:nowrap">
         <button onclick="showRuleForm('${esc(r.id)}')">编辑</button>
-        <button onclick="toggleRule('${esc(r.id)}')">${r.is_enabled !== false ? '停用' : '启用'}</button>
         <button class="danger" onclick="deleteRule('${esc(r.id)}')">删除</button>
       </td>
     </tr>`).join('')}</tbody></table>`;
 }
 
 function condRowHtml(c) {
-  const field = c.k || 'path';
-  const op = c.op || 'prefix';
+  const field = c.k || 'src_ip';
+  const op = c.op || 'eq';
   const needSub = field === 'header';
   const options = Object.entries(RULE_FIELD_LABEL).map(([k, label]) =>
     `<option value="${k}"${k === field ? ' selected' : ''}>${label}</option>`).join('');
   const ops = Object.entries(RULE_OP_LABEL).map(([k, label]) =>
     `<option value="${k}"${k === op ? ' selected' : ''}>${label}</option>`).join('');
   return `<div class="cond-row">
-    <select class="cond-k" style="width:140px" onchange="onCondFieldChange(this)">${options}</select>
-    <select class="cond-op" style="width:120px">${ops}</select>
-    <input class="cond-sub" style="width:120px;display:${needSub ? '' : 'none'}" placeholder="头名" value="${esc(c.sub_k || '')}">
-    <input class="cond-v" style="flex:1" placeholder="匹配值，多个用逗号分隔" value="${esc((c.v || []).join(', '))}">
-    <button type="button" class="danger" style="width:34px" onclick="this.closest('.cond-row').remove()">×</button>
+    <select class="cond-k" style="width:130px" onchange="onCondFieldChange(this)">${options}</select>
+    <select class="cond-op" style="width:110px">${ops}</select>
+    <input class="cond-sub" style="width:110px;display:${needSub ? '' : 'none'}" placeholder="头名" value="${esc(c.sub_k || '')}">
+    <input class="cond-v" style="flex:1" placeholder="匹配内容，多个用逗号分隔" value="${esc((c.v || []).join(', '))}">
+    <button type="button" class="danger" style="width:32px" onclick="this.closest('.cond-row').remove()">×</button>
   </div>`;
 }
 
@@ -2904,30 +2962,27 @@ function onCondFieldChange(sel) {
 function renderCondEditor(pattern) {
   document.getElementById('rule-conds').innerHTML = pattern.map((group, gi) => `
     <div class="cond-group">
-      <div class="cond-group-head">
-        <span>条件组 ${gi + 1}</span>
-        <button type="button" onclick="addCond(this)">+ 条件</button>
-        <button type="button" class="danger" onclick="this.closest('.cond-group').remove()">删除组</button>
-      </div>
+      <div class="cond-group-head"><span>条件组 ${gi + 1}</span></div>
       ${group.map(condRowHtml).join('')}
     </div>`).join('');
 }
 
-function addCondGroup() {
+/// 「或」条件：新开一个条件组
+function addOrCond() {
   document.getElementById('rule-conds').insertAdjacentHTML('beforeend', `
     <div class="cond-group">
-      <div class="cond-group-head">
-        <span>条件组</span>
-        <button type="button" onclick="addCond(this)">+ 条件</button>
-        <button type="button" class="danger" onclick="this.closest('.cond-group').remove()">删除组</button>
-      </div>
-      ${condRowHtml({ k: 'path', op: 'prefix', v: ['/'] })}
+      <div class="cond-group-head"><span>条件组</span></div>
+      ${condRowHtml({ k: 'src_ip', op: 'eq', v: [''] })}
     </div>`);
   renumberGroups();
 }
 
-function addCond(btn) {
-  btn.closest('.cond-group').insertAdjacentHTML('beforeend', condRowHtml({ k: 'path', op: 'prefix', v: ['/'] }));
+/// 「且」条件：加到最后一个条件组
+function addAndCond() {
+  const groups = document.querySelectorAll('#rule-conds .cond-group');
+  const target = groups.length ? groups[groups.length - 1] : null;
+  if (!target) return addOrCond();
+  target.insertAdjacentHTML('beforeend', condRowHtml({ k: 'src_ip', op: 'eq', v: [''] }));
 }
 
 function renumberGroups() {
@@ -2939,14 +2994,18 @@ function renumberGroups() {
 function showRuleForm(id) {
   editingRule = id ? ruleCache.find(r => r.id === id) : null;
   const r = editingRule || {
-    id: '', name: '', enabled: true, action: 1, scope: [],
+    id: '', name: '', action: Number(ruleTab === 'other' ? 2 : ruleTab),
+    match_mode: 'any', is_enabled: true, scope: [],
     pattern: [[{ k: 'src_ip', op: 'eq', v: [''] }]],
   };
-  document.getElementById('rule-modal-title').textContent = editingRule ? '编辑规则' : '新建规则';
+  document.getElementById('rule-modal-title').textContent = editingRule ? '编辑规则' : '添加规则';
   document.getElementById('rule-id').value = r.id || '';
   document.getElementById('rule-id').readOnly = !!editingRule;
   document.getElementById('rule-name').value = r.name || '';
-  document.getElementById('rule-action').value = String(r.action ?? 1);
+  document.querySelectorAll('input[name="rule-action"]').forEach(el => {
+    el.checked = Number(el.value) === Number(r.action ?? 1);
+  });
+  document.getElementById('rule-match-mode').value = r.match_mode === 'all' ? 'all' : 'any';
   document.getElementById('rule-enabled').checked = r.is_enabled !== false;
   document.getElementById('rule-scope').value = (r.scope || []).join(', ');
   renderCondEditor(r.pattern && r.pattern.length ? r.pattern : [[{ k: 'src_ip', op: 'eq', v: [''] }]]);
@@ -2973,13 +3032,18 @@ function collectRule() {
     return conds;
   }).filter(g => g.length);
 
+  const action = document.querySelector('input[name="rule-action"]:checked');
+
   return {
     id: document.getElementById('rule-id').value.trim(),
     name: document.getElementById('rule-name').value.trim(),
     is_enabled: document.getElementById('rule-enabled').checked,
-    action: parseInt(document.getElementById('rule-action').value, 10),
+    action: action ? Number(action.value) : 1,
+    match_mode: document.getElementById('rule-match-mode').value,
     scope: document.getElementById('rule-scope').value.split(',').map(s => s.trim()).filter(Boolean),
     expires_at: editingRule?.expires_at ?? null,
+    seq: editingRule?.seq ?? 0,
+    created_at: editingRule?.created_at ?? null,
     pattern,
   };
 }
@@ -2990,29 +3054,28 @@ async function submitRule(e) {
   const rule = collectRule();
 
   if (!rule.name) return showMsg('请填写规则名称', 'error');
-  if (!rule.pattern.length) return showMsg('至少需要一个有效条件（匹配值不能为空）', 'error');
+  if (!rule.pattern.length) return showMsg('至少需要一个有效条件（匹配内容不能为空）', 'error');
   const badHeader = rule.pattern.some(g => g.some(c => c.k === 'header' && !c.sub_k));
   if (badHeader) return showMsg('请求头条件必须填写头名', 'error');
   if (!rule.id) rule.id = 'rule-' + Date.now().toString(36);
 
-  btn.disabled = true; btn.textContent = '保存中…';
+  btn.disabled = true; btn.textContent = '提交中…';
   try {
     await api('/rules', { method: 'POST', body: JSON.stringify(rule) });
     showMsg(`规则「${rule.name}」已保存`);
     hideRuleForm(); loadRules(); loadStatistics();
   } catch (err) { showMsg('保存失败：' + err.message, 'error'); }
-  finally { btn.disabled = false; btn.textContent = '保存'; }
+  finally { btn.disabled = false; btn.textContent = '提交'; }
 }
 
-async function toggleRule(id) {
+async function toggleRule(id, enabled) {
   const r = ruleCache.find(x => x.id === id);
   if (!r) return;
-  const on = r.is_enabled !== false;
   try {
-    await api('/rules', { method: 'POST', body: JSON.stringify({ ...r, is_enabled: !on }) });
-    showMsg(`${r.name || id} 已${on ? '停用' : '启用'}`);
+    await api('/rules', { method: 'POST', body: JSON.stringify({ ...r, is_enabled: enabled }) });
+    showMsg(`${r.name || id} 已${enabled ? '启用' : '停用'}`);
     loadRules();
-  } catch (e) { showMsg('操作失败：' + e.message, 'error'); }
+  } catch (e) { showMsg('操作失败：' + e.message, 'error'); loadRules(); }
 }
 
 async function deleteRule(id) {

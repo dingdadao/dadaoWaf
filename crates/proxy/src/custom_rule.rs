@@ -16,7 +16,7 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 
-use homewaf_config::{CustomRule, RuleActionKind, RuleCondition};
+use homewaf_config::{CustomRule, MatchMode, RuleActionKind, RuleCondition};
 use ipnet::IpNet;
 use regex::Regex;
 
@@ -112,10 +112,17 @@ fn rule_label(rule: &CustomRule) -> String {
 }
 
 fn rule_matches(rule: &CustomRule, req: &RuleRequest<'_>) -> bool {
-    // 外层 OR：任意一组全部满足即可
-    rule.pattern
-        .iter()
-        .any(|group| !group.is_empty() && group.iter().all(|c| condition_matches(c, req)))
+    // 组内始终是 AND；组间由「匹配方式」决定
+    let groups: Vec<&Vec<RuleCondition>> = rule.pattern.iter().filter(|g| !g.is_empty()).collect();
+    if groups.is_empty() {
+        return false;
+    }
+    let group_ok = |g: &Vec<RuleCondition>| g.iter().all(|c| condition_matches(c, req));
+
+    match rule.match_mode {
+        MatchMode::Any => groups.iter().any(|g| group_ok(g)),
+        MatchMode::All => groups.iter().all(|g| group_ok(g)),
+    }
 }
 
 fn condition_matches(cond: &RuleCondition, req: &RuleRequest<'_>) -> bool {
@@ -247,6 +254,9 @@ mod tests {
             name: "测试规则".into(),
             enabled: true,
             action,
+            match_mode: MatchMode::Any,
+            seq: 0,
+            created_at: None,
             scope: Vec::new(),
             expires_at: None,
             pattern,
@@ -389,6 +399,43 @@ mod tests {
         let mut disabled = rule(1, vec![vec![cond("path", "prefix", &["/admin"])]]);
         disabled.enabled = false;
         assert!(evaluate(&[disabled], &r, NOW).is_none());
+    }
+
+    #[test]
+    fn match_mode_all_requires_every_group() {
+        let headers = http::HeaderMap::new();
+        let groups = HashMap::new();
+        let r = req(&headers, &groups); // GET /admin/login
+        let mut rule = rule(
+            1,
+            vec![
+                vec![cond("path", "prefix", &["/admin"])],
+                vec![cond("method", "eq", &["POST"])],
+            ],
+        );
+        rule.match_mode = MatchMode::All;
+        // 只有路径命中，方法不匹配 → 全部模式不成立
+        assert!(evaluate(&[rule.clone()], &r, NOW).is_none());
+
+        rule.match_mode = MatchMode::Any;
+        assert!(evaluate(&[rule], &r, NOW).is_some());
+    }
+
+    #[test]
+    fn higher_seq_wins_between_conflicting_rules() {
+        let headers = http::HeaderMap::new();
+        let groups = HashMap::new();
+        let r = req(&headers, &groups);
+        let mut deny = rule(1, vec![vec![cond("path", "prefix", &["/admin"])]]);
+        deny.seq = 1;
+        let mut allow = rule(0, vec![vec![cond("path", "prefix", &["/admin"])]]);
+        allow.seq = 2;
+        allow.id = "r2".into();
+        // 放行优先是硬规则，与序号无关
+        assert!(matches!(
+            evaluate(&[deny, allow], &r, NOW),
+            Some(CustomDecision::Allow(_))
+        ));
     }
 
     #[test]

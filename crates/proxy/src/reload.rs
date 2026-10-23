@@ -170,7 +170,12 @@ impl RuntimeState {
             tls_certs,
             feed_failures,
             rule_feeds: rule_feeds.statuses,
-            custom_rules: config.custom_rules,
+            // 序号大的先匹配：新建的规则排在最前，和列表顺序一致
+            custom_rules: {
+                let mut rules = config.custom_rules;
+                rules.sort_by_key(|r| std::cmp::Reverse(r.seq));
+                rules
+            },
             ip_groups,
             tamper: Vec::new(),
         })

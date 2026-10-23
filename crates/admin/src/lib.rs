@@ -1718,7 +1718,7 @@ async fn list_rules(State(ctx): State<Ctx>, headers: HeaderMap) -> Response {
     if !authorized(&ctx, &headers) {
         return unauthorized();
     }
-    let rules: Vec<homewaf_config::CustomRule> = match ctx
+    let mut rules: Vec<homewaf_config::CustomRule> = match ctx
         .store
         .get_setting(leichi::CUSTOM_RULES_KEY)
         .map_err(|e| e.to_string())
@@ -1726,6 +1726,8 @@ async fn list_rules(State(ctx): State<Ctx>, headers: HeaderMap) -> Response {
         Ok(v) => v.unwrap_or_default(),
         Err(e) => return internal(e).into_response(),
     };
+    // 序号大的（新建的）排在最前，与求值顺序一致
+    rules.sort_by_key(|r| std::cmp::Reverse(r.seq));
 
     let apps: Vec<serde_json::Value> = ctx
         .store
@@ -1840,12 +1842,20 @@ async fn upsert_rule(
         .ok()
         .flatten()
         .unwrap_or_default();
-    match rules.iter_mut().find(|r| r.id == rule.id) {
-        Some(existing) => *existing = rule.clone(),
-        None => rules.push(rule.clone()),
-    }
-
     let now = homewaf_acl::now_unix();
+    match rules.iter_mut().find(|r| r.id == rule.id) {
+        Some(existing) => {
+            // 编辑不改变序号与创建时间，否则列表顺序会随编辑跳来跳去
+            rule.seq = existing.seq;
+            rule.created_at = existing.created_at.or(Some(now));
+            *existing = rule.clone();
+        }
+        None => {
+            rule.seq = rules.iter().map(|r| r.seq).max().unwrap_or(0) + 1;
+            rule.created_at = Some(now);
+            rules.push(rule.clone());
+        }
+    }
     if let Err(e) = ctx.store.set_setting(leichi::CUSTOM_RULES_KEY, &rules, now) {
         return internal(e).into_response();
     }
@@ -1888,6 +1898,32 @@ async fn delete_rule(
     }
 }
 
+/// 给没有序号的规则补上序号。
+///
+/// 序号是雷池界面的「序号」列，也是匹配顺序的依据。历史规则（含迁移来的）
+/// 没有这个字段，补成 1..n 而不是留 0，否则列表里显示成 `-`、排序也落到最后。
+pub fn normalize_rule_seq(store: &Store) -> Result<(), String> {
+    let mut rules: Vec<homewaf_config::CustomRule> = store
+        .get_setting(leichi::CUSTOM_RULES_KEY)
+        .map_err(|e| e.to_string())?
+        .unwrap_or_default();
+    if rules.iter().all(|r| r.seq > 0) {
+        return Ok(());
+    }
+
+    let mut next = 1;
+    for rule in rules.iter_mut() {
+        if rule.seq <= 0 {
+            rule.seq = next;
+        }
+        next = next.max(rule.seq + 1);
+    }
+    store
+        .set_setting(leichi::CUSTOM_RULES_KEY, &rules, homewaf_acl::now_unix())
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// 把历史遗留的纯 IP ACL 规则迁移成条件规则。
 ///
 /// 访问控制统一到条件规则后，`acl_rules` 表只保留订阅生成的规则。
@@ -1917,6 +1953,10 @@ pub fn migrate_legacy_acl(store: &Store) -> Result<(), String> {
                 .unwrap_or_else(|| format!("IP 规则 {}", row.cidr)),
             enabled: true,
             action: if row.action == "allow" { 0 } else { 1 },
+            // 迁移来的规则最老，序号排最后；列表里一眼能看出是历史规则
+            match_mode: homewaf_config::MatchMode::Any,
+            seq: 0,
+            created_at: None,
             scope: row.scope.clone().map(|s| vec![s]).unwrap_or_default(),
             expires_at: row.expires_at,
             pattern: vec![vec![homewaf_config::RuleCondition {
@@ -4453,6 +4493,9 @@ fn reload_state_with(ctx: &AdminState, force_rule_feeds: bool) -> Result<(), Str
     // 保证访问控制页面看到的是同一套模型。迁移是幂等的，没有历史行时零成本。
     if let Err(e) = migrate_legacy_acl(&ctx.store) {
         tracing::warn!(error = %e, "历史 IP 规则迁移失败，本次跳过");
+    }
+    if let Err(e) = normalize_rule_seq(&ctx.store) {
+        tracing::warn!(error = %e, "补规则序号失败，本次跳过");
     }
 
     let mut new_state: RuntimeState =
