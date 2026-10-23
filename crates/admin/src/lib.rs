@@ -46,6 +46,10 @@ pub struct AdminState {
     pub sessions: Arc<std::sync::Mutex<std::collections::HashMap<String, i64>>>,
     /// 登录失败记录：来源 -> (次数, 窗口起点)，用于限制密码爆破
     pub login_failures: Arc<std::sync::Mutex<std::collections::HashMap<String, (u32, i64)>>>,
+    /// 公网登录所需的 TOTP 密钥（base32 解码后）。`None` 时不要求二次验证
+    pub totp: Option<Vec<u8>>,
+    /// 最近一次通过的 TOTP 时间步，防止同一个验证码被重放
+    pub totp_last: Arc<std::sync::Mutex<i64>>,
     /// 日志根目录，用于控制台的日志查看
     pub log_dir: std::path::PathBuf,
     /// 数据目录，GeoIP 默认库下载到这里
@@ -137,23 +141,117 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
         .strip_prefix("Bearer ")
 }
 
-/// 会话有效期：12 小时。控制台是低频操作，够用且不至于长期驻留。
-const SESSION_TTL: i64 = 12 * 3_600;
+/// 会话有效期：7 天。认证一次后信任本机浏览器，避免频繁登录。
+const SESSION_TTL: i64 = 7 * 24 * 3_600;
 /// 同一来源连续失败多少次后暂时拒绝登录
 const LOGIN_MAX_FAILS: u32 = 5;
 /// 失败计数窗口（秒）
 const LOGIN_WINDOW: i64 = 600;
+/// TOTP 时间步长（秒）
+const TOTP_STEP: i64 = 30;
 
-/// 登录来源。反代（HomeWAF/CDN）会带 X-Forwarded-For，直连时统一归到一个桶。
-fn client_key(headers: &HeaderMap) -> String {
+/// 登录来源。优先用反代写入的 `X-Real-IP`（客户端无法伪造），
+/// 其次取 `X-Forwarded-For` 最后一跳；直连时没有这些头，按局域网处理。
+fn source_ip(headers: &HeaderMap) -> Option<IpAddr> {
     headers
-        .get("x-forwarded-for")
+        .get("x-real-ip")
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.split(',').next())
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .unwrap_or("direct")
-        .to_string()
+        .and_then(|v| v.trim().parse().ok())
+        .or_else(|| {
+            headers
+                .get("x-forwarded-for")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.rsplit(',').next())
+                .and_then(|v| v.trim().parse().ok())
+        })
+}
+
+/// 是否属于局域网/回环。取不到来源时按局域网处理（只可能是本机直连）。
+fn is_lan(ip: Option<IpAddr>) -> bool {
+    let Some(ip) = ip else {
+        return true;
+    };
+    match ip {
+        IpAddr::V4(v4) => v4.is_private() || v4.is_loopback() || v4.is_link_local(),
+        IpAddr::V6(v6) => {
+            if v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| {
+                v4.is_private() || v4.is_loopback() || v4.is_link_local()
+            }) {
+                return true;
+            }
+            let head = v6.segments()[0];
+            (head & 0xfe00) == 0xfc00 || (head & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+fn client_key(headers: &HeaderMap) -> String {
+    source_ip(headers)
+        .map(|ip| ip.to_string())
+        .unwrap_or_else(|| "direct".to_string())
+}
+
+/// 解析 base32 编码的 TOTP 密钥（兼容空格、连字符与补位 `=`）。
+pub fn decode_totp_secret(input: &str) -> Option<Vec<u8>> {
+    const ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+    let mut out = Vec::with_capacity(input.len() * 5 / 8);
+    let mut buf: u32 = 0;
+    let mut bits = 0u32;
+    for ch in input.chars() {
+        let c = ch.to_ascii_uppercase() as u8;
+        if matches!(c, b'=' | b' ' | b'-') {
+            continue;
+        }
+        let idx = ALPHABET.iter().position(|&a| a == c)? as u32;
+        buf = (buf << 5) | idx;
+        bits += 5;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+            buf &= (1u32 << bits) - 1;
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// RFC 6238 的 HOTP 计算（HMAC-SHA1，取 6 位）。
+fn totp_code(secret: &[u8], counter: u64) -> u32 {
+    use ring::hmac;
+    let key = hmac::Key::new(hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY, secret);
+    let tag = hmac::sign(&key, &counter.to_be_bytes());
+    let bytes = tag.as_ref();
+    let off = (bytes[bytes.len() - 1] & 0x0f) as usize;
+    let bin = u32::from_be_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]])
+        & 0x7fff_ffff;
+    bin % 1_000_000
+}
+
+/// 校验 TOTP：允许前后各一个时间步的时钟偏差，且同一时间步只能通过一次。
+fn verify_totp(state: &AdminState, code: &str, now: i64) -> bool {
+    let Some(secret) = state.totp.as_deref() else {
+        return true;
+    };
+    let code = code.trim();
+    if code.len() != 6 || !code.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    let step = now / TOTP_STEP;
+    let Some(offset) = [0i64, -1, 1]
+        .into_iter()
+        .filter(|d| step + d >= 0)
+        .find(|d| format!("{:06}", totp_code(secret, (step + d) as u64)) == code)
+    else {
+        return false;
+    };
+    let counter = step + offset;
+    let Ok(mut last) = state.totp_last.lock() else {
+        return false;
+    };
+    if counter <= *last {
+        return false;
+    }
+    *last = counter;
+    true
 }
 
 fn login_blocked(state: &AdminState, src: &str, now: i64) -> Option<i64> {
@@ -194,6 +292,9 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 #[derive(Deserialize)]
 struct LoginBody {
     password: String,
+    /// 公网访问必填；局域网可留空
+    #[serde(default)]
+    totp: String,
 }
 
 #[derive(Serialize)]
@@ -236,6 +337,16 @@ async fn login(
     if !ct_eq(expected.as_bytes(), body.password.as_bytes()) {
         record_login_failure(&ctx, &src, now);
         return (StatusCode::UNAUTHORIZED, "密码错误").into_response();
+    }
+
+    // 公网来源必须再过一层 TOTP；局域网只校验密码
+    if !is_lan(source_ip(&headers)) && !verify_totp(&ctx, &body.totp, now) {
+        record_login_failure(&ctx, &src, now);
+        return (
+            StatusCode::UNAUTHORIZED,
+            "动态验证码错误或已过期，公网访问需要二次验证",
+        )
+            .into_response();
     }
 
     if let Ok(mut fails) = ctx.login_failures.lock() {
@@ -5015,6 +5126,8 @@ mod tests {
             password: None,
             sessions: Default::default(),
             login_failures: Default::default(),
+            totp: None,
+            totp_last: Default::default(),
             log_dir: std::env::temp_dir(),
             data_dir: std::env::temp_dir(),
             started_at: 0,
@@ -5104,6 +5217,55 @@ mod tests {
         assert!(login_blocked(&st, "1.2.3.4", now).is_some());
         assert!(login_blocked(&st, "1.2.3.4", now + LOGIN_WINDOW + 1).is_none());
         assert!(login_blocked(&st, "5.6.7.8", now).is_none());
+    }
+
+    #[test]
+    fn totp_matches_rfc6238_vector() {
+        // RFC 6238 附录 B：ASCII 密钥 "12345678901234567890"，T=59s 时 6 位为 287082
+        let secret = decode_totp_secret("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ").unwrap();
+        assert_eq!(secret, b"12345678901234567890");
+        assert_eq!(totp_code(&secret, 1), 287_082);
+        assert!(decode_totp_secret("not-base32!").is_none());
+    }
+
+    #[test]
+    fn totp_only_required_outside_lan() {
+        assert!(is_lan(None), "无来源头时按本机直连处理");
+        assert!(is_lan(Some("10.0.0.5".parse().unwrap())));
+        assert!(is_lan(Some("172.16.3.4".parse().unwrap())));
+        assert!(is_lan(Some("192.168.1.2".parse().unwrap())));
+        assert!(is_lan(Some("127.0.0.1".parse().unwrap())));
+        assert!(is_lan(Some("fd00::1".parse().unwrap())));
+        assert!(!is_lan(Some("8.8.8.8".parse().unwrap())));
+        assert!(!is_lan(Some("2001:4860:4860::8888".parse().unwrap())));
+    }
+
+    #[test]
+    fn totp_rejects_replay_and_wrong_code() {
+        let mut st = state();
+        assert!(verify_totp(&st, "", 1_700_000_000), "未配置 TOTP 时放行");
+
+        st.totp = Some(b"12345678901234567890".to_vec());
+        let now = 1_700_000_003;
+        let code = format!(
+            "{:06}",
+            totp_code(st.totp.as_deref().unwrap(), (now / TOTP_STEP) as u64)
+        );
+        assert!(verify_totp(&st, &code, now));
+        assert!(!verify_totp(&st, &code, now), "同一时间步不能重放");
+        assert!(!verify_totp(&st, "abcdef", now + 60));
+    }
+
+    #[test]
+    fn source_ip_prefers_real_ip_header() {
+        let mut h = HeaderMap::new();
+        h.insert("x-real-ip", "8.8.8.8".parse().unwrap());
+        h.insert("x-forwarded-for", "10.0.0.1, 9.9.9.9".parse().unwrap());
+        assert_eq!(source_ip(&h), Some("8.8.8.8".parse().unwrap()));
+
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-for", "10.0.0.1, 203.0.113.9".parse().unwrap());
+        assert_eq!(source_ip(&h), Some("203.0.113.9".parse().unwrap()));
     }
 
     // ============================================================

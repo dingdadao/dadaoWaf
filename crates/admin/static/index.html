@@ -1603,12 +1603,16 @@
     <div class="modal" style="width:min(420px,92vw)">
       <header><h2>管理登录</h2></header>
       <form onsubmit="submitLogin(event)" style="padding:14px 18px">
-        <div class="login-hint sub" style="margin-bottom:10px">请输入管理密码</div>
+        <div class="login-hint sub" style="margin-bottom:10px">局域网输入管理密码即可；公网访问还需动态验证码</div>
         <div><label for="login-password">管理密码</label>
           <input id="login-password" type="password" autocomplete="current-password" placeholder="管理密码">
         </div>
+        <div style="margin-top:10px"><label for="login-totp">动态验证码（公网必填）</label>
+          <input id="login-totp" inputmode="numeric" autocomplete="one-time-code" maxlength="6"
+                 placeholder="6 位验证码，局域网可留空">
+        </div>
         <div style="margin-top:14px;text-align:right"><button type="submit" class="primary" id="login-submit">登录</button></div>
-        <div class="sub" style="margin-top:10px">登录状态只保存在本机浏览器，12 小时后自动失效。</div>
+        <div class="sub" style="margin-top:10px">认证一次后本机浏览器会缓存会话令牌，7 天内免登录。</div>
       </form>
     </div>
   </div>
@@ -1688,6 +1692,8 @@ async function submitLogin(ev) {
   if (ev) ev.preventDefault();
   const input = document.getElementById('login-password');
   const password = ((input && input.value) || '').trim();
+  const totpInput = document.getElementById('login-totp');
+  const totp = ((totpInput && totpInput.value) || '').replace(/\s+/g, '');
   if (!password) return;
   const btn = document.getElementById('login-submit');
   const hint = document.querySelector('#login-modal .login-hint');
@@ -1696,15 +1702,17 @@ async function submitLogin(ev) {
     const res = await fetch('/api/login', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ password }),
+      body: JSON.stringify({ password, totp }),
     });
     if (res.status === 429) {
       if (hint) hint.textContent = '密码错误次数过多，请稍后再试';
       return;
     }
     if (!res.ok) {
-      if (hint) hint.textContent = '密码错误';
-      if (input) input.select();
+      const msg = (await res.text()) || '登录失败';
+      if (hint) hint.textContent = msg;
+      if (msg.includes('密码')) { if (input) input.select(); }
+      else if (totpInput) totpInput.select();
       return;
     }
     const data = await res.json();

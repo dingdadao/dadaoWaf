@@ -455,6 +455,18 @@ fn cmd_serve(
         let password = std::env::var("HOMEWAF_ADMIN_PASSWORD")
             .ok()
             .filter(|p| !p.trim().is_empty());
+        // 公网登录的二次验证（TOTP，base32 密钥）。局域网登录不要求
+        let totp = std::env::var("HOMEWAF_ADMIN_TOTP_SECRET")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .and_then(|s| match homewaf_admin::decode_totp_secret(&s) {
+                Some(v) => Some(v),
+                None => {
+                    tracing::warn!("HOMEWAF_ADMIN_TOTP_SECRET 不是合法 base32，已忽略 TOTP");
+                    None
+                }
+            });
         let admin_state = homewaf_admin::AdminState {
             store: store.clone(),
             shared: shared.clone(),
@@ -465,6 +477,8 @@ fn cmd_serve(
             password,
             sessions: Default::default(),
             login_failures: Default::default(),
+            totp,
+            totp_last: Default::default(),
             log_dir: std::path::PathBuf::from(&logging_cfg.dir),
             data_dir: std::path::Path::new(db)
                 .parent()

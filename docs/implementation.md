@@ -812,7 +812,9 @@ INFO HomeWAF 启动（配置来自数据库 /tmp/hw-db-mode.db） apps=1 upstrea
 
 **认证**：
 
-- 配了 `HOMEWAF_ADMIN_PASSWORD` 环境变量 → 控制台弹出登录框，`POST /api/login` 用密码换取内存会话令牌（12 小时有效），之后请求带 `Authorization: Bearer <session>`
+- 配了 `HOMEWAF_ADMIN_PASSWORD` 环境变量 → 控制台弹出登录框，`POST /api/login` 用密码换取内存会话令牌（7 天有效），之后请求带 `Authorization: Bearer <session>`
+- 配了 `HOMEWAF_ADMIN_TOTP_SECRET`（base32）→ **公网来源登录还需要 6 位 TOTP 动态验证码**；局域网（含本机直连）只校验密码。来源取反代写入的 `X-Real-IP`，客户端无法伪造
+- TOTP 允许 ±1 个 30 秒时间步偏差，同一时间步的验证码只能使用一次（防重放）
 - 同一来源连续输错 5 次锁定 10 分钟；退出登录调用 `POST /api/logout` 丢弃会话
 - 没配 → **强制只允许监听回环地址**，启动时校验，非回环直接拒绝启动
 
