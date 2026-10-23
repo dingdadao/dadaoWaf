@@ -1181,6 +1181,32 @@ ACL 规则 id（`feed:{组名}:{序号}:{作用域}`）反解，避免重载时�
 - 保存前校验正则、作用对象、分类、分值；写错直接 400，而不是存进去静默不生效
 - 控制台的「测试」按钮调 `/api/detect-rules/test` 走服务端 regex：浏览器 RegExp 不认 `(?i)`、`\p{Han}`，前端测会把合法规则误判成非法
 
+#### 3.24.5 自定义规则「命中即拦」与公开规则包
+
+**语义修正**：自定义检测规则最初沿用内置规则的阈值机制，结果 `severity=medium`（25 分）
+的规则命中后只记录、不拦截——和「黑名单」的直觉相反。现在：
+
+- 自定义规则 `action=block` → **命中即拦**，不看分数是否达到阈值
+- 内置规则与订阅规则包 → 仍按 `block_threshold` 累积判定
+- 影子期规则 → 只记录，`immediate` 被 `shadow` 覆盖
+
+实现上用 `RuleMeta.immediate` 标记，`Finding` 透传，`Verdict.blocked` 变为
+`immediate || blocking_score >= threshold`。分数仍照常累计，自动封禁不受影响。
+
+**公开规则包**（`configs/detect-rules-public.json`，15 条）：
+
+| 类别 | 内容 |
+|---|---|
+| 扫描器 UA | sqlmap / nikto / nuclei / acunetix / nessus / openvas / awvs / wpscan / xray、nmap / masscan / zgrab / shodan / censys、gobuster / dirsearch / ffuf / wfuzz |
+| 敏感文件 | `.env`、`.git/config`、`.svn`、备份残留（.bak/.old/.swp/.sql）、云凭证（.aws/.kube/.docker） |
+| 管理后台 | phpMyAdmin、Spring Actuator、Tomcat Manager |
+| WebShell | `eval($_POST`、`system($_GET`、`base64_decode($_POST` |
+| 注入 | Log4j `${jndi:ldap:` |
+
+**自测**（`scripts/selftest-detect-rules.py`）：导入规则后跑 14 条恶意 + 10 条正常用例，
+每个请求前解封一次（命中会触发自动封禁，否则后续全是 403）。正常用例判定为「非 403 即通过」，
+因为被测上游本身可能返回 404/405。
+
 ### 3.25 事件筛选与分页
 
 **为什么需要**：原来只显示最近 30 条。真实攻击场景下几小时就刷没了，用户想查"昨天谁在扫我"完全做不到。
