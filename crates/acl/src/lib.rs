@@ -586,6 +586,7 @@ mod tests {
         use homewaf_config::*;
         IpGroup {
             name: "g".to_string(),
+            label: "测试 IP 组".to_string(),
             enabled: true,
             source: IpGroupSource {
                 url: url.to_string(),

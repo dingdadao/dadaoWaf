@@ -170,14 +170,7 @@ fn main() -> ExitCode {
             admin_listen,
             allow_regex,
             no_watch,
-        } => cmd_serve(
-            &db,
-            listen,
-            tls_listen,
-            admin_listen,
-            allow_regex,
-            no_watch,
-        ),
+        } => cmd_serve(&db, listen, tls_listen, admin_listen, allow_regex, no_watch),
         Command::Import {
             path,
             db,

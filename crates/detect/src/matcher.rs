@@ -514,10 +514,7 @@ mod tests {
         let hits = ids("id=1' or '1'='1");
         assert!(hits.contains(&"sqli-boolean-tautology"), "实际: {hits:?}");
         let upper = ids("id=1 OR 1=1");
-        assert!(
-            upper.contains(&"sqli-boolean-tautology"),
-            "实际: {upper:?}"
-        );
+        assert!(upper.contains(&"sqli-boolean-tautology"), "实际: {upper:?}");
     }
 
     #[test]

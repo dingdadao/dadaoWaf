@@ -9,3 +9,6 @@
 
 # 工具会话数据（含本地记忆与临时产物）
 .workbuddy-ai/
+
+# 运行时日志（不该入库）
+crates/cli/data/

@@ -618,8 +618,17 @@ mod tests {
         let svc = ChallengeService::new();
         let issued = svc.issue(&cfg(), "nas", Some(ip("192.168.1.9")), "/admin?x=1", 1_000);
         let nonce = solve(&issued.token, FP, issued.difficulty);
-        let payload = v!(&svc, &issued.token, &nonce, FP, ENV, "nas", ip("192.168.1.9"), 1_001)
-            .expect("应通过验证");
+        let payload = v!(
+            &svc,
+            &issued.token,
+            &nonce,
+            FP,
+            ENV,
+            "nas",
+            ip("192.168.1.9"),
+            1_001
+        )
+        .expect("应通过验证");
         assert_eq!(payload.next(), "/admin?x=1");
     }
 
@@ -629,7 +638,16 @@ mod tests {
         let issued = svc.issue(&cfg(), "nas", Some(ip("192.168.1.9")), "/", 1_000);
         let nonce = solve(&issued.token, FP, issued.difficulty);
         assert_eq!(
-            v!(&svc, &issued.token, &nonce, FP, ENV, "nas", ip("192.168.1.10"), 1_001),
+            v!(
+                &svc,
+                &issued.token,
+                &nonce,
+                FP,
+                ENV,
+                "nas",
+                ip("192.168.1.10"),
+                1_001
+            ),
             Err(ChallengeError::WrongClient)
         );
     }
@@ -640,7 +658,16 @@ mod tests {
         let issued = svc.issue(&cfg(), "nas", Some(ip("192.168.1.9")), "/", 1_000);
         let nonce = solve(&issued.token, FP, issued.difficulty);
         assert_eq!(
-            v!(&svc, &issued.token, &nonce, FP, ENV, "blog", ip("192.168.1.9"), 1_001),
+            v!(
+                &svc,
+                &issued.token,
+                &nonce,
+                FP,
+                ENV,
+                "blog",
+                ip("192.168.1.9"),
+                1_001
+            ),
             Err(ChallengeError::WrongClient)
         );
     }
@@ -651,7 +678,16 @@ mod tests {
         let issued = svc.issue(&cfg(), "nas", Some(ip("192.168.1.9")), "/", 1_000);
         let nonce = solve(&issued.token, FP, issued.difficulty);
         assert_eq!(
-            v!(&svc, &issued.token, &nonce, FP, ENV, "nas", ip("192.168.1.9"), 1_060),
+            v!(
+                &svc,
+                &issued.token,
+                &nonce,
+                FP,
+                ENV,
+                "nas",
+                ip("192.168.1.9"),
+                1_060
+            ),
             Err(ChallengeError::Expired)
         );
     }
@@ -668,7 +704,16 @@ mod tests {
         let repl = if ch == 'A' { 'B' } else { 'A' };
         tampered.replace_range(pos..pos + 1, &repl.to_string());
         assert!(matches!(
-            v!(&svc, &tampered, "0", FP, ENV, "nas", ip("192.168.1.9"), 1_001),
+            v!(
+                &svc,
+                &tampered,
+                "0",
+                FP,
+                ENV,
+                "nas",
+                ip("192.168.1.9"),
+                1_001
+            ),
             Err(ChallengeError::BadSignature) | Err(ChallengeError::Malformed)
         ));
     }
@@ -734,7 +779,16 @@ mod tests {
             "0123456789abcdef0",
         ] {
             assert_eq!(
-                v!(&svc, &issued.token, &nonce, bad, ENV, "nas", ip("192.168.1.9"), 1_001),
+                v!(
+                    &svc,
+                    &issued.token,
+                    &nonce,
+                    bad,
+                    ENV,
+                    "nas",
+                    ip("192.168.1.9"),
+                    1_001
+                ),
                 Err(ChallengeError::BadFingerprint),
                 "指纹 {bad:?} 应被拒"
             );
@@ -748,7 +802,16 @@ mod tests {
         let nonce = solve(&issued.token, FP, issued.difficulty);
         for bad in ["", "wd=1.cdp=0", "wd=0.cdp=1", "wd=0", "wd=x.cdp=0"] {
             assert_eq!(
-                v!(&svc, &issued.token, &nonce, FP, bad, "nas", ip("192.168.1.9"), 1_001),
+                v!(
+                    &svc,
+                    &issued.token,
+                    &nonce,
+                    FP,
+                    bad,
+                    "nas",
+                    ip("192.168.1.9"),
+                    1_001
+                ),
                 Err(ChallengeError::Automated),
                 "标记 {bad:?} 应被拒"
             );
@@ -760,10 +823,28 @@ mod tests {
         let svc = ChallengeService::new();
         let issued = svc.issue(&cfg(), "nas", Some(ip("192.168.1.9")), "/", 1_000);
         let nonce = solve(&issued.token, FP, issued.difficulty);
-        v!(&svc, &issued.token, &nonce, FP, ENV, "nas", ip("192.168.1.9"), 1_001)
-            .expect("首次应通过");
+        v!(
+            &svc,
+            &issued.token,
+            &nonce,
+            FP,
+            ENV,
+            "nas",
+            ip("192.168.1.9"),
+            1_001
+        )
+        .expect("首次应通过");
         assert_eq!(
-            v!(&svc, &issued.token, &nonce, FP, ENV, "nas", ip("192.168.1.9"), 1_002),
+            v!(
+                &svc,
+                &issued.token,
+                &nonce,
+                FP,
+                ENV,
+                "nas",
+                ip("192.168.1.9"),
+                1_002
+            ),
             Err(ChallengeError::Replay)
         );
     }

@@ -115,6 +115,18 @@ pub fn router(state: Ctx) -> Router {
         .route("/api/feeds/{name}", delete(delete_feed))
         .route("/api/feeds/{name}/refresh", post(refresh_feed))
         .route(
+            "/api/subscriptions",
+            get(list_subscriptions).post(upsert_subscription),
+        )
+        .route(
+            "/api/subscriptions/{kind}/{name}",
+            delete(delete_subscription),
+        )
+        .route(
+            "/api/subscriptions/{kind}/{name}/refresh",
+            post(refresh_subscription),
+        )
+        .route(
             "/api/rule-feeds",
             get(list_rule_feeds).post(upsert_rule_feed),
         )
@@ -134,7 +146,10 @@ pub fn router(state: Ctx) -> Router {
         .route("/api/UploadSSLCertAPI", post(slce_upload_cert))
         // 雷池开放接口：主从配置同步/第三方脚本按雷池文档直接对接
         .route("/api/open/health", get(open_health))
-        .route("/api/open/cert", get(open_list_certs).post(open_upsert_cert))
+        .route(
+            "/api/open/cert",
+            get(open_list_certs).post(open_upsert_cert),
+        )
         .route(
             "/api/open/cert/{id}",
             get(open_get_cert).delete(open_delete_cert),
@@ -2714,6 +2729,9 @@ async fn leichi_config(State(ctx): State<Ctx>, headers: HeaderMap) -> Response {
 #[derive(Deserialize)]
 struct FeedInput {
     name: String,
+    /// 中文名称，仅用于展示
+    #[serde(default)]
+    label: Option<String>,
     url: String,
     #[serde(default)]
     enabled: Option<bool>,
@@ -2757,6 +2775,7 @@ fn build_group(input: &FeedInput) -> Result<homewaf_config::IpGroup, String> {
 
     Ok(IpGroup {
         name: name.to_string(),
+        label: input.label.as_deref().unwrap_or("").trim().to_string(),
         enabled: input.enabled.unwrap_or(true),
         source: IpGroupSource {
             url: url.to_string(),
@@ -2811,6 +2830,24 @@ async fn upsert_feed(
         Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
     };
 
+    save_ip_group(&ctx, group)
+}
+
+/// 写入 IP 组订阅并立即重载。
+///
+/// 保存成功不代表拉取成功：拉取失败只记在 `feed_failures` 里，
+/// 不告诉用户的话，他会以为防护已经生效了。
+fn save_ip_group(ctx: &AdminState, group: homewaf_config::IpGroup) -> Response {
+    // scope 指向不存在的应用会让整次重载失败，必须在写库之前挡住：
+    // 否则会出现"配置已存下、但运行时没生效"的中间态，用户完全看不出来。
+    let app_ids = match ctx.store.list_applications::<homewaf_config::Application>() {
+        Ok(apps) => apps.into_iter().map(|a| a.id).collect::<Vec<_>>(),
+        Err(e) => return internal(e).into_response(),
+    };
+    if let Err(e) = validate_ip_group(&group, &app_ids) {
+        return (StatusCode::BAD_REQUEST, e).into_response();
+    }
+
     let now = homewaf_acl::now_unix();
     if let Err(e) = ctx
         .store
@@ -2819,10 +2856,8 @@ async fn upsert_feed(
         return internal(e).into_response();
     }
 
-    match reload_state(&ctx) {
+    match reload_state(ctx) {
         Ok(()) => {
-            // 订阅保存成功不代表拉取成功。拉取失败只记在 feed_failures 里，
-            // 不告诉用户的话，他会以为防护已经生效了。
             let snapshot = ctx.shared.load_full();
             if let Some((_, err)) = snapshot
                 .feed_failures
@@ -2865,6 +2900,9 @@ async fn delete_feed(
 }
 
 /// 立即重新拉取。本质就是触发一次重载——`load_state_from_db` 会重新加载所有启用的订阅。
+///
+/// 注意重载会遵守各自的 `interval`：没到点的组不会联网，直接复用本地快照。
+/// 这种情况下要如实告诉用户"没真的去拉"，否则"刷新"就成了假按钮。
 async fn refresh_feed(
     State(ctx): State<Ctx>,
     headers: HeaderMap,
@@ -2873,6 +2911,20 @@ async fn refresh_feed(
     if !authorized(&ctx, &headers) {
         return unauthorized();
     }
+
+    let interval = ctx.store.list_ip_groups().ok().and_then(|rows| {
+        rows.iter()
+            .find(|r| r.name == name)
+            .and_then(|r| serde_json::from_str::<homewaf_config::IpGroup>(&r.body).ok())
+            .map(|g| g.source.interval.as_secs() as i64)
+    });
+    let last = ctx.store.feed_state_updated_at(&name).ok().flatten();
+    let now = homewaf_acl::now_unix();
+    let not_due = match (interval, last) {
+        (Some(interval), Some(last)) => now.saturating_sub(last) < interval,
+        _ => false,
+    };
+
     match reload_state(&ctx) {
         Ok(()) => {
             let snapshot = ctx.shared.load_full();
@@ -2880,6 +2932,14 @@ async fn refresh_feed(
                 return Json(serde_json::json!({
                     "ok": true,
                     "warning": format!("刷新失败：{err}"),
+                }))
+                .into_response();
+            }
+            if not_due {
+                let minutes = interval.unwrap_or(0) / 60;
+                return Json(serde_json::json!({
+                    "ok": true,
+                    "warning": format!("距上次拉取不足 {minutes} 分钟，本次未重新联网，仍使用本地快照"),
                 }))
                 .into_response();
             }
@@ -2957,6 +3017,11 @@ async fn upsert_rule_feed(
         return (StatusCode::BAD_REQUEST, e).into_response();
     }
 
+    save_rule_feed(&ctx, feed)
+}
+
+/// 写入规则包订阅并强制拉取一次，让用户立刻看到版本与验签结果。
+fn save_rule_feed(ctx: &AdminState, feed: homewaf_config::RuleFeed) -> Response {
     let mut feeds = match homewaf_proxy::load_rule_feed_configs(&ctx.store) {
         Ok(f) => f,
         Err(e) => return internal(e).into_response(),
@@ -2966,13 +3031,13 @@ async fn upsert_rule_feed(
         None => feeds.push(feed.clone()),
     }
 
-    let old = match save_rule_feed_configs(&ctx, &feeds) {
+    let old = match save_rule_feed_configs(ctx, &feeds) {
         Ok(old) => old,
         Err(e) => return internal(e).into_response(),
     };
 
     // 保存后强制拉取一次，让用户立刻看到版本与验签结果
-    match reload_state_with(&ctx, true) {
+    match reload_state_with(ctx, true) {
         Ok(()) => {
             let snapshot = ctx.shared.load_full();
             if let Some(status) = snapshot.rule_feeds.iter().find(|s| s.name == feed.name) {
@@ -2988,7 +3053,7 @@ async fn upsert_rule_feed(
         }
         Err(e) => {
             // 重载失败（比如规则与内置规则冲突）时回滚，避免留下一个起不来的配置
-            let _ = save_rule_feed_configs(&ctx, &old);
+            let _ = save_rule_feed_configs(ctx, &old);
             (StatusCode::BAD_REQUEST, format!("已保存，但加载失败：{e}")).into_response()
         }
     }
@@ -3064,6 +3129,318 @@ async fn refresh_rule_feed(
             }
         }
         Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+    }
+}
+
+// ============================================================
+// 统一订阅源
+// ============================================================
+//
+// IP 组订阅与规则包订阅在运行时走两条完全不同的路：前者编译成 ACL 规则，
+// 后者进检测引擎。但站在用户视角它们是同一件事——填一个 HTTPS 地址、定期拉，
+// 拉回来的东西自动生效。所以控制台只暴露一个「订阅源」对象，用 `kind` 区分；
+// 存储与校验仍各自独立，合并的是入口，不是语义。
+
+/// IP 组订阅：拉 CIDR 列表，命中后按 IP 放行/拦截。
+const KIND_IP_LIST: &str = "ip_list";
+/// 规则包订阅：拉签名规则包，补充检测引擎的规则。
+const KIND_RULE_PACK: &str = "rule_pack";
+
+fn kind_label(kind: &str) -> &'static str {
+    match kind {
+        KIND_IP_LIST => "IP 组",
+        KIND_RULE_PACK => "检测规则",
+        _ => "未知",
+    }
+}
+
+fn ip_action_str(action: homewaf_config::IpGroupAction) -> &'static str {
+    use homewaf_config::IpGroupAction;
+    match action {
+        IpGroupAction::Allow => "allow",
+        IpGroupAction::Block => "block",
+        IpGroupAction::Challenge => "challenge",
+        IpGroupAction::Log => "log",
+    }
+}
+
+/// 中文名称为空时回退到机器标识，保证界面上永远有个可读的名字。
+fn display_name(label: &str, name: &str) -> String {
+    let label = label.trim();
+    if label.is_empty() {
+        name.to_string()
+    } else {
+        label.to_string()
+    }
+}
+
+/// 控制台展示用的订阅视图。
+///
+/// `config` 原样带回完整配置，编辑表单直接回填，避免前端再维护一套字段映射。
+#[derive(Serialize)]
+struct SubscriptionView {
+    kind: &'static str,
+    kind_label: &'static str,
+    name: String,
+    label: String,
+    /// 中文名称（为空时等于 name）
+    display_name: String,
+    url: String,
+    enabled: bool,
+    /// 生效条目数：IP 组是 CIDR 条数，规则包是规则条数
+    entries: usize,
+    /// `ok` / `error` / `pending` / `disabled`
+    status: &'static str,
+    /// 规则包来源：`remote` / `cache` / `none`
+    source: Option<String>,
+    /// IP 组：命中动作
+    action: Option<&'static str>,
+    /// 最近一次成功拉取时间
+    last_fetch: Option<i64>,
+    next_check: Option<i64>,
+    error: Option<String>,
+    config: serde_json::Value,
+}
+
+/// 状态优先级：停用 > 失败 > 还没拉到东西 > 正常。
+fn feed_status(enabled: bool, has_error: bool, entries: usize) -> &'static str {
+    if !enabled {
+        "disabled"
+    } else if has_error {
+        "error"
+    } else if entries == 0 {
+        "pending"
+    } else {
+        "ok"
+    }
+}
+
+fn ip_group_views(ctx: &AdminState) -> Result<Vec<SubscriptionView>, String> {
+    let rows = ctx.store.list_ip_groups().map_err(|e| e.to_string())?;
+    let snapshot = ctx.shared.load_full();
+    let mut out = Vec::with_capacity(rows.len());
+
+    for row in rows {
+        let mut group: homewaf_config::IpGroup = match serde_json::from_str(&row.body) {
+            Ok(g) => g,
+            Err(e) => {
+                tracing::warn!(name = %row.name, error = %e, "订阅数据损坏，已跳过");
+                continue;
+            }
+        };
+        group.enabled = row.enabled;
+
+        let entries = ctx
+            .store
+            .load_feed_state(&group.name)
+            .ok()
+            .flatten()
+            .map(|s| s.lines().filter(|l| !l.trim().is_empty()).count())
+            .unwrap_or(0);
+        let last_fetch = ctx.store.feed_state_updated_at(&group.name).ok().flatten();
+        let error = snapshot
+            .feed_failures
+            .iter()
+            .find(|(n, _)| n == &group.name)
+            .map(|(_, e)| e.clone());
+        let config = serde_json::to_value(&group).map_err(|e| e.to_string())?;
+
+        out.push(SubscriptionView {
+            kind: KIND_IP_LIST,
+            kind_label: kind_label(KIND_IP_LIST),
+            name: group.name.clone(),
+            label: group.label.clone(),
+            display_name: display_name(&group.label, &group.name),
+            url: group.source.url.clone(),
+            enabled: group.enabled,
+            entries,
+            status: feed_status(group.enabled, error.is_some(), entries),
+            source: None,
+            action: Some(ip_action_str(group.action)),
+            last_fetch,
+            next_check: last_fetch.map(|t| t + group.source.interval.as_secs() as i64),
+            error,
+            config,
+        });
+    }
+    Ok(out)
+}
+
+fn rule_feed_views(ctx: &AdminState) -> Result<Vec<SubscriptionView>, String> {
+    let feeds = homewaf_proxy::load_rule_feed_configs(&ctx.store)?;
+    let snapshot = ctx.shared.load_full();
+    let mut out = Vec::with_capacity(feeds.len());
+
+    for feed in feeds {
+        let status = snapshot.rule_feeds.iter().find(|s| s.name == feed.name);
+        // 运行时的 enabled 还考虑了「缓存缺失且自动更新关闭」的情况，以运行时为准
+        let enabled = feed.enabled && status.map(|s| s.enabled).unwrap_or(true);
+        let entries = status.map(|s| s.rule_count).unwrap_or(0);
+        let error = status.and_then(|s| s.error.clone());
+        let config = serde_json::to_value(&feed).map_err(|e| e.to_string())?;
+
+        out.push(SubscriptionView {
+            kind: KIND_RULE_PACK,
+            kind_label: kind_label(KIND_RULE_PACK),
+            name: feed.name.clone(),
+            label: feed.label.clone(),
+            display_name: display_name(&feed.label, &feed.name),
+            url: feed.url.clone(),
+            enabled,
+            entries,
+            status: feed_status(enabled, error.is_some(), entries),
+            source: status.map(|s| s.source.clone()),
+            action: None,
+            last_fetch: status.and_then(|s| s.fetched_at),
+            next_check: status.and_then(|s| s.next_check_at),
+            error,
+            config,
+        });
+    }
+    Ok(out)
+}
+
+async fn list_subscriptions(State(ctx): State<Ctx>, headers: HeaderMap) -> Response {
+    if !authorized(&ctx, &headers) {
+        return unauthorized();
+    }
+
+    let mut items = match ip_group_views(&ctx) {
+        Ok(v) => v,
+        Err(e) => return internal(e).into_response(),
+    };
+    match rule_feed_views(&ctx) {
+        Ok(mut v) => items.append(&mut v),
+        Err(e) => return internal(e).into_response(),
+    }
+    // 先按类型再按标识排序，保证同一类订阅挨在一起
+    items.sort_by(|a, b| (a.kind, a.name.as_str()).cmp(&(b.kind, b.name.as_str())));
+
+    Json(serde_json::json!({ "items": items })).into_response()
+}
+
+#[derive(Deserialize)]
+struct SubscriptionInput {
+    kind: String,
+    /// 完整配置。用 Value 而不是合并成一个扁平结构：两类的字段差异太大，
+    /// 摊平后每个字段都得是 Option，反而更容易写错。
+    config: serde_json::Value,
+}
+
+async fn upsert_subscription(
+    State(ctx): State<Ctx>,
+    headers: HeaderMap,
+    Json(input): Json<SubscriptionInput>,
+) -> Response {
+    if !authorized(&ctx, &headers) {
+        return unauthorized();
+    }
+
+    match input.kind.as_str() {
+        KIND_IP_LIST => {
+            let mut group: homewaf_config::IpGroup = match serde_json::from_value(input.config) {
+                Ok(g) => g,
+                Err(e) => {
+                    return (StatusCode::BAD_REQUEST, format!("IP 组配置不合法：{e}"))
+                        .into_response()
+                }
+            };
+            group.name = group.name.trim().to_string();
+            group.label = group.label.trim().to_string();
+            save_ip_group(&ctx, group)
+        }
+        KIND_RULE_PACK => {
+            let mut feed: homewaf_config::RuleFeed = match serde_json::from_value(input.config) {
+                Ok(f) => f,
+                Err(e) => {
+                    return (StatusCode::BAD_REQUEST, format!("规则包配置不合法：{e}"))
+                        .into_response()
+                }
+            };
+            feed.name = feed.name.trim().to_string();
+            feed.label = feed.label.trim().to_string();
+            if let Err(e) = validate_rule_feed(&feed) {
+                return (StatusCode::BAD_REQUEST, e).into_response();
+            }
+            save_rule_feed(&ctx, feed)
+        }
+        other => (StatusCode::BAD_REQUEST, format!("未知订阅类型 `{other}`")).into_response(),
+    }
+}
+
+/// IP 组订阅的入口校验。
+///
+/// `app_ids` 用于确认 `scope` 引用的应用真实存在——这类错误如果留到重载阶段，
+/// 表现是"保存成功但没生效"，比直接报错难排查得多。
+fn validate_ip_group(group: &homewaf_config::IpGroup, app_ids: &[String]) -> Result<(), String> {
+    if group.name.is_empty() {
+        return Err("订阅名称不能为空".into());
+    }
+    if group.name.chars().count() > 64 {
+        return Err("订阅名称不能超过 64 个字符".into());
+    }
+    if !group
+        .name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err("订阅名称只能包含字母、数字、横线和下划线".into());
+    }
+    if group.label.chars().count() > 64 {
+        return Err("中文名称不能超过 64 个字符".into());
+    }
+    if !group.source.url.starts_with("https://") {
+        return Err("订阅地址必须是 HTTPS（明文 HTTP 可能被中间人投毒）".into());
+    }
+    if group.source.interval.as_secs() < 60 {
+        return Err("拉取周期不能短于 60 秒".into());
+    }
+    if group.source.timeout.as_secs() == 0 {
+        return Err("拉取超时不能为 0".into());
+    }
+    for scope in &group.scope {
+        if !app_ids.iter().any(|id| id == scope) {
+            return Err(format!("作用域引用了不存在的应用 `{scope}`"));
+        }
+    }
+    Ok(())
+}
+
+fn parse_kind(kind: &str) -> Option<&'static str> {
+    match kind {
+        KIND_IP_LIST => Some(KIND_IP_LIST),
+        KIND_RULE_PACK => Some(KIND_RULE_PACK),
+        _ => None,
+    }
+}
+
+async fn delete_subscription(
+    State(ctx): State<Ctx>,
+    headers: HeaderMap,
+    Path((kind, name)): Path<(String, String)>,
+) -> Response {
+    if !authorized(&ctx, &headers) {
+        return unauthorized();
+    }
+    match parse_kind(&kind) {
+        Some(KIND_IP_LIST) => delete_feed(State(ctx), headers, Path(name)).await,
+        Some(KIND_RULE_PACK) => delete_rule_feed(State(ctx), headers, Path(name)).await,
+        _ => (StatusCode::BAD_REQUEST, format!("未知订阅类型 `{kind}`")).into_response(),
+    }
+}
+
+async fn refresh_subscription(
+    State(ctx): State<Ctx>,
+    headers: HeaderMap,
+    Path((kind, name)): Path<(String, String)>,
+) -> Response {
+    if !authorized(&ctx, &headers) {
+        return unauthorized();
+    }
+    match parse_kind(&kind) {
+        Some(KIND_IP_LIST) => refresh_feed(State(ctx), headers, Path(name)).await,
+        Some(KIND_RULE_PACK) => refresh_rule_feed(State(ctx), headers, Path(name)).await,
+        _ => (StatusCode::BAD_REQUEST, format!("未知订阅类型 `{kind}`")).into_response(),
     }
 }
 
@@ -3798,7 +4175,11 @@ fn parse_open_cert_upload(headers: &HeaderMap, body: &[u8]) -> Result<ParsedUplo
         .or(parsed.crt)
         .or(parsed.cert)
         .or(parsed.cert_pem);
-    let key_pem = manual.key.or(manual.key_pem).or(parsed.key).or(parsed.key_pem);
+    let key_pem = manual
+        .key
+        .or(manual.key_pem)
+        .or(parsed.key)
+        .or(parsed.key_pem);
     Ok(ParsedUpload {
         id: parsed.id,
         body: CertUploadBody {
@@ -4201,6 +4582,7 @@ mod tests {
     fn rule_feed(name: &str) -> RuleFeed {
         RuleFeed {
             name: name.to_string(),
+            label: "官方规则包".to_string(),
             url: "https://rules.example.com/core.hwrule".to_string(),
             enabled: true,
             channel: FeedChannel::Stable,
@@ -4249,6 +4631,7 @@ mod tests {
     fn feed(name: &str, url: &str) -> FeedInput {
         FeedInput {
             name: name.to_string(),
+            label: None,
             url: url.to_string(),
             enabled: None,
             action: None,
@@ -4308,6 +4691,86 @@ mod tests {
         let mut f = feed("x", "https://a.com/l");
         f.scope = Some(vec!["nas".to_string()]);
         assert_eq!(build_group(&f).unwrap().scope, vec!["nas"]);
+    }
+
+    // ============================================================
+    // 统一订阅源
+    // ============================================================
+
+    #[test]
+    fn label_is_kept_and_trimmed() {
+        let mut f = feed("chaitin", "https://a.com/l");
+        f.label = Some("  长亭恶意 IP 库  ".to_string());
+        assert_eq!(build_group(&f).unwrap().label, "长亭恶意 IP 库");
+    }
+
+    #[test]
+    fn missing_label_is_allowed() {
+        // 中文名称是可选的：没填就回退显示标识
+        let g = build_group(&feed("chaitin", "https://a.com/l")).unwrap();
+        assert!(g.label.is_empty());
+        assert_eq!(display_name(&g.label, &g.name), "chaitin");
+    }
+
+    #[test]
+    fn display_name_prefers_label() {
+        assert_eq!(display_name("恶意 IP 库", "chaitin"), "恶意 IP 库");
+        assert_eq!(display_name("   ", "chaitin"), "chaitin");
+        assert_eq!(display_name("", "chaitin"), "chaitin");
+    }
+
+    #[test]
+    fn status_priority_is_disabled_then_error() {
+        // 停用优先于失败：用户主动关掉的东西不该显示成"异常"
+        assert_eq!(feed_status(false, true, 10), "disabled");
+        assert_eq!(feed_status(true, true, 10), "error");
+        // 拉取成功但一条都没拿到，属于待生效而不是正常
+        assert_eq!(feed_status(true, false, 0), "pending");
+        assert_eq!(feed_status(true, false, 10), "ok");
+    }
+
+    #[test]
+    fn kind_labels_are_chinese() {
+        assert_eq!(kind_label(KIND_IP_LIST), "IP 组");
+        assert_eq!(kind_label(KIND_RULE_PACK), "检测规则");
+        assert!(parse_kind(KIND_IP_LIST).is_some());
+        assert!(parse_kind("bogus").is_none());
+    }
+
+    #[test]
+    fn ip_group_validation_rejects_obvious_mistakes() {
+        let apps = vec!["nas".to_string()];
+        let g = build_group(&feed("chaitin", "https://a.com/l")).unwrap();
+        assert!(validate_ip_group(&g, &apps).is_ok());
+
+        let mut bad = g.clone();
+        bad.source.url = "http://a.com/l".to_string();
+        assert!(validate_ip_group(&bad, &apps)
+            .unwrap_err()
+            .contains("HTTPS"));
+
+        let mut bad = g.clone();
+        bad.name = "a b".to_string();
+        assert!(validate_ip_group(&bad, &apps).unwrap_err().contains("字母"));
+
+        let mut bad = g.clone();
+        bad.label = "名".repeat(65);
+        assert!(validate_ip_group(&bad, &apps).unwrap_err().contains("64"));
+
+        let mut bad = g.clone();
+        bad.source.interval = homewaf_config::Duration::from_secs(10);
+        assert!(validate_ip_group(&bad, &apps).unwrap_err().contains("60"));
+    }
+
+    #[test]
+    fn ip_group_scope_must_reference_existing_app() {
+        // 引用不存在的应用必须在保存前拦住：留到重载阶段会变成"存了但没生效"
+        let mut g = build_group(&feed("chaitin", "https://a.com/l")).unwrap();
+        g.scope = vec!["nas".to_string()];
+        assert!(validate_ip_group(&g, &["nas".to_string()]).is_ok());
+        assert!(validate_ip_group(&g, &[])
+            .unwrap_err()
+            .contains("不存在的应用"));
     }
 
     // ============================================================
@@ -4505,9 +4968,8 @@ mod tests {
         assert_eq!(manual.body.cert_pem.as_deref(), Some("CERT"));
         assert_eq!(manual.body.key_pem.as_deref(), Some("KEY"));
 
-        let flat =
-            parse_open_cert_upload(&headers, br#"{"name":"a.test","crt":"C2","key":"K2"}"#)
-                .unwrap();
+        let flat = parse_open_cert_upload(&headers, br#"{"name":"a.test","crt":"C2","key":"K2"}"#)
+            .unwrap();
         assert_eq!(flat.body.name.as_deref(), Some("a.test"));
         assert_eq!(flat.body.cert_pem.as_deref(), Some("C2"));
         assert_eq!(flat.body.key_pem.as_deref(), Some("K2"));

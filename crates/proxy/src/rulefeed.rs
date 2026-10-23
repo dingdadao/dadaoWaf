@@ -435,6 +435,7 @@ mod tests {
     fn feed(name: &str) -> RuleFeed {
         RuleFeed {
             name: name.to_string(),
+            label: format!("{name} 规则包"),
             url: format!("https://example.com/{name}.hwrule"),
             enabled: true,
             channel: FeedChannel::Stable,

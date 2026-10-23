@@ -773,8 +773,7 @@
       </div>
       <div class="nav-group">
         <div class="nav-title">订阅</div>
-        <a data-page="feeds">IP 组订阅</a>
-        <a data-page="rule-feeds">规则订阅</a>
+        <a data-page="subscriptions">订阅源</a>
       </div>
       <div class="nav-group">
         <div class="nav-title">运维</div>
@@ -1112,66 +1111,56 @@
         </section>
       </div>
 
-      <!-- ========== IP 组订阅 ========== -->
-      <div class="page" data-page="feeds">
+      <!-- ========== 订阅源（IP 组 + 检测规则包） ========== -->
+      <div class="page" data-page="subscriptions">
         <section class="card">
           <header>
-            <h2>IP 组订阅</h2>
-            <button class="primary" onclick="showFeedForm()">+ 添加订阅</button>
+            <h2>订阅源</h2>
+            <button class="primary" onclick="showSubForm()">+ 添加订阅</button>
           </header>
-          <form id="feed-form" onsubmit="submitFeed(event)" style="display:none">
-            <div><label for="ff-name">名称</label><input id="ff-name" placeholder="chaitin" required></div>
-            <div class="wide"><label for="ff-url">订阅地址（必须 HTTPS）</label><input id="ff-url" placeholder="https://chaitin.cn/api/ip-group/xxxx" required></div>
-            <div><label for="ff-action">命中动作</label>
-              <select id="ff-action"><option value="block">拒绝</option><option value="allow">放行（白名单）</option><option value="challenge">人机验证</option><option value="log">仅记录</option></select>
+          <form id="sub-form" onsubmit="submitSub(event)" style="display:none">
+            <div><label for="sf-kind">订阅类型</label>
+              <select id="sf-kind" onchange="onSubKindChange()">
+                <option value="ip_list">IP 组（恶意 IP / 白名单 IP）</option>
+                <option value="rule_pack">检测规则包（注入、XSS 等）</option>
+              </select>
             </div>
-            <div><label for="ff-scope">作用域（留空为全部）</label><input id="ff-scope" placeholder="nas"></div>
-            <div style="display:flex;gap:8px;align-items:center">
-              <button type="submit" class="primary" id="ff-submit">添加并拉取</button>
-              <button type="button" onclick="hideFeedForm()">取消</button>
-            </div>
-          </form>
-          <div id="feeds"></div>
-        </section>
-      </div>
+            <div><label for="sf-label">中文名称</label><input id="sf-label" placeholder="长亭恶意 IP 库"></div>
+            <div><label for="sf-name">标识（英文，用于规则归属）</label><input id="sf-name" placeholder="chaitin" required></div>
+            <div class="wide"><label for="sf-url">订阅地址（必须 HTTPS）</label><input id="sf-url" placeholder="https://chaitin.cn/api/ip-group/xxxx" required></div>
+            <div><label for="sf-interval">拉取间隔</label><input id="sf-interval" value="1h" placeholder="1h"></div>
+            <div><label for="sf-timeout">拉取超时</label><input id="sf-timeout" value="15s" placeholder="15s"></div>
 
-      <!-- ========== 规则包订阅 ========== -->
-      <div class="page" data-page="rule-feeds">
-        <section class="card">
-          <header>
-            <h2>检测规则订阅</h2>
-            <button class="primary" onclick="showRuleFeedForm()">+ 添加订阅</button>
-          </header>
-          <form id="rule-feed-form" onsubmit="submitRuleFeed(event)" style="display:none">
-            <div><label for="rff-name">名称</label><input id="rff-name" placeholder="official" required></div>
-            <div class="wide"><label for="rff-url">规则包地址（必须 HTTPS）</label><input id="rff-url" placeholder="https://rules.example.com/core.hwrule" required></div>
-            <div><label for="rff-channel">通道</label>
-              <select id="rff-channel" onchange="syncRuleFeedChannel()">
+            <div class="kind-ip"><label for="sf-action">命中动作</label>
+              <select id="sf-action"><option value="block">拒绝</option><option value="allow">放行（白名单）</option><option value="challenge">人机验证</option><option value="log">仅记录</option></select>
+            </div>
+            <div class="kind-ip"><label for="sf-scope">作用域（应用 ID，逗号分隔，留空为全部）</label><input id="sf-scope" placeholder="nas, photos"></div>
+
+            <div class="kind-rule"><label for="sf-channel">通道</label>
+              <select id="sf-channel" onchange="syncSubKind()">
                 <option value="stable">稳定（stable）</option>
                 <option value="beta">测试（beta）</option>
                 <option value="pinned">固定版本</option>
               </select>
             </div>
-            <div><label for="rff-version">固定版本号</label><input id="rff-version" placeholder="仅 pinned 通道需要"></div>
-            <div><label for="rff-interval">检查间隔</label><input id="rff-interval" value="6h" placeholder="6h"></div>
-            <div><label for="rff-window">更新窗口（UTC，留空不限）</label><input id="rff-window" placeholder="03:00-05:00"></div>
-            <div class="wide"><label for="rff-key">Ed25519 公钥</label><input id="rff-key" placeholder="ed25519:..."></div>
-            <div><label for="rff-shadow">影子期（留空关闭）</label><input id="rff-shadow" placeholder="24h"></div>
-            <div><label for="rff-timeout">拉取超时</label><input id="rff-timeout" value="20s" placeholder="20s"></div>
-            <div><label for="rff-maxsize">大小上限</label><input id="rff-maxsize" value="4MB" placeholder="4MB"></div>
+            <div class="kind-rule"><label for="sf-version">固定版本号</label><input id="sf-version" placeholder="仅固定版本需要"></div>
+            <div class="kind-rule"><label for="sf-shadow">影子期（留空关闭）</label><input id="sf-shadow" placeholder="24h"></div>
+            <div class="kind-rule"><label for="sf-window">更新窗口（UTC，留空不限）</label><input id="sf-window" placeholder="03:00-05:00"></div>
+            <div class="kind-rule"><label for="sf-maxsize">大小上限</label><input id="sf-maxsize" value="4MB" placeholder="4MB"></div>
+            <div class="kind-rule wide"><label for="sf-key">Ed25519 公钥</label><input id="sf-key" placeholder="ed25519:..."></div>
             <div class="wide" style="display:flex;gap:18px;flex-wrap:wrap;align-items:center;font-size:13px">
-              <label class="row" style="margin:0"><input type="checkbox" id="rff-enabled" checked> 启用</label>
-              <label class="row" style="margin:0"><input type="checkbox" id="rff-auto" checked> 自动更新</label>
-              <label class="row" style="margin:0"><input type="checkbox" id="rff-sig" checked> 强制验签</label>
-              <label class="row" style="margin:0"><input type="checkbox" id="rff-rollback" checked> 失败回退缓存</label>
+              <label class="row" style="margin:0"><input type="checkbox" id="sf-enabled" checked> 启用</label>
+              <label class="row kind-rule" style="margin:0"><input type="checkbox" id="sf-auto" checked> 自动更新</label>
+              <label class="row kind-rule" style="margin:0"><input type="checkbox" id="sf-sig" checked> 强制验签</label>
+              <label class="row kind-rule" style="margin:0"><input type="checkbox" id="sf-rollback" checked> 失败回退缓存</label>
             </div>
-            <div class="hint">影子期内新规则只记录不拦截。更新窗口按 UTC 计算，支持跨午夜（如 23:00-01:00）。强制验签时必须提供公钥。</div>
+            <div class="hint" id="sub-hint"></div>
             <div style="display:flex;gap:8px;align-items:center">
-              <button type="submit" class="primary" id="rff-submit">保存并拉取</button>
-              <button type="button" onclick="hideRuleFeedForm()">取消</button>
+              <button type="submit" class="primary" id="sf-submit">添加并拉取</button>
+              <button type="button" onclick="hideSubForm()">取消</button>
             </div>
           </form>
-          <div id="rule-feeds"></div>
+          <div id="subs"></div>
         </section>
       </div>
 
@@ -1286,8 +1275,7 @@
             <div class="fieldset">
               <div><button onclick="gotoPage('rules')">访问控制</button></div>
               <div><button onclick="gotoPage('whitelist')">检测白名单</button></div>
-              <div><button onclick="gotoPage('feeds')">IP 组订阅</button></div>
-              <div><button onclick="gotoPage('rule-feeds')">规则订阅</button></div>
+              <div><button onclick="gotoPage('subscriptions')">订阅源</button></div>
             </div>
           </section>
         </div>
@@ -1445,7 +1433,7 @@ const durationToSecs = (d) => {
 // ============================================================
 const PAGE_TITLES = {
   statistics: '统计报表', apps: '防护应用', certs: '证书管理', attack: '攻击防护', rules: '访问控制',
-  whitelist: '检测白名单', feeds: 'IP 组订阅', 'rule-feeds': '规则订阅',
+  whitelist: '检测白名单', subscriptions: '订阅源',
   bans: '封禁', events: '事件', logs: '日志', system: '系统设置',
 };
 
@@ -1460,8 +1448,7 @@ function gotoPage(page) {
   document.getElementById('page-title').textContent = PAGE_TITLES[page] || page;
 
   // 切换时按需加载
-  ({ apps: loadApps, certs: loadCerts, attack: loadAttackPage, rules: loadRules, whitelist: loadWhitelist, feeds: loadFeeds,
-     'rule-feeds': loadRuleFeeds,
+  ({ apps: loadApps, certs: loadCerts, attack: loadAttackPage, rules: loadRules, whitelist: loadWhitelist, subscriptions: loadSubs,
      bans: loadBans, events: loadEvents, logs: loadLogs, system: loadSystemPage,
      statistics: loadStatistics }[page] || (() => {}))();
 }
@@ -2848,228 +2835,225 @@ async function deleteWl(id) {
 }
 
 // ============================================================
-// IP 组订阅
+// 订阅源（IP 组 + 检测规则包合并成一个入口）
 // ============================================================
-async function loadFeeds() {
-  const el = document.getElementById('feeds');
-  try {
-    const feeds = await api('/feeds');
-    if (!feeds.length) { el.innerHTML = '<div class="empty">还没有订阅。添加一个恶意 IP 库，防护能力会强很多。</div>'; return; }
-    el.innerHTML = `<table>
-      <thead><tr><th>名称</th><th>地址</th><th>动作</th><th>作用域</th><th>状态</th><th></th></tr></thead>
-      <tbody>${feeds.map(f => `<tr>
-        <td><code>${esc(f.name)}</code></td>
-        <td style="max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"><code>${esc(f.source.url)}</code></td>
-        <td><span class="tag ${f.action === 'log' ? 'log' : 'deny'}">${actionLabel(f.action)}</span></td>
-        <td>${f.scope?.length ? esc(f.scope.join(', ')) : '<span class="sub" style="margin:0">全部</span>'}</td>
-        <td>${f.enabled ? '<span class="tag allow">启用</span>' : '<span class="tag">停用</span>'}</td>
-        <td style="white-space:nowrap">
-          <button onclick="refreshFeed('${esc(f.name)}')">刷新</button>
-          <button class="danger" onclick="deleteFeed('${esc(f.name)}')">删除</button>
-        </td>
-      </tr>`).join('')}</tbody></table>`;
-  } catch (e) { el.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`; }
-}
+//
+// 两类订阅的生效路径不同：IP 组编译成访问控制规则，规则包进检测引擎。
+// 但对用户来说都是"填地址、定期拉、自动生效"，所以列表和表单共用一套。
+let subsCache = [];
+let editingSub = null;
 
-function showFeedForm() {
-  document.getElementById('feed-form').style.display = 'grid';
-  ['ff-name', 'ff-url', 'ff-scope'].forEach(id => document.getElementById(id).value = '');
-  document.getElementById('ff-action').value = 'block';
-  document.getElementById('ff-name').focus();
-}
-function hideFeedForm() { document.getElementById('feed-form').style.display = 'none'; }
-
-async function submitFeed(e) {
-  e.preventDefault();
-  const btn = document.getElementById('ff-submit');
-  const name = document.getElementById('ff-name').value.trim();
-  const url = document.getElementById('ff-url').value.trim();
-  const action = document.getElementById('ff-action').value;
-  const scope = document.getElementById('ff-scope').value.trim();
-
-  if (!url.startsWith('https://')) return showMsg('订阅地址必须是 HTTPS（明文 HTTP 可能被中间人投毒）', 'error');
-
-  btn.disabled = true; btn.textContent = '拉取中…';
-  try {
-    const res = await api('/feeds', { method: 'POST', body: JSON.stringify({ name, url, action, scope: scope ? [scope] : [] }) });
-    if (res && res.warning) showMsg(res.warning, 'error');
-    else showMsg(`订阅 ${name} 已添加并拉取成功`);
-    hideFeedForm(); loadFeeds(); loadStatistics();
-  } catch (err) { showMsg('添加失败：' + err.message, 'error'); }
-  finally { btn.disabled = false; btn.textContent = '添加并拉取'; }
-}
-
-async function refreshFeed(name) {
-  showMsg(`正在重新拉取 ${name}…`);
-  try {
-    const res = await api('/feeds/' + encodeURIComponent(name) + '/refresh', { method: 'POST' });
-    if (res && res.warning) showMsg(res.warning, 'error');
-    else showMsg(`${name} 已刷新`);
-    loadFeeds();
-  } catch (e) { showMsg('刷新失败：' + e.message, 'error'); }
-}
-
-async function deleteFeed(name) {
-  if (!confirm(`删除订阅 ${name}？对应的规则会立即失效。`)) return;
-  try { await api('/feeds/' + encodeURIComponent(name), { method: 'DELETE' }); showMsg('已删除'); loadFeeds(); loadStatistics(); }
-  catch (e) { showMsg('删除失败：' + e.message, 'error'); }
-}
-
-// ============================================================
-// 规则包订阅
-// ============================================================
-let ruleFeedsCache = [];
-let editingRuleFeed = null;
-
+const SUB_STATUS = {
+  ok: { text: '正常', cls: 'allow' },
+  error: { text: '异常', cls: 'deny' },
+  pending: { text: '待拉取', cls: 'log' },
+  disabled: { text: '已停用', cls: '' },
+};
+const SUB_ACTION_LABEL = { allow: '放行', block: '拒绝', challenge: '人机验证', log: '仅记录' };
 const RULE_SOURCE_LABEL = { remote: '远端', cache: '缓存', none: '不可用', disabled: '已停用' };
-const RULE_SOURCE_CLASS = { remote: 'allow', cache: 'log', none: 'deny', disabled: '' };
 
-async function loadRuleFeeds() {
-  const el = document.getElementById('rule-feeds');
+function defaultSubConfig(kind) {
+  if (kind === 'ip_list') {
+    return {
+      name: '', label: '', enabled: true,
+      source: { url: '', format: 'auto', interval: '1h', timeout: '15s', headers: {} },
+      action: 'block', scope: [], expires: '24h', guards: {}, on_failure: 'keep-last',
+    };
+  }
+  return {
+    name: '', label: '', url: '', enabled: true, channel: 'stable', auto_update: true,
+    check_interval: '6h', update_window: null, timeout: '20s', max_size: '4MB',
+    headers: {}, require_signature: true, public_key: null, shadow_period: null,
+    rollback_on_error: true, pinned_version: null,
+  };
+}
+
+async function loadSubs() {
+  const el = document.getElementById('subs');
   try {
-    const data = await api('/rule-feeds');
-    ruleFeedsCache = data.feeds || [];
-    const statuses = Object.fromEntries((data.statuses || []).map(s => [s.name, s]));
-    if (!ruleFeedsCache.length) {
-      el.innerHTML = '<div class="empty">还没有规则订阅。接入签名规则包可以持续补充检测能力，不必等固件升级。</div>';
+    const data = await api('/subscriptions');
+    subsCache = data.items || [];
+    if (!subsCache.length) {
+      el.innerHTML = '<div class="empty">还没有订阅。IP 库能挡住已知恶意来源，规则包能补上新的攻击特征。</div>';
       return;
     }
     el.innerHTML = `<table>
-      <thead><tr><th>名称 / 地址</th><th>通道 / 版本</th><th>规则数</th><th>状态</th>
-      <th>影子期</th><th>最近拉取</th><th>错误</th><th></th></tr></thead>
-      <tbody>${ruleFeedsCache.map(f => {
-        const s = statuses[f.name] || {};
-        const source = s.source || 'none';
-        const sig = s.signature_ok
-          ? '<span class="tag allow" title="Ed25519 验签通过">已验签</span>'
-          : (f.require_signature ? '<span class="tag deny">未验签</span>' : '<span class="tag log">未签名</span>');
+      <thead><tr><th>中文名称</th><th>类型</th><th>订阅地址</th><th>生效条目</th><th>状态</th><th>最近更新</th><th></th></tr></thead>
+      <tbody>${subsCache.map(s => {
+        const st = SUB_STATUS[s.status] || { text: s.status, cls: '' };
+        const detail = s.kind === 'ip_list'
+          ? (s.action ? `命中${SUB_ACTION_LABEL[s.action] || s.action}` : '')
+          : (s.source ? `来源 ${RULE_SOURCE_LABEL[s.source] || s.source}` : '');
         return `<tr>
-          <td><code>${esc(f.name)}</code>
-            <div class="sub" style="margin:2px 0 0;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(f.url)}">${esc(f.url)}</div></td>
-          <td>${esc(f.channel)}${s.version ? `<br><code>${esc(s.version)}</code>` : ''}
-            ${f.channel === 'pinned' && f.pinned_version ? `<br><span class="sub" style="margin:0">固定 ${esc(f.pinned_version)}</span>` : ''}</td>
-          <td>${s.rule_count ?? 0}</td>
-          <td><span class="tag ${RULE_SOURCE_CLASS[source] || ''}">${esc(RULE_SOURCE_LABEL[source] || source)}</span>
-            ${sig}${f.enabled ? '' : ' <span class="tag">停用</span>'}</td>
-          <td>${s.shadow_until ? fmtTime(s.shadow_until) : '<span class="sub" style="margin:0">—</span>'}</td>
-          <td>${s.fetched_at ? fmtTime(s.fetched_at) : '<span class="sub" style="margin:0">—</span>'}
-            ${s.next_check_at ? `<div class="sub" style="margin:2px 0 0">下次 ${fmtTime(s.next_check_at)}</div>` : ''}</td>
-          <td style="max-width:240px;color:var(--danger);font-size:12px">${esc(s.error || '')}</td>
+          <td><b>${esc(s.display_name)}</b>
+            ${s.label ? `<div class="sub" style="margin:2px 0 0"><code>${esc(s.name)}</code></div>` : ''}
+            ${s.error ? `<div class="sub" style="margin:2px 0 0;color:var(--danger)">${esc(s.error)}</div>` : ''}
+          </td>
+          <td><span class="tag">${esc(s.kind_label)}</span></td>
+          <td style="max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(s.url)}"><code>${esc(s.url)}</code></td>
+          <td>${s.entries}${detail ? `<div class="sub" style="margin:2px 0 0">${esc(detail)}</div>` : ''}</td>
+          <td><span class="tag ${st.cls}">${st.text}</span></td>
+          <td>${s.last_fetch ? fmtTime(s.last_fetch) : '<span class="sub" style="margin:0">—</span>'}
+            ${s.next_check ? `<div class="sub" style="margin:2px 0 0">下次 ${fmtTime(s.next_check)}</div>` : ''}</td>
           <td style="white-space:nowrap">
-            <button onclick="editRuleFeed('${esc(f.name)}')">编辑</button>
-            <button onclick="refreshRuleFeed('${esc(f.name)}')">刷新</button>
-            <button class="danger" onclick="deleteRuleFeed('${esc(f.name)}')">删除</button>
+            <button onclick="editSub('${esc(s.kind)}','${esc(s.name)}')">编辑</button>
+            <button onclick="refreshSub('${esc(s.kind)}','${esc(s.name)}')">刷新</button>
+            <button class="danger" onclick="deleteSub('${esc(s.kind)}','${esc(s.name)}')">删除</button>
           </td>
         </tr>`;
       }).join('')}</tbody></table>`;
   } catch (e) { el.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`; }
 }
 
-function syncRuleFeedChannel() {
-  const pinned = document.getElementById('rff-channel').value === 'pinned';
-  document.getElementById('rff-version').disabled = !pinned;
+function syncSubKind() {
+  const kind = document.getElementById('sf-kind').value;
+  document.querySelectorAll('#sub-form .kind-ip').forEach(el => el.style.display = kind === 'ip_list' ? '' : 'none');
+  document.querySelectorAll('#sub-form .kind-rule').forEach(el => el.style.display = kind === 'rule_pack' ? '' : 'none');
+  document.getElementById('sf-version').disabled =
+    kind !== 'rule_pack' || document.getElementById('sf-channel').value !== 'pinned';
+  document.getElementById('sub-hint').textContent = kind === 'ip_list'
+    ? 'IP 组订阅拉取 CIDR 列表，命中后按「命中动作」放行或拦截；作用域留空表示对所有应用生效。'
+    : '规则包订阅拉取签名规则，影子期内新规则只记录不拦截；更新窗口按 UTC 计算，支持跨午夜（如 23:00-01:00）。';
 }
 
-function showRuleFeedForm(feed) {
-  editingRuleFeed = feed || null;
-  document.getElementById('rule-feed-form').style.display = 'grid';
+// 新建时切换类型要连带换掉默认值，否则会带着上一类的间隔/超时提交
+function onSubKindChange() {
+  const kind = document.getElementById('sf-kind').value;
+  if (!editingSub) {
+    document.getElementById('sf-interval').value = kind === 'ip_list' ? '1h' : '6h';
+    document.getElementById('sf-timeout').value = kind === 'ip_list' ? '15s' : '20s';
+  }
+  document.getElementById('sf-url').placeholder = kind === 'ip_list'
+    ? 'https://chaitin.cn/api/ip-group/xxxx'
+    : 'https://rules.example.com/core.hwrule';
+  syncSubKind();
+}
+
+function showSubForm(sub) {
+  editingSub = sub || null;
+  const kind = sub ? sub.kind : 'ip_list';
+  const cfg = sub ? JSON.parse(JSON.stringify(sub.config)) : defaultSubConfig(kind);
+
+  document.getElementById('sub-form').style.display = 'grid';
+  document.getElementById('sf-kind').value = kind;
+  // 类型不允许改：换类型后旧字段会残留成脏数据
+  document.getElementById('sf-kind').disabled = !!sub;
+
   const set = (id, v) => document.getElementById(id).value = v ?? '';
-  set('rff-name', feed?.name);
-  set('rff-url', feed?.url);
-  set('rff-channel', feed?.channel || 'stable');
-  set('rff-version', feed?.pinned_version);
-  set('rff-interval', feed?.check_interval ?? '6h');
-  set('rff-window', feed?.update_window);
-  set('rff-key', feed?.public_key);
-  set('rff-shadow', feed?.shadow_period);
-  set('rff-timeout', feed?.timeout ?? '20s');
-  set('rff-maxsize', feed?.max_size ?? '4MB');
-  document.getElementById('rff-enabled').checked = feed ? feed.enabled : true;
-  document.getElementById('rff-auto').checked = feed ? feed.auto_update : true;
-  document.getElementById('rff-sig').checked = feed ? feed.require_signature : true;
-  document.getElementById('rff-rollback').checked = feed ? feed.rollback_on_error : true;
+  set('sf-label', cfg.label);
+  set('sf-name', cfg.name);
+  set('sf-url', kind === 'ip_list' ? cfg.source?.url : cfg.url);
+  set('sf-interval', kind === 'ip_list' ? cfg.source?.interval : cfg.check_interval);
+  set('sf-timeout', kind === 'ip_list' ? cfg.source?.timeout : cfg.timeout);
+  set('sf-action', cfg.action || 'block');
+  set('sf-scope', (cfg.scope || []).join(', '));
+  set('sf-channel', cfg.channel || 'stable');
+  set('sf-version', cfg.pinned_version);
+  set('sf-shadow', cfg.shadow_period);
+  set('sf-window', cfg.update_window);
+  set('sf-maxsize', cfg.max_size || '4MB');
+  set('sf-key', cfg.public_key);
 
-  const nameEl = document.getElementById('rff-name');
-  nameEl.readOnly = !!feed;
-  nameEl.style.background = feed ? '#f5f5f2' : '#fff';
-  document.getElementById('rff-submit').textContent = feed ? '保存并拉取' : '添加并拉取';
-  syncRuleFeedChannel();
-  nameEl.focus();
+  const nameEl = document.getElementById('sf-name');
+  nameEl.readOnly = !!sub;
+  nameEl.style.background = sub ? '#f5f5f2' : '#fff';
+  document.getElementById('sf-enabled').checked = cfg.enabled !== false;
+  document.getElementById('sf-auto').checked = cfg.auto_update !== false;
+  document.getElementById('sf-sig').checked = cfg.require_signature !== false;
+  document.getElementById('sf-rollback').checked = cfg.rollback_on_error !== false;
+  document.getElementById('sf-submit').textContent = sub ? '保存并拉取' : '添加并拉取';
+
+  syncSubKind();
+  document.getElementById('sf-label').focus();
 }
 
-function hideRuleFeedForm() {
-  document.getElementById('rule-feed-form').style.display = 'none';
-  editingRuleFeed = null;
+function hideSubForm() {
+  document.getElementById('sub-form').style.display = 'none';
+  document.getElementById('sf-kind').disabled = false;
+  editingSub = null;
 }
 
-function editRuleFeed(name) {
-  const feed = ruleFeedsCache.find(f => f.name === name);
-  if (feed) showRuleFeedForm(feed);
+function editSub(kind, name) {
+  const sub = subsCache.find(s => s.kind === kind && s.name === name);
+  if (sub) showSubForm(sub);
 }
 
-async function submitRuleFeed(e) {
+async function submitSub(e) {
   e.preventDefault();
-  const btn = document.getElementById('rff-submit');
-  const name = document.getElementById('rff-name').value.trim();
-  const url = document.getElementById('rff-url').value.trim();
-  const channel = document.getElementById('rff-channel').value;
-  const version = document.getElementById('rff-version').value.trim();
-  const interval = document.getElementById('rff-interval').value.trim();
-  const window = document.getElementById('rff-window').value.trim();
-  const key = document.getElementById('rff-key').value.trim();
-  const shadow = document.getElementById('rff-shadow').value.trim();
-  const timeout = document.getElementById('rff-timeout').value.trim();
-  const maxsize = document.getElementById('rff-maxsize').value.trim();
-  const sig = document.getElementById('rff-sig').checked;
+  const btn = document.getElementById('sf-submit');
+  const kind = document.getElementById('sf-kind').value;
+  const name = document.getElementById('sf-name').value.trim();
+  const label = document.getElementById('sf-label').value.trim();
+  const url = document.getElementById('sf-url').value.trim();
+  const interval = document.getElementById('sf-interval').value.trim();
+  const timeout = document.getElementById('sf-timeout').value.trim();
 
-  if (!/^[A-Za-z0-9_-]{1,64}$/.test(name)) return showMsg('名称只能包含字母、数字、横线和下划线（最多 64 字符）', 'error');
-  if (!url.startsWith('https://')) return showMsg('规则包地址必须是 HTTPS（明文 HTTP 可能被中间人投毒）', 'error');
-  if (channel === 'pinned' && !version) return showMsg('固定版本通道必须填写版本号', 'error');
-  if (sig && !key) return showMsg('强制验签时必须填写 Ed25519 公钥', 'error');
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(name)) return showMsg('标识只能包含字母、数字、横线和下划线（最多 64 字符）', 'error');
+  if (!url.startsWith('https://')) return showMsg('订阅地址必须是 HTTPS（明文 HTTP 可能被中间人投毒）', 'error');
 
-  const feed = {
-    ...(editingRuleFeed || {}),
-    name, url,
-    enabled: document.getElementById('rff-enabled').checked,
-    channel,
-    auto_update: document.getElementById('rff-auto').checked,
-    check_interval: interval || '6h',
-    update_window: window || null,
-    timeout: timeout || '20s',
-    max_size: maxsize || '4MB',
-    headers: editingRuleFeed?.headers || {},
-    require_signature: sig,
-    public_key: key || null,
-    shadow_period: shadow || null,
-    rollback_on_error: document.getElementById('rff-rollback').checked,
-    pinned_version: channel === 'pinned' ? version : null,
-  };
+  // 以原配置为基底改字段：guards、headers、expires 这些表单里没有的项才不会被清掉
+  const cfg = editingSub ? JSON.parse(JSON.stringify(editingSub.config)) : defaultSubConfig(kind);
+  cfg.name = name;
+  cfg.label = label;
+  cfg.enabled = document.getElementById('sf-enabled').checked;
+
+  if (kind === 'ip_list') {
+    cfg.source = cfg.source || {};
+    cfg.source.url = url;
+    cfg.source.interval = interval || '1h';
+    cfg.source.timeout = timeout || '15s';
+    cfg.source.format = cfg.source.format || 'auto';
+    cfg.source.headers = cfg.source.headers || {};
+    cfg.action = document.getElementById('sf-action').value;
+    cfg.scope = document.getElementById('sf-scope').value.split(',').map(s => s.trim()).filter(Boolean);
+  } else {
+    const channel = document.getElementById('sf-channel').value;
+    const version = document.getElementById('sf-version').value.trim();
+    const key = document.getElementById('sf-key').value.trim();
+    const sig = document.getElementById('sf-sig').checked;
+    if (channel === 'pinned' && !version) return showMsg('固定版本通道必须填写版本号', 'error');
+    if (sig && !key) return showMsg('强制验签时必须填写 Ed25519 公钥', 'error');
+
+    cfg.url = url;
+    cfg.channel = channel;
+    cfg.pinned_version = channel === 'pinned' ? version : null;
+    cfg.check_interval = interval || '6h';
+    cfg.timeout = timeout || '20s';
+    cfg.max_size = document.getElementById('sf-maxsize').value.trim() || '4MB';
+    cfg.shadow_period = document.getElementById('sf-shadow').value.trim() || null;
+    cfg.update_window = document.getElementById('sf-window').value.trim() || null;
+    cfg.public_key = key || null;
+    cfg.require_signature = sig;
+    cfg.auto_update = document.getElementById('sf-auto').checked;
+    cfg.rollback_on_error = document.getElementById('sf-rollback').checked;
+    cfg.headers = cfg.headers || {};
+  }
 
   btn.disabled = true; btn.textContent = '拉取中…';
   try {
-    const res = await api('/rule-feeds', { method: 'POST', body: JSON.stringify(feed) });
+    const res = await api('/subscriptions', { method: 'POST', body: JSON.stringify({ kind, config: cfg }) });
     if (res && res.warning) showMsg(res.warning, 'error');
-    else showMsg(`规则订阅 ${name} 已保存并拉取成功`);
-    hideRuleFeedForm(); loadRuleFeeds(); loadStatistics();
+    else showMsg(`订阅「${label || name}」已保存并拉取成功`);
+    hideSubForm(); loadSubs(); loadStatistics();
   } catch (err) { showMsg('保存失败：' + err.message, 'error'); }
-  finally { btn.disabled = false; btn.textContent = '保存并拉取'; }
+  finally { btn.disabled = false; btn.textContent = editingSub ? '保存并拉取' : '添加并拉取'; }
 }
 
-async function refreshRuleFeed(name) {
+async function refreshSub(kind, name) {
   showMsg(`正在重新拉取 ${name}…`);
   try {
-    const res = await api('/rule-feeds/' + encodeURIComponent(name) + '/refresh', { method: 'POST' });
+    const res = await api(`/subscriptions/${kind}/${encodeURIComponent(name)}/refresh`, { method: 'POST' });
     if (res && res.warning) showMsg(res.warning, 'error');
     else showMsg(`${name} 已刷新`);
-    loadRuleFeeds(); loadStatistics();
+    loadSubs();
   } catch (e) { showMsg('刷新失败：' + e.message, 'error'); }
 }
 
-async function deleteRuleFeed(name) {
-  if (!confirm(`删除规则订阅 ${name}？该订阅提供的检测规则会立即失效。`)) return;
+async function deleteSub(kind, name) {
+  if (!confirm(`删除订阅 ${name}？它带来的规则会立即失效。`)) return;
   try {
-    await api('/rule-feeds/' + encodeURIComponent(name), { method: 'DELETE' });
-    showMsg('已删除'); loadRuleFeeds(); loadStatistics();
+    await api(`/subscriptions/${kind}/${encodeURIComponent(name)}`, { method: 'DELETE' });
+    showMsg('已删除'); loadSubs(); loadStatistics();
   } catch (e) { showMsg('删除失败：' + e.message, 'error'); }
 }
 

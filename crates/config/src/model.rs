@@ -659,7 +659,11 @@ impl Default for AutoBanConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct IpGroup {
+    /// 机器标识：只能字母/数字/`-`/`_`，参与规则 id 拼接，改名等于重建规则
     pub name: String,
+    /// 中文名称，仅用于控制台展示；为空时界面回退显示 `name`
+    #[serde(default)]
+    pub label: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
     pub source: IpGroupSource,
@@ -765,7 +769,11 @@ pub enum OnFailure {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuleFeed {
+    /// 机器标识：只能字母/数字/`-`/`_`，用于规则来源标记与缓存键
     pub name: String,
+    /// 中文名称，仅用于控制台展示；为空时界面回退显示 `name`
+    #[serde(default)]
+    pub label: String,
     pub url: String,
     #[serde(default = "default_true")]
     pub enabled: bool,

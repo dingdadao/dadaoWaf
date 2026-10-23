@@ -164,7 +164,9 @@ impl WafProxy {
         let token = query.and_then(|q| query_param(q, "token"));
         let nonce = query.and_then(|q| query_param(q, "nonce"));
         let fp = query.and_then(|q| query_param(q, "fp")).unwrap_or_default();
-        let env = query.and_then(|q| query_param(q, "env")).unwrap_or_default();
+        let env = query
+            .and_then(|q| query_param(q, "env"))
+            .unwrap_or_default();
         let (Some(token), Some(nonce)) = (token, nonce) else {
             return write_text(session, 400, "验证参数缺失").await;
         };
@@ -443,11 +445,7 @@ impl ProxyHttp for WafProxy {
         // 规范化后的路径不应含控制字符。`%0d%0a` 之类会被解码出来，
         // 继续转发时无法构造合法 URI（Pingora 报 invalid normalized uri），
         // 最终以 500 结束——对外应明确拒绝成 400。
-        if hit
-            .normalized_path
-            .bytes()
-            .any(|b| b < 0x20 || b == 0x7f)
-        {
+        if hit.normalized_path.bytes().any(|b| b < 0x20 || b == 0x7f) {
             tracing::warn!(
                 target: "homewaf.security",
 

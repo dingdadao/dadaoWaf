@@ -453,6 +453,7 @@ fn validate_ip_groups(groups: &[IpGroup], apps: &[Application], ctx: &mut Ctx) {
                 format!("订阅名称 `{}` 重复", g.name),
             );
         }
+        validate_label(&g.label, &base, ctx);
 
         if !g.source.url.starts_with("https://") {
             ctx.error(format!("{base}.source.url"), "订阅地址必须使用 HTTPS");
@@ -520,6 +521,7 @@ fn validate_rule_feeds(feeds: &[RuleFeed], ctx: &mut Ctx) {
                 format!("订阅名称 `{}` 重复", f.name),
             );
         }
+        validate_label(&f.label, &base, ctx);
         if !f.url.starts_with("https://") {
             ctx.error(format!("{base}.url"), "规则包地址必须使用 HTTPS");
         }
@@ -600,6 +602,17 @@ fn validate_rule_feeds(feeds: &[RuleFeed], ctx: &mut Ctx) {
                 );
             }
         }
+    }
+}
+
+/// 中文名称只做长度与可打印性校验——它不参与任何匹配逻辑，
+/// 因此不该像 `name` 那样限制字符集，否则「长亭恶意 IP 库」这种名字就存不进去。
+fn validate_label(label: &str, base: &str, ctx: &mut Ctx) {
+    if label.chars().count() > 64 {
+        ctx.error(format!("{base}.label"), "中文名称不能超过 64 个字符");
+    }
+    if label.chars().any(|c| c.is_control()) {
+        ctx.error(format!("{base}.label"), "中文名称不能包含控制字符");
     }
 }
 
@@ -1205,6 +1218,7 @@ mod tests {
         let config = Config {
             ip_groups: vec![IpGroup {
                 name: "bad".to_string(),
+                label: "测试订阅".to_string(),
                 enabled: true,
                 source: IpGroupSource {
                     url: "http://example.com/list".to_string(),
@@ -1277,6 +1291,7 @@ mod tests {
     fn rule_feed() -> RuleFeed {
         RuleFeed {
             name: "official".to_string(),
+            label: "官方规则包".to_string(),
             url: "https://rules.example.com/core.hwrule".to_string(),
             enabled: true,
             channel: FeedChannel::Stable,

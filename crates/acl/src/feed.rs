@@ -507,6 +507,7 @@ mod tests {
         use homewaf_config::*;
         IpGroup {
             name: name.to_string(),
+            label: format!("{name} 组"),
             enabled: true,
             source: IpGroupSource {
                 url: "https://example.com/list".to_string(),

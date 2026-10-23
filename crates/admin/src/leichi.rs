@@ -17,10 +17,9 @@ use std::io::Read;
 use std::time::{Duration as StdDuration, Instant};
 
 use homewaf_config::{
-    AccessMode, ActiveHealthCheck, Application, CustomRule, Domains, HealthCheckConfig,
-    IpGroup, IpGroupAction, IpGroupSource, IpGroupGuards, LbAlgorithm, LbConfig, ObserveMode,
-    OnFailure, Policy, Scheme, TlsMode, TlsModeConfig,
-    Upstream, UpstreamTlsConfig,
+    AccessMode, ActiveHealthCheck, Application, CustomRule, Domains, HealthCheckConfig, IpGroup,
+    IpGroupAction, IpGroupGuards, IpGroupSource, LbAlgorithm, LbConfig, ObserveMode, OnFailure,
+    Policy, Scheme, TlsMode, TlsModeConfig, Upstream, UpstreamTlsConfig,
 };
 use homewaf_store::{AclRuleRow, Store};
 use serde::{Deserialize, Serialize};
@@ -343,6 +342,7 @@ pub fn sync(store: &Store, req: &SyncRequest) -> Result<SyncReport, String> {
         for feed in &ip_feeds {
             let group = IpGroup {
                 name: feed.name.clone(),
+                label: feed.label.clone(),
                 enabled: true,
                 source: IpGroupSource {
                     url: feed.url.clone(),
@@ -941,9 +941,17 @@ fn policy_enabled(policy: &Value) -> bool {
 /// 回源、CDN、白名单、爬虫类必须放行，否则会误伤正常流量；其余按威胁情报拦截。
 fn infer_feed_allow(label: &str) -> bool {
     let l = label.to_lowercase();
-    ["白名单", "局域网", "回源", "edgeone", "cdn", "爬虫", "crawler"]
-        .iter()
-        .any(|k| l.contains(k))
+    [
+        "白名单",
+        "局域网",
+        "回源",
+        "edgeone",
+        "cdn",
+        "爬虫",
+        "crawler",
+    ]
+    .iter()
+    .any(|k| l.contains(k))
 }
 
 /// 策略是否引用了指定 IP 组（用于判定订阅组的处置方向）。
@@ -955,14 +963,7 @@ fn policy_references_group(policy: &Value, group_id: i64) -> bool {
         .flatten()
         .filter_map(|branch| branch.as_array())
         .flatten()
-        .filter(|cond| {
-            is_ip_key(
-                cond.get("k")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .trim(),
-            )
-        })
+        .filter(|cond| is_ip_key(cond.get("k").and_then(|v| v.as_str()).unwrap_or("").trim()))
         .filter_map(|cond| cond.get("v").and_then(|v| v.as_array()))
         .flatten()
         .any(|v| {
@@ -1224,10 +1225,7 @@ mod tests {
     #[test]
     fn cert_fields_accept_manual_and_flat_shapes() {
         let manual = json!({"manual": {"crt": "CERT-A", "key": "KEY-A"}});
-        assert_eq!(
-            cert_field(manual.get("manual"), &["crt", "cert"]),
-            "CERT-A"
-        );
+        assert_eq!(cert_field(manual.get("manual"), &["crt", "cert"]), "CERT-A");
         assert_eq!(cert_field(manual.get("manual"), &["key"]), "KEY-A");
         assert_eq!(cert_field(Some(&manual), &["crt"]), "");
 
