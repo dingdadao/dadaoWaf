@@ -1121,6 +1121,17 @@ impl Store {
         }
     }
 
+    /// 上次成功导入的时间。用于判断订阅是否到期，避免每次重载都联网拉取。
+    pub fn feed_state_updated_at(&self, name: &str) -> Result<Option<i64>, StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::Poisoned)?;
+        let mut stmt = conn.prepare("SELECT updated_at FROM feed_state WHERE name = ?1")?;
+        let mut rows = stmt.query(params![name])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(row.get(0)?)),
+            None => Ok(None),
+        }
+    }
+
     // ============================================================
     // 规则包缓存
     // ============================================================

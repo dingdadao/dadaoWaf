@@ -719,6 +719,8 @@ pub enum FeedFormat {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum IpGroupAction {
+    /// 放行：订阅命中后跳过检测与封禁（用于白名单 IP 组）
+    Allow,
     Block,
     #[default]
     Challenge,

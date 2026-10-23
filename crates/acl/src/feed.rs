@@ -219,6 +219,7 @@ pub fn apply_guards(
 /// 把订阅条目转成 ACL 规则。
 ///
 /// 动作映射：
+/// - `allow` → 放行（跳过检测与封禁）
 /// - `block` → 拒绝
 /// - `challenge` → 暂按拒绝处理（人机验证尚未实现，放行会失去防护）
 /// - `log` → 不产生规则（只记录，不拦截）
@@ -228,6 +229,7 @@ pub fn rules_from_group(group: &homewaf_config::IpGroup, entries: &[IpNet]) -> V
     use homewaf_config::IpGroupAction;
 
     let action = match group.action {
+        IpGroupAction::Allow => RuleAction::Allow,
         IpGroupAction::Block | IpGroupAction::Challenge => RuleAction::Deny,
         IpGroupAction::Log => return Vec::new(),
     };

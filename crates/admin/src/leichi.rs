@@ -3,22 +3,26 @@
 //! 通过雷池开放接口 `/api/open/*` 拉取应用、自定义规则、IP 组与证书，
 //! 转换成 HomeWAF 的模型写入数据库：
 //! - 应用：`GET /api/open/site`，含监听端口、上游与负载均衡
-//! - 自定义规则：`GET /api/open/policy`，action 0 白名单 / 1 黑名单
-//! - IP 组：`GET /api/open/ipgroup`，规则里引用组 ID 时展开成具体 CIDR
-//! - 证书：`GET /api/open/cert`，只有手动上传（带私钥）的证书能导入
+//! - 访问控制：`GET /api/open/policy`，IP 条件展开成 CIDR 写入 ACL 规则，
+//!   action 0 白名单 / 1 黑名单；条件不支持的策略跳过并写告警
+//! - IP 组订阅：`GET /api/open/ipgroup`，带 `reference` 订阅地址的组原样建成
+//!   IP 组订阅；无地址的内置情报组由雷池云端维护，跳过并告警
+//! - 证书：`GET /api/open/cert`，证书链一律登记；无私钥（ACME 托管）的条目
+//!   标记为不可用于 TLS
 //!
 //! 雷池 9443 默认使用自签证书，所以这里关闭了 TLS 校验——同步目标通常是内网。
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 use std::time::{Duration as StdDuration, Instant};
 
 use homewaf_config::{
     AccessMode, ActiveHealthCheck, Application, CustomRule, Domains, HealthCheckConfig,
-    LbAlgorithm, LbConfig, ObserveMode, Policy, RuleCondition, Scheme, TlsMode, TlsModeConfig,
+    IpGroup, IpGroupAction, IpGroupSource, IpGroupGuards, LbAlgorithm, LbConfig, ObserveMode,
+    OnFailure, Policy, Scheme, TlsMode, TlsModeConfig,
     Upstream, UpstreamTlsConfig,
 };
-use homewaf_store::Store;
+use homewaf_store::{AclRuleRow, Store};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -170,9 +174,11 @@ pub fn sync(store: &Store, req: &SyncRequest) -> Result<SyncReport, String> {
     };
     let now = homewaf_acl::now_unix();
 
-    // 1. IP 组：先把组 ID → IP 列表拿到，规则里会引用组 ID
-    let groups = fetch_ip_groups(&client, &mut report);
-    report.ip_groups.total = groups.len();
+    // 1. IP 组：组 ID → IP 列表（供策略展开），同时挑出可订阅的组
+    let ipg = fetch_ip_groups(&client, &mut report);
+    let groups = ipg.ips;
+    let mut ip_feeds = ipg.feeds;
+    report.ip_groups = ipg.stat;
 
     // 2. 证书（只有手动上传的才带私钥）
     let mut new_certs: Vec<NewCert> = Vec::new();
@@ -221,7 +227,8 @@ pub fn sync(store: &Store, req: &SyncRequest) -> Result<SyncReport, String> {
         }
     }
 
-    // 4. 自定义规则
+    // 4. 访问控制规则：雷池策略里的 IP 条件展开成 CIDR，写入 ACL 规则，
+    //    不再塞进「自定义规则」——那个页面留给用户手写的规则。
     let policies = client.get("/open/policy").and_then(|v| {
         v.get("data")
             .cloned()
@@ -229,23 +236,49 @@ pub fn sync(store: &Store, req: &SyncRequest) -> Result<SyncReport, String> {
     })?;
     let policies = policies.as_array().cloned().unwrap_or_default();
     report.rules.total = policies.len();
-    let mut rules: Vec<CustomRule> = Vec::new();
+    let mut acl_rules: Vec<AclRuleRow> = Vec::new();
     for policy in &policies {
-        match map_policy(policy, &groups, &mut report) {
-            Some(rule) => {
+        match map_policy_acl(policy, &groups, &mut report) {
+            Some(rows) => {
+                let name = policy
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("未命名规则");
+                let allow = policy_action(policy) == 0;
                 report.items.push(format!(
-                    "规则 {}（{}）",
-                    rule.name,
-                    if rule.is_whitelist() {
-                        "白名单"
-                    } else {
-                        "黑名单"
-                    }
+                    "访问控制 {}（{}，{} 条网段）",
+                    name,
+                    if allow { "白名单" } else { "黑名单" },
+                    rows.len()
                 ));
+                // 策略引用的 IP 组按策略动作决定订阅方向：白名单放行、黑名单拦截
+                for feed in ip_feeds.iter_mut() {
+                    if policy_references_group(policy, feed.id) {
+                        feed.allow = allow;
+                    }
+                }
                 report.rules.imported += 1;
-                rules.push(rule);
+                acl_rules.extend(rows);
             }
             None => report.rules.skipped += 1,
+        }
+    }
+
+    // 启用中的策略引用了某组时，以策略动作决定订阅方向；都没有引用时
+    // 保留按组名推断的结果（回源/CDN/白名单类放行，情报类拦截），并写明原因。
+    for feed in &ip_feeds {
+        let mut referenced = false;
+        for policy in policies.iter().filter(|p| policy_enabled(p)) {
+            if policy_references_group(policy, feed.id) {
+                referenced = true;
+            }
+        }
+        if !referenced {
+            report.warnings.push(format!(
+                "IP 组「{}」未被启用的策略引用，订阅动作按组名推断为{}，可在「IP 组订阅」页调整",
+                feed.label,
+                if feed.allow { "放行" } else { "拦截" }
+            ));
         }
     }
 
@@ -272,20 +305,76 @@ pub fn sync(store: &Store, req: &SyncRequest) -> Result<SyncReport, String> {
                 .map_err(|e| format!("写入应用 {} 失败：{e}", app.id))?;
         }
 
-        // 规则：按 id 合并，保留本地手工创建、未被雷池管理的规则
+        // 访问控制：先清理上一轮同步、本轮已不存在的 lei-acl-* 规则，
+        // 再写入本轮规则（稳定 id，重复同步不会产生重复条目）。
+        let wanted: std::collections::HashSet<&str> =
+            acl_rules.iter().map(|r| r.id.as_str()).collect();
+        if let Ok(existing) = store.list_acl_rules() {
+            for row in existing {
+                if row.id.starts_with("lei-acl-") && !wanted.contains(row.id.as_str()) {
+                    store.delete_acl_rule(&row.id).map_err(|e| e.to_string())?;
+                }
+            }
+        }
+        for rule in &acl_rules {
+            store
+                .upsert_acl_rule(rule, now)
+                .map_err(|e| format!("写入访问控制规则 {} 失败：{e}", rule.id))?;
+        }
+
+        // IP 组订阅：雷池的 reference 地址原样建成订阅
+        for feed in &ip_feeds {
+            let group = IpGroup {
+                name: feed.name.clone(),
+                enabled: true,
+                source: IpGroupSource {
+                    url: feed.url.clone(),
+                    format: homewaf_config::FeedFormat::Cidr,
+                    interval: homewaf_config::Duration::from_secs(3600),
+                    timeout: homewaf_config::Duration::from_secs(15),
+                    headers: BTreeMap::new(),
+                },
+                action: if feed.allow {
+                    IpGroupAction::Allow
+                } else {
+                    IpGroupAction::Block
+                },
+                scope: Vec::new(),
+                expires: homewaf_config::Duration::from_secs(86_400),
+                guards: IpGroupGuards::default(),
+                on_failure: OnFailure::KeepLast,
+            };
+            store
+                .upsert_ip_group(&group.name, group.enabled, &group, now)
+                .map_err(|e| format!("写入 IP 组订阅 {} 失败：{e}", group.name))?;
+            // 把雷池当前的快照写成本地基线：订阅源暂时不可达时也能按最近内容生效，
+            // 同时也让本次同步后的重载无需联网。
+            if let Some(ips) = groups.get(&feed.id) {
+                let nets: Vec<String> = ips
+                    .iter()
+                    .filter_map(|s| s.parse::<ipnet::IpNet>().ok())
+                    .map(|n| n.to_string())
+                    .collect();
+                if !nets.is_empty() {
+                    store
+                        .save_feed_state(&group.name, &nets.join("\n"), now)
+                        .map_err(|e| format!("写入订阅快照 {} 失败：{e}", group.name))?;
+                }
+            }
+        }
+
+        // 自定义规则只保留用户手写规则：上一轮由雷池转换出来的 lei-* 条目清掉。
         let mut merged = store
             .get_setting::<Vec<CustomRule>>(CUSTOM_RULES_KEY)
             .map_err(|e| e.to_string())?
             .unwrap_or_default();
-        for rule in rules {
-            match merged.iter_mut().find(|r| r.id == rule.id) {
-                Some(old) => *old = rule,
-                None => merged.push(rule),
-            }
+        let before = merged.len();
+        merged.retain(|r| !r.id.starts_with("lei-"));
+        if merged.len() != before {
+            store
+                .set_setting(CUSTOM_RULES_KEY, &merged, now)
+                .map_err(|e| format!("清理雷池自定义规则失败：{e}"))?;
         }
-        store
-            .set_setting(CUSTOM_RULES_KEY, &merged, now)
-            .map_err(|e| format!("写入自定义规则失败：{e}"))?;
 
         store
             .set_setting(LEICHI_URL_KEY, &client.base, now)
@@ -332,13 +421,38 @@ pub fn saved_config(store: &Store) -> (String, String) {
     (url, token)
 }
 
-fn fetch_ip_groups(client: &Client, report: &mut SyncReport) -> HashMap<i64, Vec<String>> {
+/// 一次 IP 组拉取的结果：组 ID → IP 列表（供策略展开）、可订阅的组、统计。
+struct IpGroupFetch {
+    ips: HashMap<i64, Vec<String>>,
+    feeds: Vec<IpGroupFeed>,
+    stat: SyncStat,
+}
+
+/// 一条待写入的 IP 组订阅。
+struct IpGroupFeed {
+    id: i64,
+    name: String,
+    label: String,
+    url: String,
+    /// 该组是否被白名单策略引用：是则订阅命中后放行，否则拦截
+    allow: bool,
+}
+
+const IP_GROUP_PREFIX: &str = "lei-ipgroup-";
+
+fn fetch_ip_groups(client: &Client, report: &mut SyncReport) -> IpGroupFetch {
     let mut out = HashMap::new();
+    let mut feeds = Vec::new();
+    let mut stat = SyncStat::default();
     let list = match client.get("/open/ipgroup") {
         Ok(v) => v,
         Err(e) => {
             report.warnings.push(format!("读取 IP 组列表失败：{e}"));
-            return out;
+            return IpGroupFetch {
+                ips: out,
+                feeds,
+                stat,
+            };
         }
     };
     let nodes = list
@@ -346,16 +460,20 @@ fn fetch_ip_groups(client: &Client, report: &mut SyncReport) -> HashMap<i64, Vec
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
+    stat.total = nodes.len();
     for node in nodes {
         let Some(id) = node.get("id").and_then(|v| v.as_i64()) else {
+            stat.skipped += 1;
             continue;
         };
+        let label = group_label(&node);
         let detail = match client.get(&format!("/open/ipgroup/detail?id={id}")) {
             Ok(v) => v,
             Err(e) => {
                 report
                     .warnings
                     .push(format!("读取 IP 组 {id} 详情失败：{e}"));
+                stat.skipped += 1;
                 continue;
             }
         };
@@ -374,11 +492,50 @@ fn fetch_ip_groups(client: &Client, report: &mut SyncReport) -> HashMap<i64, Vec
         if !ips.is_empty() {
             report
                 .items
-                .push(format!("IP 组 {}（{} 条）", group_label(&node), ips.len()));
-            out.insert(id, ips);
+                .push(format!("IP 组 {}（{} 条）", label, ips.len()));
+            out.insert(id, ips.clone());
+        }
+
+        // 有订阅地址的组直接建成 IP 组订阅，由本机定时拉取，不依赖雷池在线。
+        let reference = node
+            .get("reference")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if reference.starts_with("https://") {
+            feeds.push(IpGroupFeed {
+                id,
+                name: format!("{IP_GROUP_PREFIX}{id}"),
+                label: label.clone(),
+                url: reference,
+                // 先按组名推断，稍后用策略引用关系覆盖
+                allow: infer_feed_allow(&label),
+            });
+            stat.imported += 1;
+            report
+                .items
+                .push(format!("IP 组订阅 {label} → {IP_GROUP_PREFIX}{id}"));
+        } else if reference.starts_with("http://") {
+            stat.skipped += 1;
+            report.warnings.push(format!(
+                "IP 组「{label}」的订阅地址不是 HTTPS，已跳过（明文订阅可能被投毒）"
+            ));
+        } else if ips.is_empty() {
+            stat.skipped += 1;
+            report.warnings.push(format!(
+                "IP 组「{label}」没有订阅地址，内容由雷池云端维护，无法迁移"
+            ));
+        } else {
+            // 没有订阅地址但已有快照：内容已经展开成访问控制规则
+            stat.imported += 1;
         }
     }
-    out
+    IpGroupFetch {
+        ips: out,
+        feeds,
+        stat,
+    }
 }
 
 fn group_label(node: &Value) -> String {
@@ -445,12 +602,19 @@ fn fetch_certs(
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .trim();
-        if crt.is_empty() || key.is_empty() {
+        if crt.is_empty() {
             stat.skipped += 1;
-            report.warnings.push(format!(
-                "证书 #{id} 没有私钥（ACME / 托管证书无法导出），跳过"
-            ));
+            report
+                .warnings
+                .push(format!("证书 #{id} 没有证书链内容，跳过"));
             continue;
+        }
+        // ACME / 托管证书在雷池侧不导出私钥：证书链照常登记（控制台可见），
+        // 但没有私钥无法用于 TLS 握手，只能提示手动补齐。
+        if key.is_empty() {
+            report.warnings.push(format!(
+                "证书 #{id} 为 ACME / 托管证书，雷池不提供私钥，已登记证书链但不会用于 TLS，需手动上传私钥"
+            ));
         }
         if existing.iter().any(|row| row.cert_pem == crt) {
             stat.imported += 1;
@@ -691,134 +855,192 @@ fn map_app(site: &Value) -> Result<Application, String> {
     })
 }
 
-fn map_policy(
+/// 雷池策略动作：0 = 白名单，1 = 黑名单。
+fn policy_action(policy: &Value) -> i64 {
+    policy.get("action").and_then(|v| v.as_i64()).unwrap_or(1)
+}
+
+fn policy_enabled(policy: &Value) -> bool {
+    policy
+        .get("is_enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true)
+}
+
+/// 没有被任何启用策略引用的情报组：按组名推断订阅方向。
+/// 回源、CDN、白名单、爬虫类必须放行，否则会误伤正常流量；其余按威胁情报拦截。
+fn infer_feed_allow(label: &str) -> bool {
+    let l = label.to_lowercase();
+    ["白名单", "局域网", "回源", "edgeone", "cdn", "爬虫", "crawler"]
+        .iter()
+        .any(|k| l.contains(k))
+}
+
+/// 策略是否引用了指定 IP 组（用于判定订阅组的处置方向）。
+fn policy_references_group(policy: &Value, group_id: i64) -> bool {
+    policy
+        .get("pattern")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|branch| branch.as_array())
+        .flatten()
+        .filter(|cond| {
+            is_ip_key(
+                cond.get("k")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim(),
+            )
+        })
+        .filter_map(|cond| cond.get("v").and_then(|v| v.as_array()))
+        .flatten()
+        .any(|v| {
+            v.as_i64() == Some(group_id)
+                || v.as_str().and_then(|s| s.trim().parse::<i64>().ok()) == Some(group_id)
+        })
+}
+
+/// 把一条雷池策略转换成 ACL 规则。
+///
+/// 只处理「每个 OR 分支都恰好是一个 IP 条件」的策略：ACL 规则是单一 CIDR，
+/// 无法表达 IP 与路径/Header 的与关系，这类策略保留在雷池侧并告警。
+/// 数字形式的 IP 值表示 IP 组 ID，展开成具体网段后逐条落成规则。
+fn map_policy_acl(
     policy: &Value,
     groups: &HashMap<i64, Vec<String>>,
     report: &mut SyncReport,
-) -> Option<CustomRule> {
+) -> Option<Vec<AclRuleRow>> {
     let name = policy
         .get("name")
         .and_then(|v| v.as_str())
         .unwrap_or("未命名规则")
         .to_string();
-    let id = policy.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
-
-    let mut pattern: Vec<Vec<RuleCondition>> = Vec::new();
-    let raw_pattern = policy.get("pattern").and_then(|v| v.as_array());
-    for group in raw_pattern.into_iter().flatten() {
-        let mut conditions = Vec::new();
-        for cond in group.as_array().into_iter().flatten() {
-            let key = cond.get("k").and_then(|v| v.as_str()).unwrap_or("").trim();
-            if !supported_key(key) {
-                report
-                    .warnings
-                    .push(format!("跳过规则「{name}」：不支持条件 `{key}`"));
-                return None;
-            }
-            let op = cond.get("op").and_then(|v| v.as_str()).unwrap_or("eq");
-            let mut values: Vec<String> = cond
-                .get("v")
-                .and_then(|v| v.as_array())
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|v| v.as_str().or_else(|| v.as_i64().map(|_| "")))
-                        .filter(|s| !s.is_empty())
-                        .map(str::to_string)
-                        .collect()
-                })
-                .unwrap_or_default();
-            // 雷池的 v 也可能是数字
-            if values.is_empty() {
-                if let Some(a) = cond.get("v").and_then(|v| v.as_array()) {
-                    values = a
-                        .iter()
-                        .filter_map(|v| v.as_i64().map(|n| n.to_string()))
-                        .collect();
-                }
-            }
-            // src_ip 的数字值表示 IP 组 ID，展开成具体 CIDR
-            if is_ip_key(key) && matches!(op.to_ascii_lowercase().as_str(), "in" | "eq") {
-                let mut expanded = Vec::new();
-                for value in &values {
-                    if let Ok(group_id) = value.parse::<i64>() {
-                        match groups.get(&group_id) {
-                            Some(ips) => expanded.extend(ips.iter().cloned()),
-                            None => report.warnings.push(format!(
-                                "规则「{name}」引用的 IP 组 {group_id} 没有数据，已忽略"
-                            )),
-                        }
-                    } else {
-                        expanded.push(value.clone());
-                    }
-                }
-                values = expanded;
-            }
-            if values.is_empty() {
-                report
-                    .warnings
-                    .push(format!("跳过规则「{name}」：条件 `{key}` 没有可用值"));
-                return None;
-            }
-            conditions.push(RuleCondition {
-                k: key.to_string(),
-                op: op.to_string(),
-                v: values,
-                sub_k: cond
-                    .get("sub_k")
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.trim().is_empty())
-                    .map(str::to_string),
-            });
-        }
-        if !conditions.is_empty() {
-            pattern.push(conditions);
-        }
-    }
-    if pattern.is_empty() {
-        report
-            .warnings
-            .push(format!("跳过规则「{name}」：pattern 为空"));
+    let policy_id = policy.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
+    if !policy
+        .get("is_enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true)
+    {
+        report.warnings.push(format!(
+            "策略「{name}」在雷池中已停用，未迁移（ACL 规则没有停用状态）"
+        ));
         return None;
     }
 
-    Some(CustomRule {
-        id: format!("lei-{id}"),
-        name,
-        enabled: policy
-            .get("is_enabled")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true),
-        action: policy.get("action").and_then(|v| v.as_i64()).unwrap_or(1) as u8,
-        pattern,
-    })
+    let branches: Vec<&Vec<Value>> = policy
+        .get("pattern")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|b| b.as_array()).collect())
+        .unwrap_or_default();
+    if branches.is_empty() {
+        report
+            .warnings
+            .push(format!("策略「{name}」的 pattern 为空，跳过"));
+        return None;
+    }
+
+    let mut cidrs: Vec<String> = Vec::new();
+    for branch in branches {
+        if branch.len() != 1 {
+            report.warnings.push(format!(
+                "策略「{name}」的分支有 {} 个条件（与关系），ACL 无法表达，跳过",
+                branch.len()
+            ));
+            return None;
+        }
+        let cond = &branch[0];
+        let key = cond.get("k").and_then(|v| v.as_str()).unwrap_or("").trim();
+        let op = cond
+            .get("op")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if !is_ip_key(key) || !matches!(op.as_str(), "in" | "eq") {
+            report.warnings.push(format!(
+                "策略「{name}」含非 IP 条件 `{key}`，ACL 无法表达，跳过"
+            ));
+            return None;
+        }
+        let mut values: Vec<String> = cond
+            .get("v")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| {
+                        v.as_str()
+                            .map(str::to_string)
+                            .or_else(|| v.as_i64().map(|n| n.to_string()))
+                    })
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if values.is_empty() {
+            report
+                .warnings
+                .push(format!("策略「{name}」的 IP 条件没有可用值，跳过"));
+            return None;
+        }
+        for value in values.drain(..) {
+            match value.parse::<i64>() {
+                Ok(group_id) => match groups.get(&group_id) {
+                    Some(ips) => cidrs.extend(ips.iter().cloned()),
+                    None => report.warnings.push(format!(
+                        "策略「{name}」引用的 IP 组 {group_id} 没有数据，已忽略"
+                    )),
+                },
+                Err(_) => cidrs.push(value),
+            }
+        }
+    }
+
+    let action = if policy_action(policy) == 0 {
+        "allow"
+    } else {
+        "deny"
+    };
+    let mut rows = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for raw in cidrs {
+        let Some(net) = normalize_cidr(&raw) else {
+            report
+                .warnings
+                .push(format!("策略「{name}」的条目 `{raw}` 不是合法网段，已忽略"));
+            continue;
+        };
+        if !seen.insert(net.clone()) {
+            continue;
+        }
+        rows.push(AclRuleRow {
+            id: format!("lei-acl-{policy_id}-{}", rows.len()),
+            cidr: net,
+            action: action.to_string(),
+            scope: None,
+            expires_at: None,
+            note: Some(name.clone()),
+        });
+    }
+    if rows.is_empty() {
+        report
+            .warnings
+            .push(format!("策略「{name}」展开后没有可用网段，跳过"));
+        return None;
+    }
+    Some(rows)
 }
 
-fn supported_key(key: &str) -> bool {
-    matches!(
-        key.to_ascii_lowercase().as_str(),
-        "src_ip"
-            | "ip"
-            | "client_ip"
-            | "source_ip"
-            | "website"
-            | "app"
-            | "site"
-            | "host"
-            | "domain"
-            | "path"
-            | "uri"
-            | "url"
-            | "query"
-            | "args"
-            | "query_string"
-            | "method"
-            | "user_agent"
-            | "ua"
-            | "content_type"
-            | "cookie"
-            | "header"
-            | "headers"
-    )
+/// 单个 IP 补全成 /32（IPv6 为 /128）。
+fn normalize_cidr(raw: &str) -> Option<String> {
+    if let Ok(net) = raw.parse::<ipnet::IpNet>() {
+        return Some(net.to_string());
+    }
+    let ip = raw.parse::<std::net::IpAddr>().ok()?;
+    Some(match ip {
+        std::net::IpAddr::V4(v4) => format!("{v4}/32"),
+        std::net::IpAddr::V6(v6) => format!("{v6}/128"),
+    })
 }
 
 fn is_ip_key(key: &str) -> bool {
@@ -845,10 +1067,13 @@ mod tests {
             "pattern": [[{"k": "src_ip", "op": "in", "v": ["10"], "sub_k": ""}]]
         });
         let mut report = SyncReport::default();
-        let rule = map_policy(&policy, &groups, &mut report).expect("应能转换");
-        assert_eq!(rule.id, "lei-83");
-        assert!(rule.is_whitelist());
-        assert_eq!(rule.pattern[0][0].v, vec!["10.0.0.0/24".to_string()]);
+        let rows = map_policy_acl(&policy, &groups, &mut report).expect("应能转换");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "lei-acl-83-0");
+        assert_eq!(rows[0].action, "allow");
+        assert_eq!(rows[0].cidr, "10.0.0.0/24");
+        // 白名单策略引用的 IP 组在订阅时应放行
+        assert!(policy_references_group(&policy, 10));
     }
 
     #[test]
@@ -861,8 +1086,40 @@ mod tests {
             "pattern": [[{"k": "ja4", "op": "eq", "v": ["t13d"]}]]
         });
         let mut report = SyncReport::default();
-        assert!(map_policy(&policy, &HashMap::new(), &mut report).is_none());
+        assert!(map_policy_acl(&policy, &HashMap::new(), &mut report).is_none());
         assert_eq!(report.warnings.len(), 1);
+    }
+
+    #[test]
+    fn skips_disabled_policy() {
+        let policy = json!({
+            "id": 2,
+            "name": "旧规则",
+            "action": 1,
+            "is_enabled": false,
+            "pattern": [[{"k": "src_ip", "op": "in", "v": ["1.2.3.4"]}]]
+        });
+        let mut report = SyncReport::default();
+        assert!(map_policy_acl(&policy, &HashMap::new(), &mut report).is_none());
+        assert!(report.warnings[0].contains("已停用"));
+    }
+
+    #[test]
+    fn normalizes_single_ip_and_skips_bad_entry() {
+        let mut groups = HashMap::new();
+        groups.insert(3, vec!["1.2.3.4".to_string(), "not-a-cidr".to_string()]);
+        let policy = json!({
+            "id": 9,
+            "name": "黑名单",
+            "action": 1,
+            "is_enabled": true,
+            "pattern": [[{"k": "src_ip", "op": "in", "v": ["3"]}]]
+        });
+        let mut report = SyncReport::default();
+        let rows = map_policy_acl(&policy, &groups, &mut report).expect("应能转换");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].cidr, "1.2.3.4/32");
+        assert_eq!(rows[0].action, "deny");
     }
 
     #[test]

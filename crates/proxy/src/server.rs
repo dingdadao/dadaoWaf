@@ -479,8 +479,12 @@ impl ProxyHttp for WafProxy {
                     return write_empty(session, 403).await;
                 }
                 AclDecision::Allow(reason) => {
+                    // 内网网段默认放行只是"不做地域/网段拦截"，不代表受信任来源，
+                    // 不能因此跳过应用层检测与自动封禁。显式白名单与订阅放行才算。
+                    if !matches!(reason, homewaf_acl::Reason::PrivateNetwork) {
+                        ctx.acl_allowed = true;
+                    }
                     ctx.acl_reason = Some(reason.describe());
-                    ctx.acl_allowed = true;
                 }
                 AclDecision::Normal => {}
             }
@@ -538,11 +542,15 @@ impl ProxyHttp for WafProxy {
             None => {}
         }
 
+        // 受信任来源 = 自定义白名单，或 ACL 显式放行（雷池白名单策略同步后即为 allow 规则）。
+        // 两者都按白名单语义处理：跳过自动封禁与应用层检测。
+        let whitelisted = custom_whitelisted || ctx.acl_allowed;
+
         // 自动封禁检查：命中直接拒绝，连检测都不必做。
         // 这是 WAF 的核心价值回路——被封的 IP 不再消耗检测资源。
         if let Some(ip) = ctx.client_ip {
             let now_secs = homewaf_acl::now_unix().max(0) as u64;
-            if !custom_whitelisted {
+            if !whitelisted {
                 if let Some(status) = self.bans.check(ip, now_secs) {
                     tracing::info!(
                         target: "homewaf.security",
@@ -848,12 +856,14 @@ impl ProxyHttp for WafProxy {
             }
         }
 
-        // 自定义白名单命中：按雷池语义直接放行，跳过应用层检测（含 body 检测）。
-        if custom_whitelisted {
+        // 白名单命中：按雷池语义直接放行，跳过应用层检测（含 body 检测）。
+        // ACL allow 与自定义白名单同样适用。
+        if whitelisted {
             tracing::debug!(
                 req = %ctx.request_id,
                 app = %app.id,
-                "自定义白名单命中，跳过检测"
+                acl_allowed = ctx.acl_allowed,
+                "白名单命中，跳过检测"
             );
         } else {
             // 应用层攻击检测。

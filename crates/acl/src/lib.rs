@@ -307,6 +307,11 @@ pub trait FeedState {
     fn previous(&self, group: &str) -> Vec<ipnet::IpNet>;
     /// 记录本次成功导入的条目。
     fn remember(&self, group: &str, entries: &[ipnet::IpNet]);
+    /// 上次成功导入的时间（Unix 秒）。实现方不保存时间时返回 `None`，
+    /// 表示每次重载都重新拉取。
+    fn updated_at(&self, _group: &str) -> Option<i64> {
+        None
+    }
 }
 
 /// 不做状态保存的实现，用于纯内存模式。
@@ -355,15 +360,30 @@ pub fn load_group(
 ///
 /// 单个订阅失败不影响其余订阅，也不会让调用方整体失败。
 /// 成功导入的条目会写回 `state`，供下次变更幅度校验使用。
+///
+/// 两个避免拖慢重载的处理：
+/// - 未到 `interval` 且已有上次结果时，直接用上次条目生成规则，不联网；
+/// - 拉取失败且 `on_failure = keep-last` 时，沿用上次条目而不是丢掉整组。
 pub fn load_enabled_groups(
     groups: &[homewaf_config::IpGroup],
     state: &dyn FeedState,
 ) -> (Vec<AclRule>, Vec<(String, String)>) {
     let mut rules = Vec::new();
     let mut failures = Vec::new();
+    let now = now_unix();
 
     for group in groups.iter().filter(|g| g.enabled) {
         let previous = state.previous(&group.name);
+
+        let due = match state.updated_at(&group.name) {
+            Some(at) => now.saturating_sub(at) >= group.source.interval.as_secs() as i64,
+            None => true,
+        };
+        if !due && !previous.is_empty() {
+            rules.extend(feed::rules_from_group(group, &previous));
+            continue;
+        }
+
         match load_group(group, &previous) {
             Ok((r, entries)) => {
                 tracing::info!(
@@ -377,8 +397,17 @@ pub fn load_enabled_groups(
                 rules.extend(r);
             }
             Err(e) => {
-                tracing::warn!(group = %group.name, error = %e, "订阅加载失败，已跳过");
+                tracing::warn!(group = %group.name, error = %e, "订阅加载失败");
                 failures.push((group.name.clone(), e));
+                if group.on_failure == homewaf_config::OnFailure::KeepLast && !previous.is_empty() {
+                    let r = feed::rules_from_group(group, &previous);
+                    tracing::warn!(
+                        group = %group.name,
+                        rules = r.len(),
+                        "沿用上次成功内容（keep-last）"
+                    );
+                    rules.extend(r);
+                }
             }
         }
     }
@@ -536,5 +565,86 @@ mod tests {
         let acl = Acl::build(&config(), &rules, 0);
         // ::ffff:203.0.113.9 应被识别为 IPv4 并命中规则
         assert!(acl.check(ip("::ffff:203.0.113.9"), None).is_denied());
+    }
+
+    struct MemFeedState {
+        entries: std::collections::HashMap<String, Vec<IpNet>>,
+        at: std::collections::HashMap<String, i64>,
+    }
+
+    impl FeedState for MemFeedState {
+        fn previous(&self, group: &str) -> Vec<IpNet> {
+            self.entries.get(group).cloned().unwrap_or_default()
+        }
+        fn remember(&self, _group: &str, _entries: &[IpNet]) {}
+        fn updated_at(&self, group: &str) -> Option<i64> {
+            self.at.get(group).copied()
+        }
+    }
+
+    fn feed_group(url: &str, action: homewaf_config::IpGroupAction) -> homewaf_config::IpGroup {
+        use homewaf_config::*;
+        IpGroup {
+            name: "g".to_string(),
+            enabled: true,
+            source: IpGroupSource {
+                url: url.to_string(),
+                format: FeedFormat::Cidr,
+                interval: Duration::from_secs(3600),
+                timeout: Duration::from_secs(2),
+                headers: Default::default(),
+            },
+            action,
+            scope: Vec::new(),
+            expires: Duration::from_secs(86_400),
+            guards: IpGroupGuards::default(),
+            on_failure: OnFailure::KeepLast,
+        }
+    }
+
+    #[test]
+    fn not_due_reuses_cached_entries_without_network() {
+        let mut state = MemFeedState {
+            entries: Default::default(),
+            at: Default::default(),
+        };
+        state
+            .entries
+            .insert("g".to_string(), vec![net("1.2.3.0/24")]);
+        state.at.insert("g".to_string(), now_unix());
+        // 不可达地址：只要不联网就不会变慢
+        let groups = vec![feed_group(
+            "https://127.0.0.1:9/none",
+            homewaf_config::IpGroupAction::Block,
+        )];
+        let started = std::time::Instant::now();
+        let (rules, failures) = load_enabled_groups(&groups, &state);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert!(failures.is_empty());
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].cidr, net("1.2.3.0/24"));
+        assert_eq!(rules[0].action, RuleAction::Deny);
+    }
+
+    #[test]
+    fn keep_last_falls_back_when_fetch_fails() {
+        let mut state = MemFeedState {
+            entries: Default::default(),
+            at: Default::default(),
+        };
+        state
+            .entries
+            .insert("g".to_string(), vec![net("4.5.6.0/24")]);
+        // 记录很久以前，强制进入拉取分支；本机端口未监听会立刻失败
+        state.at.insert("g".to_string(), 1);
+        let groups = vec![feed_group(
+            "http://127.0.0.1:1/none",
+            homewaf_config::IpGroupAction::Allow,
+        )];
+        let (rules, failures) = load_enabled_groups(&groups, &state);
+        assert_eq!(failures.len(), 1);
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].cidr, net("4.5.6.0/24"));
+        assert_eq!(rules[0].action, RuleAction::Allow);
     }
 }

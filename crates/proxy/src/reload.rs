@@ -60,6 +60,10 @@ impl FeedState for SqliteFeedState<'_> {
             tracing::warn!(error = %e, group, "保存订阅状态失败");
         }
     }
+
+    fn updated_at(&self, group: &str) -> Option<i64> {
+        self.store.feed_state_updated_at(group).ok().flatten()
+    }
 }
 
 /// 运行时可整体替换的状态。

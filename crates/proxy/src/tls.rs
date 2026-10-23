@@ -101,6 +101,11 @@ pub fn build_cert_map(
     let mut by_id: HashMap<i64, Arc<CertifiedKey>> = HashMap::new();
 
     for row in certs {
+        // 只有证书链、没有私钥的条目（如雷池同步来的 ACME 托管证书）
+        // 无法参与握手，跳过而不是让整个证书库加载失败。
+        if row.cert_pem.trim().is_empty() || row.key_pem.trim().is_empty() {
+            continue;
+        }
         let key = load_certified_key(&row.cert_pem, &row.key_pem)
             .map_err(|e| format!("证书「{}」加载失败：{e}", row.name))?;
         by_id.insert(row.id, key.clone());

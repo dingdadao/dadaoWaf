@@ -1111,7 +1111,7 @@
             <div><label for="ff-name">名称</label><input id="ff-name" placeholder="chaitin" required></div>
             <div class="wide"><label for="ff-url">订阅地址（必须 HTTPS）</label><input id="ff-url" placeholder="https://chaitin.cn/api/ip-group/xxxx" required></div>
             <div><label for="ff-action">命中动作</label>
-              <select id="ff-action"><option value="block">拒绝</option><option value="challenge">人机验证</option><option value="log">仅记录</option></select>
+              <select id="ff-action"><option value="block">拒绝</option><option value="allow">放行（白名单）</option><option value="challenge">人机验证</option><option value="log">仅记录</option></select>
             </div>
             <div><label for="ff-scope">作用域（留空为全部）</label><input id="ff-scope" placeholder="nas"></div>
             <div style="display:flex;gap:8px;align-items:center">
@@ -1313,9 +1313,12 @@
             </header>
             <div class="fieldset">
               <div class="wide hint">
-                通过雷池开放接口（<code>X-SLCE-API-Token</code>）拉取应用、自定义规则、IP 组与证书。
-                应用 ID 为 <code>lei-站点ID</code>，规则 ID 为 <code>lei-策略ID</code>；本地手工创建、
-                未被雷池管理的规则会保留。IP 组会展开成具体 CIDR 写入规则，ACME 托管证书因无法导出私钥会跳过。
+                通过雷池开放接口（<code>X-SLCE-API-Token</code>）拉取应用、策略、IP 组与证书。
+                应用 ID 为 <code>lei-站点ID</code>；雷池策略转换为「访问控制」规则
+                （<code>lei-acl-策略ID-序号</code>，白名单→放行、黑名单→拦截）；
+                带订阅地址的 IP 组建成「IP 组订阅」（<code>lei-ipgroup-组ID</code>）。
+                本地手工创建、未被雷池管理的规则与订阅会保留。ACME 托管证书只登记证书链，
+                没有私钥不会用于 TLS，需要在证书页补传私钥。
               </div>
               <div class="wide"><label for="leichi-url">雷池地址</label>
                 <input id="leichi-url" placeholder="https://10.0.0.14:9443"></div>
@@ -1411,7 +1414,7 @@ const esc = (s) => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&l
 const fmtDuration = (secs) => secs >= 3600 ? Math.floor(secs/3600)+' 小时'
   : secs >= 60 ? Math.floor(secs/60)+' 分钟' : secs+' 秒';
 const fmtTime = (ts) => new Date(ts * 1000).toLocaleString('zh-CN', { hour12: false });
-const actionLabel = (a) => ({ block: '拒绝', challenge: '人机验证', log: '仅记录', observe: '观察' }[a] || a);
+const actionLabel = (a) => ({ allow: '放行', block: '拒绝', challenge: '人机验证', log: '仅记录', observe: '观察' }[a] || a);
 const kindLabel = (k) => ({ detect: '检测', ban: '封禁', acl: 'ACL', ratelimit: 'CC 限流', challenge: '人机验证' }[k] || k);
 /// 把后端返回的 "30m" / "2h" / "90s" 转成秒，供输入框编辑
 const durationToSecs = (d) => {
@@ -2221,7 +2224,7 @@ async function loadApps() {
     }
     appsCache = apps;
     el.innerHTML = apps.length
-      ? `<div class="app-grid">${apps.map(appCard).join('')}</div>`
+      ? apps.map(appCard).join('')
       : '<div class="empty">还没有应用，点右上角添加应用</div>';
   } catch (e) { el.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`; }
 }
@@ -3310,7 +3313,7 @@ async function loadCerts() {
     el.innerHTML = '<div class="empty">还没有证书，点右上角上传</div>';
   } else {
     el.innerHTML = `<table>
-      <thead><tr><th>ID</th><th>名称</th><th>域名</th><th>有效期</th><th>签发者</th><th>默认</th><th></th></tr></thead>
+      <thead><tr><th>ID</th><th>名称</th><th>域名</th><th>有效期</th><th>签发者</th><th>状态</th><th>默认</th><th></th></tr></thead>
       <tbody>${certsCache.map(c => `<tr>
         <td><code>${c.id}</code></td>
         <td>${esc(c.name)}</td>
@@ -3318,6 +3321,9 @@ async function loadCerts() {
         <td>${fmtTime(c.not_before)} ~ ${fmtTime(c.not_after)}
           ${c.expired ? '<span class="tag deny">已过期</span>' : ''}</td>
         <td>${esc(c.issuer || '')}</td>
+        <td>${c.has_key === false
+          ? '<span class="tag deny">缺私钥</span><div class="sub" style="margin:2px 0 0">仅登记证书链，需补传私钥才能用于 TLS</div>'
+          : (c.expired ? '<span class="tag deny">不可用</span>' : '<span class="tag allow">可用</span>')}</td>
         <td>${c.is_default ? '<span class="tag allow">默认</span>' : `<button onclick="setDefaultCert(${c.id})">设为默认</button>`}</td>
         <td>
           <button onclick="openCertEditor(${c.id})">更新</button>
@@ -3811,9 +3817,9 @@ function renderLeichiReport(r) {
     ${sysField('模式', r.preview ? '预览（未写库）' : '已写入并热重载')}
     ${sysField('耗时', `${fmtNum(r.duration_ms || 0)} ms`)}
     ${leichiStat('应用', r.apps)}
-    ${leichiStat('自定义规则', r.rules)}
+    ${leichiStat('访问控制规则', r.rules)}
     ${leichiStat('证书', r.certs)}
-    ${leichiStat('IP 组', r.ip_groups)}
+    ${leichiStat('IP 组订阅', r.ip_groups)}
   </div>
   ${items.length ? `<table>
     <thead><tr><th>同步明细</th></tr></thead>

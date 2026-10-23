@@ -2737,10 +2737,15 @@ fn build_group(input: &FeedInput) -> Result<homewaf_config::IpGroup, String> {
     }
 
     let action = match input.action.as_deref().unwrap_or("block") {
+        "allow" => IpGroupAction::Allow,
         "block" => IpGroupAction::Block,
         "challenge" => IpGroupAction::Challenge,
         "log" => IpGroupAction::Log,
-        other => return Err(format!("动作 `{other}` 非法（block / challenge / log）")),
+        other => {
+            return Err(format!(
+                "动作 `{other}` 非法（allow / block / challenge / log）"
+            ))
+        }
     };
 
     Ok(IpGroup {
@@ -3220,6 +3225,8 @@ struct CertView {
     created_at: i64,
     updated_at: i64,
     expired: bool,
+    /// 是否有可用私钥。雷池同步来的 ACME 托管证书只有证书链，缺私钥无法用于 TLS
+    has_key: bool,
 }
 
 fn split_domains(raw: &str) -> Vec<String> {
@@ -3253,6 +3260,7 @@ fn cert_view(row: &CertificateRow) -> CertView {
         created_at: row.created_at,
         updated_at: row.updated_at,
         expired: row.not_after > 0 && row.not_after <= homewaf_acl::now_unix(),
+        has_key: !row.cert_pem.trim().is_empty() && !row.key_pem.trim().is_empty(),
     }
 }
 
