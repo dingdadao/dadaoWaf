@@ -425,6 +425,7 @@ fn cmd_serve(
         tls_override
     };
     let tls = state.tls.clone();
+    let upstream_read_timeout = state.server.upstream_read_timeout.0;
 
     tracing::info!(
         apps = state.router.len(),
@@ -470,6 +471,7 @@ fn cmd_serve(
             started_at: homewaf_acl::now_unix(),
             listen: listen.clone(),
             tls_listen: tls_listen.clone(),
+            admin_addr: admin_addr.clone(),
         };
         match homewaf_admin::spawn(admin_state, admin_addr.clone()) {
             Ok(()) => tracing::info!(listen = %admin_addr, "控制台启动中"),
@@ -484,6 +486,7 @@ fn cmd_serve(
         store: Some(store),
         bans,
         metrics,
+        upstream_read_timeout,
         // DB 模式下没有配置文件可监视。改配置后由控制台显式触发重载
         watch_path: None,
         allow_regex,

@@ -57,6 +57,11 @@ pub struct AdminState {
     pub listen: Vec<String>,
     /// 实际生效的 TLS 监听地址（命令行覆盖后的值）
     pub tls_listen: Vec<String>,
+    /// 实际生效的管理面监听地址（命令行覆盖后的值）。
+    ///
+    /// 不能从运行时状态里取：热重载会用数据库里的配置覆盖 `server.admin`，
+    /// 命令行传入的地址会"消失"，端口校验就会漏判。
+    pub admin_addr: String,
 }
 
 type Ctx = Arc<AdminState>;
@@ -106,7 +111,9 @@ async fn security_headers(req: Request, next: Next) -> Response {
         .entry(header::CACHE_CONTROL)
         .or_insert(HeaderValue::from_static("no-store"));
     headers
-        .entry(header::HeaderName::from_static("x-permitted-cross-domain-policies"))
+        .entry(header::HeaderName::from_static(
+            "x-permitted-cross-domain-policies",
+        ))
         .or_insert(HeaderValue::from_static("none"));
     res
 }
@@ -173,9 +180,11 @@ fn is_lan(ip: Option<IpAddr>) -> bool {
     match ip {
         IpAddr::V4(v4) => v4.is_private() || v4.is_loopback() || v4.is_link_local(),
         IpAddr::V6(v6) => {
-            if v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| {
-                v4.is_private() || v4.is_loopback() || v4.is_link_local()
-            }) {
+            if v6.is_loopback()
+                || v6
+                    .to_ipv4_mapped()
+                    .is_some_and(|v4| v4.is_private() || v4.is_loopback() || v4.is_link_local())
+            {
                 return true;
             }
             let head = v6.segments()[0];
@@ -492,7 +501,13 @@ enum BindStep {
 }
 
 /// 未绑定动态口令时的处理：发二维码等扫码，或校验绑定码后正式启用。
-fn bind_step(ctx: &AdminState, auth: &mut AdminAuth, body: &LoginBody, lan: bool, now: i64) -> BindStep {
+fn bind_step(
+    ctx: &AdminState,
+    auth: &mut AdminAuth,
+    body: &LoginBody,
+    lan: bool,
+    now: i64,
+) -> BindStep {
     if body.skip_bind {
         if !lan {
             return BindStep::Failed(text(
@@ -740,12 +755,7 @@ async fn totp_confirm(
     let Some(secret) = auth.totp_secret.as_deref().and_then(decode_totp_secret) else {
         return text(StatusCode::CONFLICT, "请先获取二维码后再提交验证码");
     };
-    if !verify_totp(
-        &secret,
-        &body.totp,
-        homewaf_acl::now_unix(),
-        &ctx.totp_last,
-    ) {
+    if !verify_totp(&secret, &body.totp, homewaf_acl::now_unix(), &ctx.totp_last) {
         return text(StatusCode::UNAUTHORIZED, "动态验证码错误或已过期");
     }
     auth.totp_enabled = true;
@@ -1107,7 +1117,8 @@ fn merged_traffic(ctx: &AdminState, range: i64, app: Option<&str>, now: i64) -> 
         Vec::new()
     };
 
-    ctx.metrics.dashboard_merged(range, app, now, &history, boundary)
+    ctx.metrics
+        .dashboard_merged(range, app, now, &history, boundary)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2342,6 +2353,81 @@ async fn upsert_app(
     }
 }
 
+/// 从监听地址里取端口（`[::]:80` / `0.0.0.0:443`）。
+fn addr_port(addr: &str) -> Option<u16> {
+    if let Some(rest) = addr.strip_prefix('[') {
+        let end = rest.find(']')?;
+        return rest[end + 1..].strip_prefix(':')?.parse().ok();
+    }
+    addr.rsplit_once(':')?.1.parse().ok()
+}
+
+/// 解析 `/proc/net/tcp` / `/proc/net/tcp6` 中处于 LISTEN（状态 0A）的本地端口。
+fn parse_proc_listen(text: &str) -> std::collections::HashSet<u16> {
+    let mut out = std::collections::HashSet::new();
+    for line in text.lines().skip(1) {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() < 4 || cols[3] != "0A" {
+            continue;
+        }
+        if let Some((_, hex)) = cols[1].rsplit_once(':') {
+            if let Ok(port) = u16::from_str_radix(hex, 16) {
+                out.insert(port);
+            }
+        }
+    }
+    out
+}
+
+/// 主机上已被进程监听的端口。
+///
+/// 只读 Linux 的 /proc；其他平台返回空集合，避免本地开发被误报拦住。
+fn os_listen_ports() -> std::collections::HashSet<u16> {
+    let mut out = std::collections::HashSet::new();
+    for path in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            out.extend(parse_proc_listen(&text));
+        }
+    }
+    out
+}
+
+/// 校验应用要监听的端口是否可用。
+///
+/// 规则：
+/// - 80/443 这类**静态监听端口**是程序内置的默认端口，所有应用共享，重复声明不算冲突；
+/// - 管理面端口不能被应用占用；
+/// - 其余端口：已被其他应用声明、或已被系统其他进程监听的，保存时就拒绝并提示，
+///   而不是等运行时绑不上、流量悄悄进不来。
+fn check_listen_ports(
+    ports: &[u16],
+    reserved: &std::collections::HashSet<u16>,
+    admin_port: Option<u16>,
+    other_apps: &std::collections::HashMap<u16, String>,
+    own_previous: &std::collections::HashSet<u16>,
+    os_ports: &std::collections::HashSet<u16>,
+) -> Result<(), String> {
+    for &port in ports {
+        if Some(port) == admin_port {
+            return Err(format!("端口 {port} 是管理面端口，不能作为应用监听端口"));
+        }
+        if reserved.contains(&port) {
+            continue;
+        }
+        if let Some(owner) = other_apps.get(&port) {
+            return Err(format!("端口 {port} 已被应用 `{owner}` 占用，请换一个端口"));
+        }
+        // 本应用原先声明的端口仍握在自己手里（动态监听不做热卸载），更新时不算冲突
+        if own_previous.contains(&port) {
+            continue;
+        }
+        if os_ports.contains(&port) {
+            return Err(format!("端口 {port} 已被系统其他进程占用，请换一个端口"));
+        }
+    }
+    Ok(())
+}
+
 /// 校验一个待写入的应用。
 fn validate_app(ctx: &AdminState, app: &Application) -> Result<(), String> {
     let id = app.id.trim();
@@ -2430,6 +2516,36 @@ fn validate_app(ctx: &AdminState, app: &Application) -> Result<(), String> {
             }
         }
     }
+
+    // 监听端口占用：80/443 是程序默认的共享端口，多应用共用不冲突；
+    // 其他端口一旦被别的应用或系统进程占着就绑不上，保存时就提示，
+    // 免得用户以为保存成功、实际流量进不来。
+    let reserved: std::collections::HashSet<u16> = ctx
+        .listen
+        .iter()
+        .chain(ctx.tls_listen.iter())
+        .filter_map(|addr| addr_port(addr))
+        .collect();
+    let admin_port = addr_port(&ctx.admin_addr);
+    let mut other_ports: std::collections::HashMap<u16, String> = Default::default();
+    let mut own_previous: std::collections::HashSet<u16> = Default::default();
+    for other in existing.iter().filter(|a| a.enabled) {
+        if mine(other) {
+            own_previous.extend(other.listen_ports.iter().copied());
+        } else {
+            for &port in &other.listen_ports {
+                other_ports.entry(port).or_insert_with(|| other.id.clone());
+            }
+        }
+    }
+    check_listen_ports(
+        &app.listen_ports,
+        &reserved,
+        admin_port,
+        &other_ports,
+        &own_previous,
+        &os_listen_ports(),
+    )?;
 
     Ok(())
 }
@@ -3919,6 +4035,8 @@ fn build_group(input: &FeedInput) -> Result<homewaf_config::IpGroup, String> {
         enabled: input.enabled.unwrap_or(true),
         source: IpGroupSource {
             url: url.to_string(),
+            kind: IpGroupSourceKind::Http,
+            aliyun: Default::default(),
             format: FeedFormat::Auto,
             interval: Duration::from_secs(3600),
             timeout: Duration::from_secs(15),
@@ -4391,7 +4509,12 @@ fn ip_group_views(ctx: &AdminState) -> Result<Vec<SubscriptionView>, String> {
             name: group.name.clone(),
             label: group.label.clone(),
             display_name: display_name(&group.label, &group.name),
-            url: group.source.url.clone(),
+            url: match group.source.kind {
+                homewaf_config::IpGroupSourceKind::Http => group.source.url.clone(),
+                homewaf_config::IpGroupSourceKind::AliyunEsa => {
+                    format!("阿里云 ESA · SiteId {}", group.source.aliyun.site_id)
+                }
+            },
             enabled: group.enabled,
             entries,
             status: feed_status(group.enabled, error.is_some(), entries),
@@ -4529,8 +4652,24 @@ fn validate_ip_group(group: &homewaf_config::IpGroup, app_ids: &[String]) -> Res
     if group.label.chars().count() > 64 {
         return Err("中文名称不能超过 64 个字符".into());
     }
-    if !group.source.url.starts_with("https://") {
-        return Err("订阅地址必须是 HTTPS（明文 HTTP 可能被中间人投毒）".into());
+    match group.source.kind {
+        homewaf_config::IpGroupSourceKind::Http => {
+            if !group.source.url.starts_with("https://") {
+                return Err("订阅地址必须是 HTTPS（明文 HTTP 可能被中间人投毒）".into());
+            }
+        }
+        homewaf_config::IpGroupSourceKind::AliyunEsa => {
+            let a = &group.source.aliyun;
+            if a.access_key_id.trim().is_empty()
+                || a.access_key_secret.trim().is_empty()
+                || a.site_id.trim().is_empty()
+            {
+                return Err("阿里云 ESA 来源需要 AccessKey ID / Secret 和站点 ID".into());
+            }
+            if a.region.trim().is_empty() {
+                return Err("阿里云 ESA 来源需要填写地域".into());
+            }
+        }
     }
     if group.source.interval.as_secs() < 60 {
         return Err("拉取周期不能短于 60 秒".into());
@@ -5520,6 +5659,7 @@ mod tests {
             started_at: 0,
             listen: vec!["0.0.0.0:80".to_string()],
             tls_listen: Vec::new(),
+            admin_addr: "127.0.0.1:9443".to_string(),
         }
     }
 
@@ -5563,8 +5703,108 @@ mod tests {
     }
 
     // ============================================================
-    // 认证
+    // 监听端口占用校验
     // ============================================================
+
+    #[test]
+    fn parses_listen_ports_from_proc() {
+        let text = "\
+  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 00000000:0050 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 1
+   1: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 2
+   2: 0100007F:1F91 00000000:0000 01 00000000:00000000 00:00000000 00000000     0        0 3
+   3: 00000000:1710 0100007F:0050 01 00000000:00000000 00:00000000 00000000     0        0 4
+";
+        let ports = parse_proc_listen(text);
+        assert!(ports.contains(&80), "0A 状态应被识别（0050 = 80）");
+        assert!(ports.contains(&8080), "0A 状态应被识别（1F90 = 8080）");
+        assert!(!ports.contains(&8081), "非 LISTEN 状态不应计入");
+        assert!(!ports.contains(&5904), "只取本地端口，不看对端");
+    }
+
+    #[test]
+    fn addr_port_handles_v4_and_v6() {
+        assert_eq!(addr_port("[::]:80"), Some(80));
+        assert_eq!(addr_port("0.0.0.0:443"), Some(443));
+        assert_eq!(addr_port("127.0.0.1:9443"), Some(9443));
+        assert_eq!(addr_port("nonsense"), None);
+    }
+
+    #[test]
+    fn default_ports_are_shared_and_not_conflicting() {
+        let reserved: std::collections::HashSet<u16> = [80u16, 443].into_iter().collect();
+        let other = std::collections::HashMap::from([(80u16, "lei-1".to_string())]);
+        let os: std::collections::HashSet<u16> = [80u16, 443].into_iter().collect();
+        assert!(check_listen_ports(
+            &[80, 443],
+            &reserved,
+            Some(9443),
+            &other,
+            &Default::default(),
+            &os
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn port_owned_by_other_app_is_rejected() {
+        let other = std::collections::HashMap::from([(5667u16, "lei-1".to_string())]);
+        let err = check_listen_ports(
+            &[5667],
+            &Default::default(),
+            None,
+            &other,
+            &Default::default(),
+            &Default::default(),
+        )
+        .unwrap_err();
+        assert!(err.contains("lei-1"), "应提示占用者：{err}");
+    }
+
+    #[test]
+    fn port_occupied_by_system_is_rejected() {
+        let os: std::collections::HashSet<u16> = [8006u16].into_iter().collect();
+        let err = check_listen_ports(
+            &[8006],
+            &Default::default(),
+            None,
+            &Default::default(),
+            &Default::default(),
+            &os,
+        )
+        .unwrap_err();
+        assert!(err.contains("系统其他进程"), "应提示系统占用：{err}");
+    }
+
+    #[test]
+    fn own_previous_port_is_not_a_conflict() {
+        // 更新自己时端口还在本进程手里（动态监听不热卸载），不能误报
+        let os: std::collections::HashSet<u16> = [5667u16].into_iter().collect();
+        let own: std::collections::HashSet<u16> = [5667u16].into_iter().collect();
+        assert!(check_listen_ports(
+            &[5667],
+            &Default::default(),
+            None,
+            &Default::default(),
+            &own,
+            &os
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn admin_port_is_rejected() {
+        let err = check_listen_ports(
+            &[9443],
+            &Default::default(),
+            Some(9443),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+        )
+        .unwrap_err();
+        assert!(err.contains("管理面"), "{err}");
+    }
 
     #[test]
     fn auth_always_requires_session() {
@@ -5581,8 +5821,7 @@ mod tests {
         h.insert("authorization", "Bearer sess-1".parse().unwrap());
         assert!(authorized(&st, &h));
 
-        *st.sessions.lock().unwrap().get_mut("sess-1").unwrap() =
-            homewaf_acl::now_unix() - 1;
+        *st.sessions.lock().unwrap().get_mut("sess-1").unwrap() = homewaf_acl::now_unix() - 1;
         assert!(!authorized(&st, &h), "过期会话应拒绝");
     }
 
@@ -5613,11 +5852,17 @@ mod tests {
         assert_eq!(auth.username, DEFAULT_ADMIN_USER);
         let loaded = store_get_auth(&st.store);
         assert_eq!(loaded.username, DEFAULT_ADMIN_USER);
-        assert!(verify_password(&loaded.password_hash, DEFAULT_ADMIN_PASSWORD));
+        assert!(verify_password(
+            &loaded.password_hash,
+            DEFAULT_ADMIN_PASSWORD
+        ));
     }
 
     fn store_get_auth(store: &Store) -> AdminAuth {
-        store.get_setting::<AdminAuth>(ADMIN_AUTH_KEY).unwrap().unwrap()
+        store
+            .get_setting::<AdminAuth>(ADMIN_AUTH_KEY)
+            .unwrap()
+            .unwrap()
     }
 
     #[test]

@@ -22,6 +22,7 @@ use crate::headers::{self, ForwardedCtx};
 use crate::metrics::{TrafficMetrics, TrafficSample};
 use crate::realip;
 use crate::reload::{RuntimeState, SharedState};
+use crate::risk::{RiskAssessment, RiskLevel, RiskTable, RiskTag};
 use crate::upstream;
 
 /// 请求 ID 计数器。
@@ -132,6 +133,10 @@ pub struct WafProxy {
     metrics: Arc<TrafficMetrics>,
     /// 人机验证签名服务（密钥进程内唯一，重启后旧凭据失效）
     challenges: Arc<ChallengeService>,
+    /// 进程内风险分（软标签累积，驱动挑战升级）
+    risks: RiskTable,
+    /// 上游响应读超时。WebSocket 等长连接依赖它，默认 pingora 的 60s 过短
+    upstream_read_timeout: std::time::Duration,
 }
 
 impl WafProxy {
@@ -140,6 +145,7 @@ impl WafProxy {
         bans: Arc<BanTable>,
         store: Option<Arc<Store>>,
         metrics: Arc<TrafficMetrics>,
+        upstream_read_timeout: std::time::Duration,
     ) -> Self {
         Self {
             state,
@@ -147,6 +153,8 @@ impl WafProxy {
             store,
             metrics,
             challenges: Arc::new(ChallengeService::new()),
+            risks: RiskTable::new(),
+            upstream_read_timeout,
         }
     }
 
@@ -161,15 +169,18 @@ impl WafProxy {
         &self,
         session: &mut Session,
         state: &RuntimeState,
+        ctx: &RequestCtx,
         app: &str,
         ip: Option<IpAddr>,
         query: Option<&str>,
         secure: bool,
-        request_id: &str,
     ) -> Result<bool> {
         let token = query.and_then(|q| query_param(q, "token"));
         let nonce = query.and_then(|q| query_param(q, "nonce"));
         let fp = query.and_then(|q| query_param(q, "fp")).unwrap_or_default();
+        let sig = query
+            .and_then(|q| query_param(q, "sig"))
+            .unwrap_or_default();
         let env = query
             .and_then(|q| query_param(q, "env"))
             .unwrap_or_default();
@@ -183,12 +194,28 @@ impl WafProxy {
             nonce: &nonce,
             fp: &fp,
             env: &env,
+            sig: &sig,
         };
         match self.challenges.verify(&sol, app, ip, now) {
             Ok(payload) => {
                 let cookie = self.challenges.issue_cookie(&state.challenge, app, ip, now);
                 let ttl = state.challenge.ttl.as_secs();
                 let next = safe_next(payload.next());
+                if let Some(ip) = ip {
+                    self.challenges.reset_failures(ip);
+                }
+
+                // 通过事件也带风险分：同一 IP 之前的软标签仍有参考价值
+                let score = ip.map(|i| self.risks.score_at(i, now)).unwrap_or(0);
+                self.record_security_event(
+                    ctx,
+                    EventKind::Challenge,
+                    app,
+                    CHALLENGE_PATH,
+                    "challenge",
+                    score,
+                    "pass",
+                );
 
                 let mut resp = ResponseHeader::build(303, None)?;
                 resp.insert_header("location", next)?;
@@ -203,24 +230,75 @@ impl WafProxy {
                 tracing::info!(
                     target: "homewaf.security",
 
-                    req = %request_id,
+                    req = %ctx.request_id,
                     app,
                     client_ip = ?ip,
                     next,
+                    risk_score = score,
                     "人机验证通过"
                 );
                 Ok(true)
             }
             Err(e) => {
+                // 失败分类 → 风险标签；hard 标签与 Block 等级进入封禁表
+                let tag = match e {
+                    challenge::ChallengeError::Automated => Some(RiskTag::AutomationReported),
+                    challenge::ChallengeError::FingerprintForged => {
+                        Some(RiskTag::FingerprintForged)
+                    }
+                    challenge::ChallengeError::SignalsMissing
+                    | challenge::ChallengeError::BadFingerprint => {
+                        Some(RiskTag::FingerprintMissing)
+                    }
+                    _ => None,
+                };
+                let mut assessment = RiskAssessment::from_tags([RiskTag::ChallengeFailed]);
+                if let Some(t) = tag {
+                    assessment.add(t);
+                }
+                let mut banned = false;
+                if let Some(ip) = ip {
+                    if !fp.is_empty() && self.risks.bump_replay(&fp, ip, now) {
+                        assessment.add(RiskTag::FingerprintReplay);
+                    }
+                    self.risks.add_at(ip, assessment.score, now);
+                    let level = self.risks.level_at(ip, &state.challenge, now);
+                    if assessment.hard || level == RiskLevel::Block {
+                        banned = self.bans.record(ip, 50, now).is_some();
+                    }
+                }
+                let score = ip.map(|i| self.risks.score_at(i, now)).unwrap_or(0);
+                let rules = tag.map(|t| t.as_str()).unwrap_or("challenge_failed");
+                self.record_security_event_with_tags(
+                    ctx,
+                    EventKind::Challenge,
+                    app,
+                    CHALLENGE_PATH,
+                    rules,
+                    score,
+                    "fail",
+                    &assessment.tag_names(),
+                );
                 tracing::debug!(
                     target: "homewaf.security",
 
-                    req = %request_id,
+                    req = %ctx.request_id,
                     app,
                     client_ip = ?ip,
                     error = %e,
+                    risk_tags = %assessment.tag_names(),
+                    risk_score = score,
+                    banned,
                     "人机验证失败"
                 );
+
+                // 1 分钟内失败超过 5 次直接 429，压住暴力试错
+                let over = ip
+                    .map(|i| self.challenges.record_failure(i, now))
+                    .unwrap_or(false);
+                if over {
+                    return write_text(session, 429, "验证失败次数过多，请稍后再试").await;
+                }
                 write_text(session, 400, "验证失败，请刷新重试").await
             }
         }
@@ -232,21 +310,44 @@ impl WafProxy {
         &self,
         session: &mut Session,
         state: &RuntimeState,
+        ctx: &RequestCtx,
         app: &str,
         ip: Option<IpAddr>,
         next: &str,
         status: u16,
+        level: RiskLevel,
     ) -> Result<bool> {
         let now = homewaf_acl::now_unix().max(0) as u64;
-        let issued = self.challenges.issue(&state.challenge, app, ip, next, now);
+        let score = ip.map(|i| self.risks.score_at(i, now)).unwrap_or(0);
+        let issued = self
+            .challenges
+            .issue(&state.challenge, app, ip, next, level, now);
+
+        let level_name = match level {
+            RiskLevel::Normal => "normal",
+            RiskLevel::Challenge => "challenge",
+            RiskLevel::Block => "block",
+        };
+        self.record_security_event(
+            ctx,
+            EventKind::Challenge,
+            app,
+            next,
+            level_name,
+            score,
+            "issue",
+        );
 
         tracing::info!(
             target: "homewaf.security",
 
+            req = %ctx.request_id,
             app,
             client_ip = ?ip,
             difficulty = issued.difficulty,
             status,
+            risk_level = level_name,
+            risk_score = score,
             "下发人机验证"
         );
 
@@ -275,6 +376,22 @@ impl WafProxy {
         score: u32,
         action: &str,
     ) {
+        self.record_security_event_with_tags(ctx, kind, app, path, rules, score, action, "");
+    }
+
+    /// 同上，附带风险标签（逗号分隔）。
+    #[allow(clippy::too_many_arguments)]
+    fn record_security_event_with_tags(
+        &self,
+        ctx: &RequestCtx,
+        kind: EventKind,
+        app: &str,
+        path: &str,
+        rules: &str,
+        score: u32,
+        action: &str,
+        risk_tags: &str,
+    ) {
         let Some(store) = &self.store else {
             return;
         };
@@ -291,7 +408,8 @@ impl WafProxy {
         .with_request(ctx.request_id.clone(), ctx.method.clone())
         .with_query(ctx.query.clone().unwrap_or_default())
         .with_user_agent(ctx.user_agent.clone())
-        .with_rule_names(ctx.matched_rule_names.clone());
+        .with_rule_names(ctx.matched_rule_names.clone())
+        .with_risk_tags(risk_tags.to_string());
         if let Err(e) = store.insert_event(&event) {
             tracing::warn!(error = %e, "写入安全事件失败");
         }
@@ -430,7 +548,14 @@ impl ProxyHttp for WafProxy {
         }
 
         let host = strip_port(&raw_host);
-        let port = extract_port(&raw_host).unwrap_or(if is_tls { 443 } else { 80 });
+        // 端口优先取 Host 头；Host 不带端口时用连接实际落地的本地端口。
+        //
+        // 不能按 TLS 与否猜 443/80：经过端口映射（公网 443 → 源站 5667）时
+        // Host 通常不带端口，猜出来的 443 会让声明了 listen_ports=[5667] 的应用匹配不上。
+        let local_port = session
+            .server_addr()
+            .and_then(|addr| addr.as_inet().map(|a| a.port()));
+        let port = resolve_request_port(&raw_host, local_port, is_tls);
         let scheme: &'static str = if is_tls { "https" } else { "http" };
 
         ctx.original_host = host.clone();
@@ -438,8 +563,24 @@ impl ProxyHttp for WafProxy {
         ctx.scheme = scheme;
 
         let Some(hit) = state.router.resolve(&host, port, &path) else {
-            // 未配置的域名：返回 404，不泄露任何后端指纹
-            return write_empty(session, 404).await;
+            // 未配置的域名，或直接用 IP（主机名是 IP 字面量）访问：默认拒绝。
+            //
+            // 这里不能只回 404：命中不了任何应用就没有应用级策略，检测、限流、
+            // 人机验证全部不生效，事件里也查不到——用 IP 扫一遍等于隐形。
+            // 统一按 ACL 拒绝处理并落事件，控制台能看到、也能据此封禁。
+            ctx.app_id = String::new();
+            ctx.blocked = true;
+            ctx.acl_reason = Some("未配置域名/IP 直连".to_string());
+            ctx.matched_rule_names = "未配置域名 / IP 直接访问".to_string();
+            self.record_security_event(ctx, EventKind::Acl, "-", &path, "unknown-host", 0, "block");
+            tracing::warn!(
+                req = %ctx.request_id,
+                host = %host,
+                path = %path,
+                client_ip = %ctx.client_ip.map(|i| i.to_string()).unwrap_or_default(),
+                "未配置的域名/IP 直接访问，拒绝",
+            );
+            return write_empty(session, 403).await;
         };
 
         let app = state
@@ -511,7 +652,11 @@ impl ProxyHttp for WafProxy {
         // 自定义规则（兼容雷池格式）：放行优先，其次拦截/人机验证，最后仅记录。
         // 放在 ACL 之后、自动封禁之前——白名单命中时连封禁都可以绕过。
         let mut custom_whitelisted = false;
-        let custom = {
+        let custom = if uri_path == CHALLENGE_PATH {
+            // 挑战回调必须直达校验逻辑：若这里继续求值自定义规则，
+            // 命中 Challenge 规则会把挑战页本身再次挑战，形成死循环。
+            None
+        } else {
             let headers = &session.req_header().headers;
             let creq = crate::custom_rule::RuleRequest {
                 app: &app.id,
@@ -537,6 +682,10 @@ impl ProxyHttp for WafProxy {
             Some(crate::custom_rule::CustomDecision::Deny(name)) => {
                 ctx.matched_rule_names = name.clone();
                 let reason = format!("自定义黑名单：{name}");
+                // 规则型拦截不给 hard 标签，只累积软分，避免共享出口被误封
+                if let Some(ip) = ctx.client_ip {
+                    self.risks.add(ip, 25);
+                }
                 tracing::info!(
                     target: "homewaf.security",
 
@@ -584,20 +733,30 @@ impl ProxyHttp for WafProxy {
                         rule = %name,
                         "自定义规则要求人机验证"
                     );
-                    self.record_security_event(
-                        ctx,
-                        EventKind::Challenge,
-                        &app.id,
-                        &hit.normalized_path,
-                        &format!("自定义规则：{name}"),
-                        0,
-                        "challenge",
-                    );
                     ctx.acl_reason = Some(format!("自定义规则要求人机验证：{name}"));
                     ctx.blocked = true;
                     if state.challenge.enabled {
+                        let level = ctx
+                            .client_ip
+                            .map(|ip| {
+                                self.risks.level_at(
+                                    ip,
+                                    &state.challenge,
+                                    homewaf_acl::now_unix().max(0) as u64,
+                                )
+                            })
+                            .unwrap_or(RiskLevel::Normal);
                         return self
-                            .issue_challenge(session, &state, &app.id, ctx.client_ip, &path, 403)
+                            .issue_challenge(
+                                session,
+                                &state,
+                                ctx,
+                                &app.id,
+                                ctx.client_ip,
+                                &path,
+                                403,
+                                level,
+                            )
                             .await;
                     }
                     return write_text(session, 403, "人机验证未启用").await;
@@ -704,11 +863,11 @@ impl ProxyHttp for WafProxy {
                 .handle_challenge_callback(
                     session,
                     &state,
+                    ctx,
                     &app.id,
                     ctx.client_ip,
                     query.as_deref(),
                     scheme == "https",
-                    &ctx.request_id,
                 )
                 .await;
         }
@@ -783,24 +942,78 @@ impl ProxyHttp for WafProxy {
             .unwrap_or(false);
         ctx.challenge_passed = challenge_passed;
 
-        // 应用/路由要求人机验证
-        if policy.require_challenge && !challenge_passed && !ctx.acl_allowed {
+        // 风险分层处置：软标签累积到 Challenge 阈值先要求人机验证，
+        // 到 Block 阈值直接拒绝。白名单来源不参与，避免共享出口被误伤。
+        let risk_level = if whitelisted {
+            RiskLevel::Normal
+        } else {
+            ctx.client_ip
+                .map(|ip| self.risks.level_at(ip, &state.challenge, now_secs))
+                .unwrap_or(RiskLevel::Normal)
+        };
+        let risk_score = ctx
+            .client_ip
+            .map(|ip| self.risks.score_at(ip, now_secs))
+            .unwrap_or(0);
+        if risk_level == RiskLevel::Block {
+            if let Some(ip) = ctx.client_ip {
+                self.bans.record(ip, 50, now_secs);
+            }
+            tracing::warn!(
+                target: "homewaf.security",
+
+                req = %ctx.request_id,
+                client_ip = ?ctx.client_ip,
+                app = %app.id,
+                risk_score,
+                "风险分达到拦截阈值，拒绝"
+            );
+            self.record_security_event(
+                ctx,
+                EventKind::Challenge,
+                &app.id,
+                &hit.normalized_path,
+                "risk-block",
+                risk_score,
+                "block",
+            );
+            ctx.blocked = true;
+            return write_empty(session, 403).await;
+        }
+
+        // 应用/路由要求人机验证；风险等级达到 Challenge 时同样升级为挑战
+        let risk_challenge = risk_level == RiskLevel::Challenge;
+        if (policy.require_challenge || risk_challenge) && !challenge_passed && !ctx.acl_allowed {
+            ctx.blocked = true;
+            if state.challenge.enabled {
+                let level = if risk_challenge {
+                    RiskLevel::Challenge
+                } else {
+                    RiskLevel::Normal
+                };
+                return self
+                    .issue_challenge(
+                        session,
+                        &state,
+                        ctx,
+                        &app.id,
+                        ctx.client_ip,
+                        &path,
+                        403,
+                        level,
+                    )
+                    .await;
+            }
+            // 要求挑战但挑战功能被关闭：保守拦截，而不是静默放行
             self.record_security_event(
                 ctx,
                 EventKind::Challenge,
                 &app.id,
                 &hit.normalized_path,
                 "challenge",
-                0,
+                risk_score,
                 "block",
             );
-            ctx.blocked = true;
-            if state.challenge.enabled {
-                return self
-                    .issue_challenge(session, &state, &app.id, ctx.client_ip, &path, 403)
-                    .await;
-            }
-            // 要求挑战但挑战功能被关闭：保守拦截，而不是静默放行
             tracing::warn!(
                 target: "homewaf.security",
 
@@ -828,6 +1041,10 @@ impl ProxyHttp for WafProxy {
                     .check(ctx.client_ip, url_key.as_deref(), params);
 
                 if let Some(hit_limit) = qps_hit {
+                    // CC 命中只累积软分，不直接封禁
+                    if let Some(ip) = ctx.client_ip {
+                        self.risks.add(ip, RiskTag::CcBurst.weight());
+                    }
                     let blocked = match action {
                         RateLimitAction::Log => false,
                         RateLimitAction::Block => true,
@@ -844,24 +1061,17 @@ impl ProxyHttp for WafProxy {
                                     "block",
                                     hit_limit.observed,
                                 );
-                                self.record_security_event(
-                                    ctx,
-                                    EventKind::Challenge,
-                                    &app.id,
-                                    &hit.normalized_path,
-                                    "cc-challenge",
-                                    hit_limit.observed,
-                                    "block",
-                                );
                                 ctx.blocked = true;
                                 return self
                                     .issue_challenge(
                                         session,
                                         &state,
+                                        ctx,
                                         &app.id,
                                         ctx.client_ip,
                                         &path,
                                         429,
+                                        RiskLevel::Challenge,
                                     )
                                     .await;
                             }
@@ -932,6 +1142,7 @@ impl ProxyHttp for WafProxy {
                                     "block",
                                     policy.ratelimit.per_ip_conn,
                                 );
+                                self.risks.add(ip, RiskTag::CcBurst.weight());
                                 ctx.blocked = true;
                                 return write_text(session, 429, "并发连接数过多").await;
                             }
@@ -1049,7 +1260,7 @@ impl ProxyHttp for WafProxy {
                                 &app.id,
                                 &hit.normalized_path,
                                 &verdict.rule_ids().join(","),
-                                verdict.score,
+                                outcome.score,
                                 "ban",
                             );
                             tracing::warn!(
@@ -1326,6 +1537,9 @@ impl ProxyHttp for WafProxy {
             .unwrap_or_else(|| "127.0.0.1:1".to_string());
 
         let mut peer = HttpPeer::new(addr.as_str(), ctx.upstream_tls, ctx.upstream_sni.clone());
+        // WebSocket / SSE 等长连接的空闲上限。pingora 默认 60s 会中断心跳
+        // 间隔较大的移动端连接，这里统一放宽到配置值。
+        peer.options.read_timeout = Some(self.upstream_read_timeout);
         if ctx.upstream_tls {
             // 内网自签上游：SNI 仍然发送，但跳过证书与主机名校验
             peer.options.verify_cert = ctx.upstream_verify;
@@ -1863,6 +2077,17 @@ fn extract_port(host: &str) -> Option<u16> {
     port.parse().ok()
 }
 
+/// 请求实际使用的端口。
+///
+/// 优先级：Host 头里显式带的端口 → 连接实际落地的本地端口 → 按 TLS 猜测。
+/// 中间那一步不能省：经过端口映射时 Host 往往不带端口，猜 443/80
+/// 会让声明了自定义端口（如 5667）的应用匹配不上。
+fn resolve_request_port(host: &str, local_port: Option<u16>, is_tls: bool) -> u16 {
+    extract_port(host)
+        .or(local_port)
+        .unwrap_or(if is_tls { 443 } else { 80 })
+}
+
 /// 代理启动参数。
 ///
 /// 路由、ACL、上游池都在 [`RuntimeState`] 里，热重载时整体替换；
@@ -1879,6 +2104,8 @@ pub struct ProxySettings {
     pub bans: Arc<BanTable>,
     /// 流量指标。由调用方创建，因为控制台要读同一份数据
     pub metrics: Arc<TrafficMetrics>,
+    /// 上游响应读超时（WebSocket 等长连接依赖）
+    pub upstream_read_timeout: std::time::Duration,
     /// 配置文件路径。`Some` 时启用热重载
     pub watch_path: Option<std::path::PathBuf>,
     /// 热重载是否允许正则路由
@@ -1887,6 +2114,187 @@ pub struct ProxySettings {
     pub watch_interval: std::time::Duration,
     /// 事件保留天数，超期自动清理
     pub events_retention_days: u32,
+}
+
+/// 从监听地址里取端口，如 `[::]:5667` / `0.0.0.0:80`。
+fn port_of_addr(addr: &str) -> Option<u16> {
+    extract_port(addr)
+}
+
+/// 汇总所有**已启用**应用声明的监听端口。
+///
+/// 返回值 `port -> 是否按 TLS 监听`：同一端口上只要有一个应用没关闭 TLS，
+/// 就按 TLS 服务（加密是安全默认值）；全部应用都是 `TlsMode::Off` 才走明文。
+/// 应用没声明 `listen_ports` 时不参与——它接受任意端口，不需要额外监听。
+fn app_declared_ports(
+    apps: &[homewaf_config::Application],
+) -> std::collections::BTreeMap<u16, bool> {
+    let mut ports = std::collections::BTreeMap::new();
+    for app in apps.iter().filter(|a| a.enabled) {
+        for &port in &app.listen_ports {
+            let needs_tls = !matches!(app.tls.mode, homewaf_config::TlsMode::Off);
+            ports
+                .entry(port)
+                .and_modify(|tls| *tls = *tls || needs_tls)
+                .or_insert(needs_tls);
+        }
+    }
+    ports
+}
+
+/// 动态端口的 Server 实例不响应进程信号：进程退出时由 systemd 一并结束。
+///
+/// 第二个 [`Server`] 若使用默认信号处理，SIGTERM 到来时会自己走完优雅退出并
+/// `std::process::exit(0)`，与主 Server 抢退出时机、截断日志。
+struct NeverShutdown;
+
+#[async_trait]
+impl pingora::server::ShutdownSignalWatch for NeverShutdown {
+    async fn recv(&self) -> pingora::server::ShutdownSignal {
+        std::future::pending().await
+    }
+}
+
+/// 为一批新端口起一个独立的 Pingora Server。
+///
+/// Pingora 的 [`Server`] 只能在启动前添加监听器，运行中无法扩容，
+/// 因此新增端口单独跑一个 Server 线程：它只承接这批端口，
+/// 已有的 80/443 监听器不受影响，等于零中断。
+#[allow(clippy::too_many_arguments)]
+fn spawn_listener_server(
+    state: SharedState,
+    bans: Arc<BanTable>,
+    store: Option<Arc<Store>>,
+    metrics: Arc<TrafficMetrics>,
+    upstream_read_timeout: std::time::Duration,
+    want_h2: bool,
+    ports: Vec<(u16, bool)>,
+) {
+    let names: Vec<String> = ports.iter().map(|(p, _)| p.to_string()).collect();
+    let thread_name = format!("homewaf-listen-{}", names.join("-"));
+    let spawned = std::thread::Builder::new()
+        .name(thread_name)
+        .spawn(move || {
+            let mut server = match Server::new(None) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!(error = %e, ports = ?names, "动态端口监听初始化失败");
+                    return;
+                }
+            };
+            if let Some(conf) = std::sync::Arc::get_mut(&mut server.configuration) {
+                conf.grace_period_seconds = Some(10);
+            }
+
+            let proxy = WafProxy::new(state.clone(), bans, store, metrics, upstream_read_timeout);
+            let mut service = pingora::proxy::http_proxy_service(&server.configuration, proxy);
+            let resolver = Arc::new(crate::tls::SniResolver::new(state.clone()));
+
+            for (port, tls) in ports {
+                let addr = format!("[::]:{port}");
+                if tls {
+                    let mut tls_settings =
+                        match TlsSettings::with_callbacks(Box::new(NoTlsCallbacks)) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                tracing::error!(error = %e, port, "初始化动态端口 TLS 失败");
+                                continue;
+                            }
+                        };
+                    tls_settings.set_cert_resolver(resolver.clone());
+                    if want_h2 {
+                        tls_settings.enable_h2();
+                    }
+                    tracing::info!(listen = %addr, mode = "https", "开始监听（应用声明端口）");
+                    service.add_tls_with_settings(&addr, None, tls_settings);
+                } else {
+                    tracing::info!(listen = %addr, mode = "http", "开始监听（应用声明端口）");
+                    service.add_tcp(&addr);
+                }
+            }
+
+            server.add_service(service);
+            // 不调用 bootstrap()：它只在 `upgrade=true` 时接管旧进程的监听 fd，这里不需要。
+            server.run(pingora::server::RunArgs {
+                shutdown_signal: Box::new(NeverShutdown),
+            });
+            tracing::warn!(ports = ?names, "动态端口监听线程退出");
+        });
+    if let Err(e) = spawned {
+        tracing::error!(error = %e, "启动动态端口监听线程失败");
+    }
+}
+
+/// 轮询应用声明的端口，为新增端口建立监听。
+///
+/// 已绑定的端口不回收（配置里删掉端口需要重启生效），这样避免"摘监听"期间
+/// 请求打到无人接管的端口上。绑定失败只记一次 warn 并持续重试，
+/// 避免每轮刷屏。
+#[allow(clippy::too_many_arguments)]
+fn spawn_dynamic_port_watcher(
+    state: SharedState,
+    reserved: std::collections::BTreeSet<u16>,
+    interval: std::time::Duration,
+    want_h2: bool,
+    bans: Arc<BanTable>,
+    store: Option<Arc<Store>>,
+    metrics: Arc<TrafficMetrics>,
+    upstream_read_timeout: std::time::Duration,
+) {
+    std::thread::Builder::new()
+        .name("homewaf-listen-watcher".to_string())
+        .spawn(move || {
+            let mut bound = reserved;
+            let mut warned: std::collections::BTreeSet<u16> = Default::default();
+            loop {
+                let snapshot = state.load_full();
+                let declared = app_declared_ports(snapshot.router.apps());
+                drop(snapshot);
+
+                let fresh: Vec<(u16, bool)> = declared
+                    .into_iter()
+                    .filter(|(port, _)| !bound.contains(port))
+                    .collect();
+
+                let mut to_spawn: Vec<(u16, bool)> = Vec::new();
+                for (port, tls) in fresh {
+                    // 先探测一次：端口被别的进程占着时不要白起一个 Server 线程
+                    match std::net::TcpListener::bind((std::net::Ipv6Addr::UNSPECIFIED, port)) {
+                        Ok(probe) => {
+                            drop(probe);
+                            warned.remove(&port);
+                            bound.insert(port);
+                            to_spawn.push((port, tls));
+                        }
+                        Err(e) => {
+                            if warned.insert(port) {
+                                tracing::warn!(
+                                    port,
+                                    error = %e,
+                                    "应用声明的端口无法绑定，稍后重试"
+                                );
+                            }
+                        }
+                    }
+                }
+
+                if !to_spawn.is_empty() {
+                    tracing::info!(ports = ?to_spawn, "应用声明了新端口，开始监听");
+                    spawn_listener_server(
+                        state.clone(),
+                        bans.clone(),
+                        store.clone(),
+                        metrics.clone(),
+                        upstream_read_timeout,
+                        want_h2,
+                        to_spawn,
+                    );
+                }
+
+                std::thread::sleep(interval);
+            }
+        })
+        .expect("启动动态端口监听轮询线程失败");
 }
 
 /// 主动健康检查：后台线程定时探测所有启用的上游。
@@ -2049,7 +2457,23 @@ pub fn run(state: SharedState, settings: ProxySettings) -> anyhow::Result<()> {
         );
     }
 
-    let proxy = WafProxy::new(state.clone(), bans, store, settings.metrics.clone());
+    let want_h2 = settings.tls.alpn.iter().any(|p| p == "h2");
+    // 动态端口监听要复用同一批运行期组件（共享封禁表/指标/持久化）
+    let watcher_args = (
+        state.clone(),
+        bans.clone(),
+        store.clone(),
+        settings.metrics.clone(),
+        settings.upstream_read_timeout,
+    );
+
+    let proxy = WafProxy::new(
+        state.clone(),
+        bans,
+        store,
+        settings.metrics.clone(),
+        settings.upstream_read_timeout,
+    );
 
     // 有应用启用主动健康检查时才起线程
     let hc_interval = state.load_full().pool.probe_interval();
@@ -2075,7 +2499,6 @@ pub fn run(state: SharedState, settings: ProxySettings) -> anyhow::Result<()> {
 
         // 证书解析器每次握手都读当前状态，因此证书更新是热生效的
         let resolver = Arc::new(crate::tls::SniResolver::new(state.clone()));
-        let want_h2 = settings.tls.alpn.iter().any(|p| p == "h2");
 
         for addr in &settings.tls_listen {
             let mut tls_settings = TlsSettings::with_callbacks(Box::new(NoTlsCallbacks))
@@ -2088,6 +2511,27 @@ pub fn run(state: SharedState, settings: ProxySettings) -> anyhow::Result<()> {
             service.add_tls_with_settings(addr, None, tls_settings);
         }
     }
+
+    // 静态监听器都加完之后启动动态端口轮询：应用新声明的端口单独起 Server，
+    // 已绑定的 80/443 不重建，因此加端口不会中断现有流量。
+    let reserved: std::collections::BTreeSet<u16> = settings
+        .listen
+        .iter()
+        .chain(settings.tls_listen.iter())
+        .filter_map(|addr| port_of_addr(addr))
+        .collect();
+    let (watcher_state, watcher_bans, watcher_store, watcher_metrics, watcher_timeout) =
+        watcher_args;
+    spawn_dynamic_port_watcher(
+        watcher_state,
+        reserved,
+        settings.watch_interval,
+        want_h2,
+        watcher_bans,
+        watcher_store,
+        watcher_metrics,
+        watcher_timeout,
+    );
 
     server.add_service(service);
     server.run_forever();
@@ -2110,6 +2554,187 @@ mod tests {
         assert_eq!(extract_port("[::1]:443"), Some(443));
         assert_eq!(extract_port("[::1]"), None);
         assert_eq!(extract_port("nas.home.lan"), None);
+    }
+
+    // ============================================================
+    // 端口推导（决定 listen_ports 匹配与日志口径）
+    // ============================================================
+
+    #[test]
+    fn port_of_addr_variants() {
+        assert_eq!(port_of_addr("[::]:5667"), Some(5667));
+        assert_eq!(port_of_addr("0.0.0.0:80"), Some(80));
+        assert_eq!(port_of_addr("127.0.0.1:8443"), Some(8443));
+        assert_eq!(port_of_addr("[::]"), None);
+    }
+
+    #[test]
+    fn host_port_wins_over_local_port() {
+        // Host 显式带端口时以它为准（反代链路里可能是另一侧的端口约定）
+        assert_eq!(
+            resolve_request_port("nas.home.lan:8443", Some(5667), true),
+            8443
+        );
+    }
+
+    #[test]
+    fn falls_back_to_local_port_when_host_has_none() {
+        // 端口映射场景：Host 不带端口，必须用连接实际落地的 5667
+        assert_eq!(resolve_request_port("nas.home.lan", Some(5667), true), 5667);
+    }
+
+    #[test]
+    fn falls_back_to_scheme_default_without_local_port() {
+        assert_eq!(resolve_request_port("nas.home.lan", None, true), 443);
+        assert_eq!(resolve_request_port("nas.home.lan", None, false), 80);
+    }
+
+    fn app_with(
+        enabled: bool,
+        ports: Vec<u16>,
+        mode: homewaf_config::TlsMode,
+    ) -> homewaf_config::Application {
+        homewaf_config::Application {
+            id: "app".to_string(),
+            name: "app".to_string(),
+            enabled,
+            domains: homewaf_config::Domains {
+                primary: "app.home.lan".to_string(),
+                aliases: vec![],
+            },
+            listen_ports: ports,
+            upstreams: vec![],
+            routes: vec![],
+            tls: homewaf_config::TlsModeConfig {
+                mode,
+                cert_id: None,
+            },
+            policy: Default::default(),
+            lb: Default::default(),
+            timeouts: Default::default(),
+            health_check: Default::default(),
+            retry: Default::default(),
+            headers: Default::default(),
+            websocket: false,
+            expires_at: None,
+            description: String::new(),
+            group: String::new(),
+            access_mode: Default::default(),
+            static_site: Default::default(),
+            redirect: Default::default(),
+            features: Default::default(),
+            tamper: Default::default(),
+        }
+    }
+
+    #[test]
+    fn declared_ports_merge_tls_and_plaintext() {
+        use homewaf_config::TlsMode;
+        let apps = vec![
+            app_with(true, vec![8080], TlsMode::Auto),
+            app_with(true, vec![8080, 8081], TlsMode::Off),
+        ];
+        let ports = app_declared_ports(&apps);
+        // 任一应用要 TLS 就按 TLS 监听
+        assert_eq!(ports.get(&8080), Some(&true));
+        assert_eq!(ports.get(&8081), Some(&false));
+    }
+
+    #[test]
+    fn declared_ports_skip_disabled_apps() {
+        use homewaf_config::TlsMode;
+        let apps = vec![
+            app_with(false, vec![9000], TlsMode::Auto),
+            app_with(true, vec![], TlsMode::Auto),
+        ];
+        assert!(app_declared_ports(&apps).is_empty());
+    }
+
+    /// 取一个当前空闲的端口：绑 0 拿到系统分配值后立刻释放。
+    fn free_port() -> u16 {
+        let listener = std::net::TcpListener::bind(("::1", 0)).expect("应能绑定回环端口");
+        listener.local_addr().unwrap().port()
+    }
+
+    fn wait_listening(port: u16) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if std::net::TcpStream::connect_timeout(
+                &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+                std::time::Duration::from_millis(200),
+            )
+            .is_ok()
+            {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        false
+    }
+
+    /// 热监听：先按第一版配置绑一个端口，再整体替换状态（模拟重载）让应用多声明一个端口，
+    /// watcher 应在下一轮把新端口接起来，且第一个端口继续可用。
+    #[test]
+    fn watcher_binds_declared_ports_and_hot_adds() {
+        let dir = std::env::temp_dir();
+        let p1 = free_port();
+        let mut p2 = free_port();
+        while p2 == p1 {
+            p2 = free_port();
+        }
+        let yaml = |ports: &[u16]| {
+            let list: Vec<String> = ports.iter().map(|p| p.to_string()).collect();
+            format!(
+                r#"
+applications:
+  - id: dyn
+    name: dyn
+    domains: {{ primary: "dyn.home.lan" }}
+    listen_ports: [{}]
+    upstreams: [{{ addr: 127.0.0.1, port: 9 }}]
+"#,
+                list.join(", ")
+            )
+        };
+        let path = dir.join(format!("homewaf-dyn-ports-{}.yaml", std::process::id()));
+        std::fs::write(&path, yaml(&[p1])).unwrap();
+
+        let state = crate::reload::load_state(&path, false, &homewaf_acl::NoFeedState)
+            .expect("配置应能加载");
+        let shared = crate::reload::shared(state);
+
+        let bans = Arc::new(BanTable::new(&Default::default(), 64));
+        let metrics = Arc::new(TrafficMetrics::new());
+        spawn_dynamic_port_watcher(
+            shared.clone(),
+            Default::default(),
+            std::time::Duration::from_millis(100),
+            false,
+            bans,
+            None,
+            metrics,
+            std::time::Duration::from_secs(300),
+        );
+
+        assert!(wait_listening(p1), "应用声明的端口 {p1} 应被监听");
+
+        // 第二版配置：同一应用追加 p2，替换运行时状态即等价于一次热重载
+        std::fs::write(&path, yaml(&[p1, p2])).unwrap();
+        let state2 = crate::reload::load_state(&path, false, &homewaf_acl::NoFeedState)
+            .expect("配置应能加载");
+        shared.store(Arc::new(state2));
+
+        assert!(wait_listening(p2), "新增端口 {p2} 应被热监听");
+        assert!(
+            std::net::TcpStream::connect_timeout(
+                &std::net::SocketAddr::from(([127, 0, 0, 1], p1)),
+                std::time::Duration::from_millis(200),
+            )
+            .is_ok(),
+            "原有端口 {p1} 不应因新增端口而中断"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 
     // ============================================================

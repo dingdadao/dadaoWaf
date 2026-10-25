@@ -1,12 +1,17 @@
 //! IP 访问控制。
 //!
 //! 匹配顺序（越具体越优先）：
-//! 1. 应用专属白名单 → 2. 应用专属黑名单
-//! 3. 全局白名单     → 4. 全局黑名单
-//! 5. 内网网段策略   → 6. 正常流程
+//! 1. 应用专属白名单 → 2. 应用专属手动黑名单
+//! 3. 全局白名单     → 4. 全局手动黑名单
+//! 5. 内网网段策略   → 6. 订阅黑名单 → 7. 正常流程
 //!
 //! 白名单永远优先于黑名单：用户显式加白某台机器，不应该被自动封禁推翻。
+//!
+//! 内网网段不参与订阅黑名单：公共订阅源常把 `10.0.0.0/8` 这类 bogon
+//! 整段收进来，会误伤内网回源与健康检查。管理员手写的黑名单仍然生效，
+//! 所以"内网放行"不是无条件的——只是不让外部订阅决定内网命运。
 
+pub mod aliyun;
 pub mod ban;
 pub mod feed;
 pub mod http;
@@ -42,6 +47,9 @@ pub struct AclRule {
     /// 到期时间（Unix 秒）；`None` 表示永久
     pub expires_at: Option<i64>,
     pub note: Option<String>,
+    /// 是否由 IP 组订阅生成。订阅覆盖全网，难免把内网段误收进来，
+    /// 所以内网网段不适用订阅黑名单，只适用手动规则。
+    pub from_feed: bool,
 }
 
 impl AclRule {
@@ -53,6 +61,7 @@ impl AclRule {
             scope: None,
             expires_at: None,
             note: None,
+            from_feed: false,
         }
     }
 
@@ -64,7 +73,14 @@ impl AclRule {
             scope: None,
             expires_at: None,
             note: None,
+            from_feed: false,
         }
+    }
+
+    /// 标记为订阅生成的规则。
+    pub fn from_feed(mut self) -> Self {
+        self.from_feed = true;
+        self
     }
 
     pub fn with_scope(mut self, app: impl Into<String>) -> Self {
@@ -135,7 +151,10 @@ impl Reason {
 #[derive(Debug, Clone, Default)]
 struct ScopeRules {
     allow: PrefixMap<RuleRef>,
+    /// 手动黑名单
     deny: PrefixMap<RuleRef>,
+    /// 订阅生成的黑名单，单独存放：内网网段需要能跳过它
+    feed_deny: PrefixMap<RuleRef>,
 }
 
 impl ScopeRules {
@@ -148,25 +167,38 @@ impl ScopeRules {
             RuleAction::Allow => {
                 self.allow.insert(rule.cidr, reference);
             }
+            RuleAction::Deny if rule.from_feed => {
+                self.feed_deny.insert(rule.cidr, reference);
+            }
             RuleAction::Deny => {
                 self.deny.insert(rule.cidr, reference);
             }
         }
     }
 
-    /// 返回 Some 表示命中（白或黑），None 表示无规则。
-    fn check(&self, ip: IpAddr) -> Option<Decision> {
-        if let Some(r) = self.allow.lookup(ip) {
-            return Some(Decision::Allow(Reason::ManualAllow { rule: r.id.clone() }));
-        }
-        if let Some(r) = self.deny.lookup(ip) {
-            return Some(Decision::Deny(Reason::ManualDeny { rule: r.id.clone() }));
-        }
-        None
+    /// 白名单命中。
+    fn check_allow(&self, ip: IpAddr) -> Option<Decision> {
+        self.allow
+            .lookup(ip)
+            .map(|r| Decision::Allow(Reason::ManualAllow { rule: r.id.clone() }))
+    }
+
+    /// 手动黑名单命中。
+    fn check_deny(&self, ip: IpAddr) -> Option<Decision> {
+        self.deny
+            .lookup(ip)
+            .map(|r| Decision::Deny(Reason::ManualDeny { rule: r.id.clone() }))
+    }
+
+    /// 订阅黑名单命中。
+    fn check_feed_deny(&self, ip: IpAddr) -> Option<Decision> {
+        self.feed_deny
+            .lookup(ip)
+            .map(|r| Decision::Deny(Reason::ManualDeny { rule: r.id.clone() }))
     }
 
     fn len(&self) -> usize {
-        self.allow.len() + self.deny.len()
+        self.allow.len() + self.deny.len() + self.feed_deny.len()
     }
 }
 
@@ -219,26 +251,46 @@ impl Acl {
     /// 判定某个 IP 在某个应用下的处置。
     pub fn check(&self, ip: IpAddr, app_id: Option<&str>) -> Decision {
         let ip = normalize(ip);
+        let private = self.is_private(ip);
 
-        // 应用专属规则优先（更具体）
+        // 1/2. 应用专属规则优先（更具体）
         if let Some(app) = app_id {
             if let Some(rules) = self.by_app.get(app) {
-                if let Some(d) = rules.check(ip) {
+                if let Some(d) = rules.check_allow(ip) {
                     return d;
+                }
+                if let Some(d) = rules.check_deny(ip) {
+                    return d;
+                }
+                // 内网网段不吃订阅黑名单（手动黑名单已在上面生效）
+                if !private {
+                    if let Some(d) = rules.check_feed_deny(ip) {
+                        return d;
+                    }
                 }
             }
         }
 
-        if let Some(d) = self.global.check(ip) {
+        // 3/4. 全局白名单 → 全局手动黑名单
+        if let Some(d) = self.global.check_allow(ip) {
+            return d;
+        }
+        if let Some(d) = self.global.check_deny(ip) {
             return d;
         }
 
-        if self.is_private(ip) {
+        // 5. 内网网段策略：公共订阅覆盖全网，不能让它决定内网流量的命运
+        if private {
             return match self.private_action {
                 PrivateNetworkAction::Allow => Decision::Allow(Reason::PrivateNetwork),
                 PrivateNetworkAction::Deny => Decision::Deny(Reason::PrivateNetwork),
                 PrivateNetworkAction::Normal => Decision::Normal,
             };
+        }
+
+        // 6. 订阅黑名单
+        if let Some(d) = self.global.check_feed_deny(ip) {
+            return d;
         }
 
         Decision::Normal
@@ -294,6 +346,7 @@ pub fn rules_from_config(config: &AclConfig) -> Vec<AclRule> {
             scope: r.scope.clone(),
             expires_at: r.expires_at,
             note: r.note.clone(),
+            from_feed: false,
         })
         .collect()
 }
@@ -331,15 +384,27 @@ pub fn load_group(
     group: &homewaf_config::IpGroup,
     previous: &[ipnet::IpNet],
 ) -> Result<(Vec<AclRule>, Vec<ipnet::IpNet>), String> {
-    let text = http::fetch(
-        &group.source.url,
-        group.source.timeout.0,
-        group.guards.max_response_bytes.as_bytes() as usize,
-        &group.source.headers,
-    )
-    .map_err(|e| format!("拉取失败：{e}"))?;
+    let max_bytes = group.guards.max_response_bytes.as_bytes() as usize;
+    let (text, format) = match group.source.kind {
+        homewaf_config::IpGroupSourceKind::Http => (
+            http::fetch(
+                &group.source.url,
+                group.source.timeout.0,
+                max_bytes,
+                &group.source.headers,
+            ),
+            group.source.format,
+        ),
+        // ESA 返回的是 JSON，这里先转成一行一个 CIDR 的文本，
+        // 后续解析与护栏完全复用普通订阅的路径。
+        homewaf_config::IpGroupSourceKind::AliyunEsa => (
+            aliyun::fetch_origin_ips(&group.source.aliyun, group.source.timeout.0, max_bytes),
+            homewaf_config::FeedFormat::Cidr,
+        ),
+    };
+    let text = text.map_err(|e| format!("拉取失败：{e}"))?;
 
-    let parsed = feed::parse(&text, group.source.format).map_err(|e| format!("解析失败：{e}"))?;
+    let parsed = feed::parse(&text, format).map_err(|e| format!("解析失败：{e}"))?;
 
     let entries = match feed::apply_guards(parsed.entries, previous, &group.guards) {
         feed::GuardOutcome::Accepted(v) => v,
@@ -508,6 +573,56 @@ mod tests {
     }
 
     #[test]
+    fn feed_deny_does_not_block_private_network() {
+        // 公共订阅常把 10.0.0.0/8 整段收进来，不能让它拦住内网
+        let rules = vec![AclRule::deny("feed:pub-firehol:0:global", net("10.0.0.0/8")).from_feed()];
+        let acl = Acl::build(&config(), &rules, 0);
+        assert_eq!(
+            acl.check(ip("10.0.0.31"), None),
+            Decision::Allow(Reason::PrivateNetwork)
+        );
+
+        // 公网地址不受影响
+        let rules =
+            vec![AclRule::deny("feed:pub-firehol:1:global", net("203.0.113.0/24")).from_feed()];
+        let acl = Acl::build(&config(), &rules, 0);
+        assert!(acl.check(ip("203.0.113.9"), None).is_denied());
+    }
+
+    #[test]
+    fn feed_deny_app_scope_skips_private_network() {
+        let rules = vec![AclRule::deny("feed:pub:0:nas", net("10.0.0.0/8"))
+            .from_feed()
+            .with_scope("nas")];
+        let acl = Acl::build(&config(), &rules, 0);
+        assert_eq!(
+            acl.check(ip("10.0.0.31"), Some("nas")),
+            Decision::Allow(Reason::PrivateNetwork)
+        );
+    }
+
+    #[test]
+    fn manual_deny_wins_over_feed_deny_on_private_network() {
+        let rules = vec![
+            AclRule::deny("feed:pub-firehol:0:global", net("10.0.0.0/8")).from_feed(),
+            AclRule::deny("ban-internal", net("10.0.0.31/32")),
+        ];
+        let acl = Acl::build(&config(), &rules, 0);
+        // 订阅黑名单跳过，但管理员手写的条目仍然生效
+        assert_eq!(
+            acl.check(ip("10.0.0.31"), None),
+            Decision::Deny(Reason::ManualDeny {
+                rule: "ban-internal".to_string()
+            })
+        );
+        assert_eq!(
+            acl.check(ip("10.0.0.32"), None),
+            Decision::Allow(Reason::PrivateNetwork)
+        );
+        assert_eq!(acl.rule_count(), 2);
+    }
+
+    #[test]
     fn app_scoped_rule_beats_global() {
         let rules = vec![
             AclRule::deny("global-deny", net("203.0.113.0/24")),
@@ -590,6 +705,8 @@ mod tests {
             enabled: true,
             source: IpGroupSource {
                 url: url.to_string(),
+                kind: Default::default(),
+                aliyun: Default::default(),
                 format: FeedFormat::Cidr,
                 interval: Duration::from_secs(3600),
                 timeout: Duration::from_secs(2),

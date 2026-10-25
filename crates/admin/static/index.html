@@ -1265,7 +1265,17 @@
             </div>
             <div><label for="sf-label">中文名称</label><input id="sf-label" placeholder="长亭恶意 IP 库"></div>
             <div><label for="sf-name">标识（英文，用于规则归属）</label><input id="sf-name" placeholder="chaitin" required></div>
-            <div class="wide"><label for="sf-url">订阅地址（必须 HTTPS）</label><input id="sf-url" placeholder="https://chaitin.cn/api/ip-group/xxxx" required></div>
+            <div class="wide" id="sf-url-row"><label for="sf-url">订阅地址（必须 HTTPS）</label><input id="sf-url" placeholder="https://chaitin.cn/api/ip-group/xxxx" required></div>
+            <div class="kind-ip"><label for="sf-source-kind">来源类型</label>
+              <select id="sf-source-kind" onchange="syncSubSource()">
+                <option value="http">HTTPS 列表</option>
+                <option value="aliyun_esa">阿里云 ESA 源站防护</option>
+              </select>
+            </div>
+            <div class="kind-ip src-esa"><label for="sf-esa-ak">AccessKey ID</label><input id="sf-esa-ak" placeholder="LTAI..." autocomplete="off"></div>
+            <div class="kind-ip src-esa"><label for="sf-esa-sk">AccessKey Secret</label><input id="sf-esa-sk" type="password" autocomplete="new-password"></div>
+            <div class="kind-ip src-esa"><label for="sf-esa-site">站点 ID（SiteId）</label><input id="sf-esa-site" placeholder="1234567890000"></div>
+            <div class="kind-ip src-esa"><label for="sf-esa-region">地域</label><input id="sf-esa-region" value="cn-hangzhou" placeholder="cn-hangzhou"></div>
             <div><label for="sf-interval">拉取间隔</label><input id="sf-interval" value="1h" placeholder="1h"></div>
             <div><label for="sf-timeout">拉取超时</label><input id="sf-timeout" value="15s" placeholder="15s"></div>
 
@@ -2021,7 +2031,7 @@ const esc = (s) => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&l
 const fmtDuration = (secs) => secs >= 3600 ? Math.floor(secs/3600)+' 小时'
   : secs >= 60 ? Math.floor(secs/60)+' 分钟' : secs+' 秒';
 const fmtTime = (ts) => new Date(ts * 1000).toLocaleString('zh-CN', { hour12: false });
-const actionLabel = (a) => ({ allow: '放行', block: '拒绝', challenge: '人机验证', log: '仅记录', observe: '观察' }[a] || a);
+const actionLabel = (a) => ({ allow: '放行', block: '拒绝', challenge: '人机验证', log: '仅记录', observe: '观察', issue: '下发挑战', pass: '验证通过', fail: '验证失败', ban: '封禁' }[a] || a);
 const kindLabel = (k) => ({ detect: '检测', ban: '封禁', acl: 'ACL', ratelimit: 'CC 限流', challenge: '人机验证' }[k] || k);
 /// 把后端返回的 "30m" / "2h" / "90s" 转成秒，供输入框编辑
 const durationToSecs = (d) => {
@@ -4201,7 +4211,7 @@ function defaultSubConfig(kind) {
   if (kind === 'ip_list') {
     return {
       name: '', label: '', enabled: true,
-      source: { url: '', format: 'auto', interval: '1h', timeout: '15s', headers: {} },
+      source: { kind: 'http', url: '', format: 'auto', interval: '1h', timeout: '15s', headers: {} },
       action: 'block', scope: [], expires: '24h', guards: {}, on_failure: 'keep-last',
     };
   }
@@ -4259,6 +4269,18 @@ function syncSubKind() {
   document.getElementById('sub-hint').textContent = kind === 'ip_list'
     ? 'IP 组订阅拉取 CIDR 列表，命中后按「命中动作」放行或拦截；作用域留空表示对所有应用生效。'
     : '规则包订阅拉取签名规则，影子期内新规则只记录不拦截；更新窗口按 UTC 计算，支持跨午夜（如 23:00-01:00）。';
+  syncSubSource();
+}
+
+/// IP 组的来源类型：HTTPS 列表填 URL；阿里云 ESA 直接调 OpenAPI 取回源网段。
+function syncSubSource() {
+  const esat = document.getElementById('sf-source-kind').value === 'aliyun_esa';
+  document.querySelectorAll('#sub-form .src-esa').forEach(el => el.style.display = esat ? '' : 'none');
+  const url = document.getElementById('sf-url');
+  url.disabled = esat;
+  url.required = !esat;
+  document.getElementById('sf-url-row').style.display =
+    esat && document.getElementById('sf-kind').value === 'ip_list' ? 'none' : '';
 }
 
 // 新建时切换类型要连带换掉默认值，否则会带着上一类的间隔/超时提交
@@ -4300,6 +4322,11 @@ function showSubForm(sub) {
   set('sf-label', cfg.label);
   set('sf-name', cfg.name);
   set('sf-url', kind === 'ip_list' ? cfg.source?.url : cfg.url);
+  set('sf-source-kind', kind === 'ip_list' ? (cfg.source?.kind || 'http') : 'http');
+  set('sf-esa-ak', cfg.source?.aliyun?.access_key_id);
+  set('sf-esa-sk', cfg.source?.aliyun?.access_key_secret);
+  set('sf-esa-site', cfg.source?.aliyun?.site_id);
+  set('sf-esa-region', cfg.source?.aliyun?.region || 'cn-hangzhou');
   set('sf-interval', kind === 'ip_list' ? cfg.source?.interval : cfg.check_interval);
   set('sf-timeout', kind === 'ip_list' ? cfg.source?.timeout : cfg.timeout);
   set('sf-action', cfg.action || 'block');
@@ -4344,9 +4371,10 @@ async function submitSub(e) {
   const url = document.getElementById('sf-url').value.trim();
   const interval = document.getElementById('sf-interval').value.trim();
   const timeout = document.getElementById('sf-timeout').value.trim();
+  const srcKind = kind === 'ip_list' ? document.getElementById('sf-source-kind').value : 'http';
 
   if (!/^[A-Za-z0-9_-]{1,64}$/.test(name)) return showMsg('标识只能包含字母、数字、横线和下划线（最多 64 字符）', 'error');
-  if (!url.startsWith('https://')) return showMsg('订阅地址必须是 HTTPS（明文 HTTP 可能被中间人投毒）', 'error');
+  if (srcKind === 'http' && !url.startsWith('https://')) return showMsg('订阅地址必须是 HTTPS（明文 HTTP 可能被中间人投毒）', 'error');
 
   // 以原配置为基底改字段：guards、headers、expires 这些表单里没有的项才不会被清掉
   const cfg = editingSub ? JSON.parse(JSON.stringify(editingSub.config)) : defaultSubConfig(kind);
@@ -4356,11 +4384,23 @@ async function submitSub(e) {
 
   if (kind === 'ip_list') {
     cfg.source = cfg.source || {};
-    cfg.source.url = url;
+    cfg.source.kind = srcKind;
     cfg.source.interval = interval || '1h';
     cfg.source.timeout = timeout || '15s';
     cfg.source.format = cfg.source.format || 'auto';
     cfg.source.headers = cfg.source.headers || {};
+    if (srcKind === 'aliyun_esa') {
+      const ak = document.getElementById('sf-esa-ak').value.trim();
+      const sk = document.getElementById('sf-esa-sk').value.trim();
+      const site = document.getElementById('sf-esa-site').value.trim();
+      const region = document.getElementById('sf-esa-region').value.trim() || 'cn-hangzhou';
+      if (!ak || !sk || !site) return showMsg('阿里云 ESA 订阅需要 AccessKey ID、AccessKey Secret 与站点 ID', 'error');
+      cfg.source.url = '';
+      cfg.source.aliyun = { access_key_id: ak, access_key_secret: sk, site_id: site, region };
+    } else {
+      cfg.source.url = url;
+      delete cfg.source.aliyun;
+    }
     cfg.action = document.getElementById('sf-action').value;
     cfg.scope = [...document.getElementById('sf-scope').selectedOptions].map(o => o.value);
   } else {
@@ -4468,8 +4508,12 @@ async function loadEvents() {
       el.innerHTML = '<div class="empty">没有符合条件的事件</div>';
       pager.innerHTML = ''; return;
     }
+    const scoreHeader = kind === 'ratelimit' ? 'QPS'
+      : kind === 'ban' ? '累计分'
+      : kind === 'challenge' ? '风险分'
+      : '分数';
     el.innerHTML = `<table>
-      <thead><tr><th>时间</th><th>类型</th><th>来源 IP</th><th>请求</th><th>命中规则</th><th>分数</th><th>处置</th><th>应用</th><th></th></tr></thead>
+      <thead><tr><th>时间</th><th>类型</th><th>来源 IP</th><th>请求</th><th>命中规则</th><th>风险标签</th><th>${scoreHeader}</th><th>处置</th><th>应用</th><th></th></tr></thead>
       <tbody>${events.map((e, i) => `<tr>
         <td style="white-space:nowrap">${fmtTime(e.ts)}</td>
         <td>${esc(kindLabel(e.kind))}</td>
@@ -4479,6 +4523,7 @@ async function loadEvents() {
           ${e.query ? `<div class="sub" style="margin:2px 0 0;word-break:break-all">?${esc(e.query)}</div>` : ''}
         </td>
         <td style="max-width:280px;word-break:break-all">${esc(ruleLabel(e.rule_names || e.rules))}</td>
+        <td style="max-width:200px;word-break:break-all">${riskTagsHtml(e.risk_tags)}</td>
         <td>${e.score}</td>
         <td><span class="tag ${esc(e.action)}">${esc(actionLabel(e.action))}</span></td>
         <td>${esc(appLabel(e.app))}</td>
@@ -4499,6 +4544,25 @@ async function loadEvents() {
 
 let eventCache = [];
 let appNames = {};
+
+/// 风险标签的展示名。未知标签原样显示，避免升级时漏展示。
+const RISK_TAG_LABEL = {
+  automation_reported: '自报自动化',
+  fingerprint_forged: '指纹伪造',
+  fingerprint_missing: '指纹缺失',
+  fingerprint_replay: '指纹复用',
+  headless_ua: '无头 UA',
+  ua_ch_mismatch: 'UA 矛盾',
+  challenge_failed: '验证失败',
+  cc_burst: 'CC 突发',
+  slider_failed: '滑块失败',
+};
+
+function riskTagsHtml(raw) {
+  if (!raw) return '—';
+  return raw.split(',').filter(Boolean)
+    .map(t => `<span class="tag">${esc(RISK_TAG_LABEL[t] || t)}</span>`).join(' ');
+}
 
 /// 规则 id → 展示名（内置检测规则 + 自定义检测规则）
 let ruleNames = null;
@@ -4548,6 +4612,7 @@ function showEventDetail(i) {
     ['User-Agent', e.user_agent ? `<span style="word-break:break-all">${esc(e.user_agent)}</span>` : '—'],
     ['命中规则 ID', `<code>${esc(e.rules || '-')}</code>`],
     ['命中规则名称', esc(ruleLabel(e.rule_names || e.rules))],
+    ['风险标签', riskTagsHtml(e.risk_tags)],
     ['风险分', String(e.score ?? 0)],
     ['请求 ID', e.request_id
       ? `<code>${esc(e.request_id)}</code> <button onclick="gotoLogsByReq('${esc(e.request_id)}')">查看日志</button>`
@@ -4901,9 +4966,16 @@ function renderSettings(s) {
         启用（前面有 CDN / Tunnel / frp 时必开）</label>
       <div class="wide"><label for="set-trusted">可信代理网段（逗号分隔）</label>
         <input id="set-trusted" placeholder="127.0.0.1/32, 10.0.0.0/8" value="${(ri.trusted_proxies || []).join(', ')}"></div>
+      <div class="wide"><label for="set-trusted-groups">可信代理订阅组（可多选，与上面取并集）</label>
+        <div class="ms" data-empty="未选择订阅组">
+          <button type="button" class="ms-btn" onclick="msToggle(event, this)"><span>未选择订阅组</span></button>
+          <div class="ms-menu"></div>
+          <select id="set-trusted-groups" multiple hidden></select>
+        </div></div>
       <div class="wide"><label for="set-headers">头部优先级（逗号分隔）</label>
         <input id="set-headers" placeholder="CF-Connecting-IP, X-Real-IP" value="${(ri.header_priority || []).join(', ')}"></div>
-      <div class="hint">只有来自可信代理的请求才会解析这些头，其余一律用直连 IP。</div>
+      <div class="hint">只有来自可信代理的请求才会解析这些头，其余一律用直连 IP。
+        云 CDN / 回源节点网段会变，选订阅组（需为「放行」动作）可自动跟上。</div>
     </div>
     <div class="fieldset">
       <h3>CC 防护（限流）</h3>
@@ -4929,6 +5001,13 @@ function renderSettings(s) {
         <input type="number" id="set-ch-difficulty" min="1" max="8" value="${ch.difficulty ?? 4}"></div>
       <div><label for="set-ch-ttl">通过后免验证时长（秒）</label>
         <input type="number" id="set-ch-ttl" min="30" value="${durationToSecs(ch.ttl ?? '30m')}"></div>
+      <label class="row"><input type="checkbox" id="set-ch-slider" ${ch.slider ? 'checked' : ''}>
+        中风险时启用滑块轨迹验证（本期预留，暂不渲染）</label>
+      <div><label for="set-ch-risk-challenge">风险分挑战阈值</label>
+        <input type="number" id="set-ch-risk-challenge" min="1" max="100" value="${ch.risk_challenge_threshold ?? 30}"></div>
+      <div><label for="set-ch-risk-block">风险分拦截阈值</label>
+        <input type="number" id="set-ch-risk-block" min="2" max="100" value="${ch.risk_block_threshold ?? 60}"></div>
+      <div class="hint">风险分按 IP 累计（600 秒窗口）：达到挑战阈值要求人机验证，达到拦截阈值直接 403。拦截阈值必须大于挑战阈值。</div>
       <div class="hint">难度每加 1 计算量约翻 16 倍。浏览器用纯 JS 计算，家用设备建议 4–5；纯 HTTP 环境也可用（不依赖 crypto.subtle）。</div>
     </div>
     <div class="fieldset">
@@ -4939,6 +5018,21 @@ function renderSettings(s) {
       <div class="hint">用于统计报表与防护大屏的访问来源地图。只在控制台聚合时查询，不影响代理转发；留空时地图显示「未启用地理位置」。<br>
         默认下载源 <code>https://cdn.jsdelivr.net/npm/geolite2-city/GeoLite2-City.mmdb.gz</code>，下载后自动解压到数据目录、写入路径并立即生效。</div>
     </div>`;
+  fillTrustedGroups(ri.trusted_proxy_groups || []);
+}
+
+/// 填充「可信代理订阅组」多选：只列 IP 组订阅，值是组名。
+async function fillTrustedGroups(selected) {
+  const sel = document.getElementById('set-trusted-groups');
+  if (!sel) return;
+  const picked = new Set(selected || []);
+  let items = [];
+  try { items = (await api('/subscriptions')).items || []; } catch { /* 拉不到就先空着 */ }
+  const groups = items.filter(i => i.kind === 'ip_list');
+  sel.innerHTML = groups.length
+    ? groups.map(g => `<option value="${esc(g.name)}"${picked.has(g.name) ? ' selected' : ''}>${esc(g.display_name)}（${esc(g.name)}）</option>`).join('')
+    : '<option value="" disabled>暂无 IP 组订阅</option>';
+  msRender('set-trusted-groups');
 }
 
 async function saveSettings() {
@@ -4960,6 +5054,11 @@ async function saveSettings() {
     const ri = { ...settingsCache.real_ip };
     ri.enabled = document.getElementById('set-realip').checked;
     ri.trusted_proxies = listVal('set-trusted');
+    // 订阅列表还没加载出来时不要用空值覆盖已有配置
+    const tg = document.getElementById('set-trusted-groups');
+    if (tg && [...tg.options].some(o => !o.disabled)) {
+      ri.trusted_proxy_groups = [...tg.selectedOptions].map(o => o.value);
+    }
     ri.header_priority = listVal('set-headers');
 
     const rl = { ...settingsCache.ratelimit };
@@ -4974,6 +5073,11 @@ async function saveSettings() {
     ch.enabled = document.getElementById('set-ch-enabled').checked;
     ch.difficulty = Math.min(8, Math.max(1, numVal('set-ch-difficulty')));
     ch.ttl = Math.max(30, numVal('set-ch-ttl')) + 's';
+    ch.slider = document.getElementById('set-ch-slider').checked;
+    const riskChallenge = Math.max(1, numVal('set-ch-risk-challenge'));
+    // 拦截阈值必须严格大于挑战阈值，与服务端阈值归一化保持一致
+    ch.risk_challenge_threshold = riskChallenge;
+    ch.risk_block_threshold = Math.max(riskChallenge + 1, numVal('set-ch-risk-block'));
 
     await api('/settings/protection', { method: 'PUT', body: JSON.stringify(p) });
     await api('/settings/acl', { method: 'PUT', body: JSON.stringify(acl) });
@@ -5114,18 +5218,19 @@ function renderAttackEvents(res) {
   }
   el.innerHTML = `<table>
     <thead><tr><th>时间</th><th>类型</th><th>来源 IP</th><th>应用</th><th>路径</th>
-      <th>命中规则</th><th>分数</th><th>处置</th><th>操作</th></tr></thead>
+      <th>命中规则</th><th>风险标签</th><th>分数</th><th>处置</th><th>操作</th></tr></thead>
     <tbody>${events.map(e => {
       const rid = 'atk-' + e.id;
       return `<tr style="cursor:pointer" onclick="toggleRaw('${rid}')">
         <td>${fmtTime(e.ts)}</td><td>${esc(kindLabel(e.kind))}</td>
         <td><code>${esc(e.client_ip)}</code></td><td>${esc(appLabel(e.app))}</td>
         <td class="mono" title="${esc(e.path)}">${esc(e.path)}</td>
-        <td><code>${esc(ruleLabel(e.rule_names || e.rules))}</code></td><td>${e.score}</td>
+        <td><code>${esc(ruleLabel(e.rule_names || e.rules))}</code></td>
+        <td>${riskTagsHtml(e.risk_tags)}</td><td>${e.score}</td>
         <td><span class="tag ${esc(e.action)}">${esc(actionLabel(e.action))}</span></td>
         <td><button onclick="event.stopPropagation();banAttackIp('${esc(e.client_ip)}')">封禁</button></td>
       </tr>
-      <tr class="rawrow hidden" id="raw-${rid}"><td colspan="9"><pre>${esc(JSON.stringify(e, null, 2))}</pre></td></tr>`;
+      <tr class="rawrow hidden" id="raw-${rid}"><td colspan="10"><pre>${esc(JSON.stringify(e, null, 2))}</pre></td></tr>`;
     }).join('')}</tbody></table>`;
 
   const pages = Math.max(1, Math.ceil(total / ATTACK_PAGE_SIZE));

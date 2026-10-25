@@ -346,6 +346,8 @@ pub fn sync(store: &Store, req: &SyncRequest) -> Result<SyncReport, String> {
                 enabled: true,
                 source: IpGroupSource {
                     url: feed.url.clone(),
+                    kind: homewaf_config::IpGroupSourceKind::Http,
+                    aliyun: Default::default(),
                     format: homewaf_config::FeedFormat::Cidr,
                     interval: homewaf_config::Duration::from_secs(3600),
                     timeout: homewaf_config::Duration::from_secs(15),

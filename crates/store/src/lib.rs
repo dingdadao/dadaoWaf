@@ -101,6 +101,8 @@ pub struct Event {
     /// 查询串（不含 `?`）
     pub query: String,
     pub user_agent: String,
+    /// 风险标签（逗号分隔），如 `fingerprint_forged,headless_ua`
+    pub risk_tags: String,
 }
 
 impl Event {
@@ -121,6 +123,7 @@ impl Event {
             method: String::new(),
             query: String::new(),
             user_agent: String::new(),
+            risk_tags: String::new(),
         }
     }
 
@@ -146,6 +149,11 @@ impl Event {
 
     pub fn with_rule_names(mut self, names: impl Into<String>) -> Self {
         self.rule_names = names.into();
+        self
+    }
+
+    pub fn with_risk_tags(mut self, tags: impl Into<String>) -> Self {
+        self.risk_tags = tags.into();
         self
     }
 
@@ -327,7 +335,8 @@ impl Store {
                 method    TEXT NOT NULL DEFAULT '',
                 query     TEXT NOT NULL DEFAULT '',
                 ua        TEXT NOT NULL DEFAULT '',
-                rule_names TEXT NOT NULL DEFAULT ''
+                rule_names TEXT NOT NULL DEFAULT '',
+                risk_tags TEXT NOT NULL DEFAULT ''
             );
             CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts DESC);
 
@@ -459,11 +468,17 @@ impl Store {
             ("query", "TEXT NOT NULL DEFAULT ''"),
             ("ua", "TEXT NOT NULL DEFAULT ''"),
             ("rule_names", "TEXT NOT NULL DEFAULT ''"),
+            ("risk_tags", "TEXT NOT NULL DEFAULT ''"),
         ] {
             ensure_column(&conn, "events", column, decl);
         }
         // 流量分钟表同理：detail 是后加的列，老库必须能平滑升级。
-        ensure_column(&conn, "traffic_minutes", "detail", "TEXT NOT NULL DEFAULT ''");
+        ensure_column(
+            &conn,
+            "traffic_minutes",
+            "detail",
+            "TEXT NOT NULL DEFAULT ''",
+        );
         Ok(())
     }
 
@@ -552,8 +567,8 @@ impl Store {
         conn.execute(
             r#"
             INSERT INTO events (ts, kind, client_ip, app, path, rules, score, action,
-                                request_id, method, query, ua, rule_names)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                                request_id, method, query, ua, rule_names, risk_tags)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
             "#,
             params![
                 event.ts,
@@ -568,7 +583,8 @@ impl Store {
                 event.method,
                 event.query,
                 event.user_agent,
-                event.rule_names
+                event.rule_names,
+                event.risk_tags
             ],
         )?;
         Ok(conn.last_insert_rowid())
@@ -622,7 +638,7 @@ impl Store {
             let mut stmt = conn.prepare(
                 r#"
                 SELECT id, ts, kind, client_ip, app, path, rules, score, action,
-                       request_id, method, query, ua, rule_names
+                       request_id, method, query, ua, rule_names, risk_tags
                 FROM events
                 WHERE (?1 IS NULL OR kind = ?1)
                   AND (?2 IS NULL OR client_ip = ?2)
@@ -670,6 +686,7 @@ impl Store {
                         query: row.get(11)?,
                         user_agent: row.get(12)?,
                         rule_names: row.get(13)?,
+                        risk_tags: row.get(14)?,
                     })
                 },
             )?;
@@ -1463,7 +1480,8 @@ mod tests {
             .with_path("/api")
             .with_rules("sqli-union-select")
             .with_score(50)
-            .with_action("block");
+            .with_action("block")
+            .with_risk_tags("fingerprint_forged,challenge_failed");
         let id = s.insert_event(&e).unwrap();
         assert!(id > 0);
 
@@ -1472,6 +1490,7 @@ mod tests {
         assert_eq!(events[0].kind, EventKind::Detect);
         assert_eq!(events[0].client_ip, "203.0.113.9");
         assert_eq!(events[0].score, 50);
+        assert_eq!(events[0].risk_tags, "fingerprint_forged,challenge_failed");
     }
 
     #[test]

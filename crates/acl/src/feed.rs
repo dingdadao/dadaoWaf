@@ -81,13 +81,15 @@ pub fn parse(input: &str, format: FeedFormat) -> Result<ParsedFeed, FeedError> {
     }
 }
 
-/// 逐行解析，支持 `#` 注释、空行、行尾注释。
+/// 逐行解析，支持 `#` 与 `;` 注释、空行、行尾注释。
+///
+/// `;` 是为了兼容 Spamhaus DROP 这类格式：`1.2.3.0/24 ; SBL123456`。
 fn parse_lines(input: &str) -> ParsedFeed {
     let mut entries = Vec::new();
     let mut skipped = 0;
 
     for line in input.lines() {
-        let content = line.split('#').next().unwrap_or("").trim();
+        let content = line.split(['#', ';']).next().unwrap_or("").trim();
         if content.is_empty() {
             continue;
         }
@@ -251,6 +253,7 @@ pub fn rules_from_group(group: &homewaf_config::IpGroup, entries: &[IpNet]) -> V
                 scope: scope.clone(),
                 expires_at: None,
                 note: Some(format!("订阅 {}", group.name)),
+                from_feed: true,
             });
         }
     }
@@ -286,6 +289,15 @@ mod tests {
         let input = "# 这是注释\n1.2.3.0/24\n\n10.0.0.1  # 行尾注释\n";
         let r = parse(input, FeedFormat::Cidr).unwrap();
         assert_eq!(r.entries.len(), 2);
+    }
+
+    #[test]
+    fn parses_semicolon_comments() {
+        // Spamhaus DROP 的格式：`;` 注释行 + `CIDR ; 编号` 行尾注释
+        let input = "; Spamhaus DROP List\n1.10.16.0/20 ; SBL256894\n\n2.26.75.0/24 ; SBL698389\n";
+        let r = parse(input, FeedFormat::Cidr).unwrap();
+        assert_eq!(r.entries, vec![net("1.10.16.0/20"), net("2.26.75.0/24")]);
+        assert_eq!(r.skipped, 0);
     }
 
     #[test]
@@ -511,6 +523,8 @@ mod tests {
             enabled: true,
             source: IpGroupSource {
                 url: "https://example.com/list".to_string(),
+                kind: Default::default(),
+                aliyun: Default::default(),
                 format: FeedFormat::Auto,
                 interval: Duration::from_secs(3600),
                 timeout: Duration::from_secs(15),

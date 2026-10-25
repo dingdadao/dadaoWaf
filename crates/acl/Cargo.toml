@@ -9,8 +9,11 @@ rust-version.workspace = true
 [dependencies]
 homewaf-config = { path = "../config" }
 ipnet.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing = "0.1"
 # 订阅拉取。默认特性即 rustls + gzip，纯 Rust 不需要 C 工具链
 ureq = "3"
+# 阿里云 ESA 订阅的 V3 签名（HMAC-SHA256），复用 rustls 已引入的 ring
+ring = "0.17"

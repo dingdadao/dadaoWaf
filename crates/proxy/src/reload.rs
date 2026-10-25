@@ -121,6 +121,10 @@ impl RuntimeState {
         // 规则 id 形如 `feed:{组名}:{序号}:{作用域}`，这里从 id 反解组名。
         let ip_groups = group_snapshot(&feed_rules);
 
+        // 可信代理网段 = 手工填写 + 订阅组条目。云回源 IP 会变，靠订阅自动跟上。
+        let mut real_ip = config.real_ip;
+        merge_trusted_groups(&mut real_ip, &config.ip_groups, &ip_groups);
+
         let mut rules = homewaf_acl::rules_from_config(&config.acl);
         rules.extend(feed_rules);
         let acl = Acl::build(&config.acl, &rules, homewaf_acl::now_unix());
@@ -160,7 +164,7 @@ impl RuntimeState {
             router,
             acl,
             pool,
-            real_ip: config.real_ip,
+            real_ip,
             engine,
             policies,
             limiter: Arc::new(RateLimiter::new()),
@@ -290,8 +294,61 @@ fn group_snapshot(
     map
 }
 
+/// 把订阅 IP 组里的网段并入可信代理列表。
+///
+/// 与手工填写的 `trusted_proxies` 取并集：云厂商回源节点网段会变，
+/// 订阅更新后自动生效，不用改设置。
+///
+/// **只接受「放行」动作的组**。可信代理意味着信任该来源的转发头，
+/// 若拿黑名单组当可信代理，被拉黑的攻击者只要伪造 `X-Forwarded-For`
+/// 就能把客户端 IP 换成放行网段，直接绕过 ACL。
+fn merge_trusted_groups(
+    real_ip: &mut RealIpConfig,
+    groups: &[homewaf_config::IpGroup],
+    snapshot: &std::collections::HashMap<String, Vec<IpNet>>,
+) {
+    if real_ip.trusted_proxy_groups.is_empty() {
+        return;
+    }
+
+    let mut added = 0usize;
+    for name in &real_ip.trusted_proxy_groups {
+        let Some(group) = groups.iter().find(|g| &g.name == name) else {
+            tracing::warn!(group = %name, "真实 IP 可信代理组不存在，已忽略");
+            continue;
+        };
+        if group.action != homewaf_config::IpGroupAction::Allow {
+            tracing::warn!(
+                group = %name,
+                "可信代理组必须是「放行」动作，已忽略（否则可伪造客户端 IP 绕过 ACL）"
+            );
+            continue;
+        }
+        match snapshot.get(name) {
+            Some(entries) if !entries.is_empty() => {
+                added += entries.len();
+                real_ip.trusted_proxies.extend(entries.iter().copied());
+            }
+            _ => tracing::warn!(group = %name, "可信代理组还没有条目（未拉到或已停用），本次跳过"),
+        }
+    }
+
+    if added == 0 {
+        return;
+    }
+    real_ip.trusted_proxies.sort();
+    real_ip.trusted_proxies.dedup();
+    if real_ip.trusted_proxies.len() > 512 {
+        tracing::warn!(
+            count = real_ip.trusted_proxies.len(),
+            "可信代理网段超过 512 条，逐请求匹配的开销会上升"
+        );
+    }
+}
+
 /// 共享的运行时状态句柄。
 pub type SharedState = Arc<ArcSwap<RuntimeState>>;
+
 /// 把状态包成可热替换的共享句柄。
 pub fn shared(state: RuntimeState) -> SharedState {
     Arc::new(ArcSwap::from_pointee(state))
@@ -662,5 +719,87 @@ applications:
             state.previous("b")[0],
             "2.2.2.0/24".parse::<IpNet>().unwrap()
         );
+    }
+
+    // ============================================================
+    // 可信代理由订阅组补充
+    // ============================================================
+
+    fn real_ip_cfg(groups: &[&str], manual: &[&str]) -> RealIpConfig {
+        RealIpConfig {
+            enabled: true,
+            trusted_proxies: manual.iter().map(|s| s.parse().unwrap()).collect(),
+            trusted_proxy_groups: groups.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn ip_group(name: &str, action: homewaf_config::IpGroupAction) -> homewaf_config::IpGroup {
+        serde_json::from_value(serde_json::json!({
+            "name": name,
+            "source": { "url": "https://example.com/list" },
+            "action": action,
+        }))
+        .unwrap()
+    }
+
+    fn snapshot(pairs: &[(&str, &[&str])]) -> std::collections::HashMap<String, Vec<IpNet>> {
+        pairs
+            .iter()
+            .map(|(name, nets)| {
+                (
+                    name.to_string(),
+                    nets.iter().map(|n| n.parse().unwrap()).collect(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn allow_group_merged_into_trusted_proxies() {
+        let groups = vec![ip_group("esa", homewaf_config::IpGroupAction::Allow)];
+        let snap = snapshot(&[("esa", &["2408:8752:0:5:2::/64", "42.48.120.0/24"])]);
+        let mut cfg = real_ip_cfg(&["esa"], &["10.0.0.0/8"]);
+
+        merge_trusted_groups(&mut cfg, &groups, &snap);
+
+        assert_eq!(cfg.trusted_proxies.len(), 3, "手工 + 订阅取并集");
+        assert!(cfg
+            .trusted_proxies
+            .contains(&"2408:8752:0:5:2::/64".parse::<IpNet>().unwrap()));
+    }
+
+    #[test]
+    fn block_group_is_never_trusted() {
+        // 黑名单组当可信代理等于允许这些 IP 伪造 XFF 绕过 ACL
+        let groups = vec![ip_group("bad", homewaf_config::IpGroupAction::Block)];
+        let snap = snapshot(&[("bad", &["1.2.3.0/24"])]);
+        let mut cfg = real_ip_cfg(&["bad"], &[]);
+
+        merge_trusted_groups(&mut cfg, &groups, &snap);
+
+        assert!(cfg.trusted_proxies.is_empty(), "黑名单组必须被忽略");
+    }
+
+    #[test]
+    fn missing_or_empty_group_is_ignored() {
+        let groups = vec![ip_group("esa", homewaf_config::IpGroupAction::Allow)];
+        let mut cfg = real_ip_cfg(&["esa", "typo"], &[]);
+
+        // esa 还没拉到条目；typo 根本不存在 —— 都不应 panic，也不应改动配置
+        merge_trusted_groups(&mut cfg, &groups, &snapshot(&[]));
+
+        assert!(cfg.trusted_proxies.is_empty());
+    }
+
+    #[test]
+    fn duplicate_nets_are_deduped() {
+        let groups = vec![ip_group("esa", homewaf_config::IpGroupAction::Allow)];
+        let snap = snapshot(&[("esa", &["42.48.120.0/24", "42.48.120.0/24"])]);
+        let mut cfg = real_ip_cfg(&["esa"], &["42.48.120.0/24"]);
+
+        merge_trusted_groups(&mut cfg, &groups, &snap);
+
+        assert_eq!(cfg.trusted_proxies.len(), 1);
     }
 }

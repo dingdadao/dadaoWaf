@@ -227,7 +227,10 @@ fn validate_real_ip(real_ip: &RealIpConfig, ctx: &mut Ctx) {
     if !real_ip.enabled {
         return;
     }
-    if real_ip.trusted_proxies.is_empty() && real_ip.preset.is_none() {
+    if real_ip.trusted_proxies.is_empty()
+        && real_ip.trusted_proxy_groups.is_empty()
+        && real_ip.preset.is_none()
+    {
         ctx.warn(
             "real_ip.trusted_proxies",
             "已启用真实 IP 还原但未配置可信网段，所有转发头都会被忽略",
@@ -462,8 +465,36 @@ fn validate_ip_groups(groups: &[IpGroup], apps: &[Application], ctx: &mut Ctx) {
         }
         validate_label(&g.label, &base, ctx);
 
-        if !g.source.url.starts_with("https://") {
-            ctx.error(format!("{base}.source.url"), "订阅地址必须使用 HTTPS");
+        match g.source.kind {
+            crate::IpGroupSourceKind::Http => {
+                if !g.source.url.starts_with("https://") {
+                    ctx.error(format!("{base}.source.url"), "订阅地址必须使用 HTTPS");
+                }
+            }
+            crate::IpGroupSourceKind::AliyunEsa => {
+                let a = &g.source.aliyun;
+                if a.access_key_id.trim().is_empty() {
+                    ctx.error(
+                        format!("{base}.source.aliyun.access_key_id"),
+                        "缺少 AccessKey ID",
+                    );
+                }
+                if a.access_key_secret.trim().is_empty() {
+                    ctx.error(
+                        format!("{base}.source.aliyun.access_key_secret"),
+                        "缺少 AccessKey Secret",
+                    );
+                }
+                if a.site_id.trim().is_empty() {
+                    ctx.error(
+                        format!("{base}.source.aliyun.site_id"),
+                        "缺少站点 ID（SiteId）",
+                    );
+                }
+                if a.region.trim().is_empty() {
+                    ctx.error(format!("{base}.source.aliyun.region"), "缺少地域");
+                }
+            }
         }
         if g.source.interval.as_secs() < 60 {
             ctx.error(format!("{base}.source.interval"), "拉取周期不能短于 60 秒");
@@ -1545,6 +1576,8 @@ mod tests {
                 enabled: true,
                 source: IpGroupSource {
                     url: "http://example.com/list".to_string(),
+                    kind: crate::IpGroupSourceKind::Http,
+                    aliyun: Default::default(),
                     format: FeedFormat::Auto,
                     interval: crate::units::Duration::from_secs(3600),
                     timeout: crate::units::Duration::from_secs(15),

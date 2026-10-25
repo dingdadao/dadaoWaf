@@ -233,13 +233,14 @@ fn alias_domain_routes_to_same_upstream() {
 }
 
 #[test]
-fn unknown_host_returns_404_without_touching_upstream() {
+fn unknown_host_is_denied_without_touching_upstream() {
     let upstream = Upstream::start("should-not-appear");
     let cfg = write_config("unknown", &config_for(upstream.port));
     let proxy = Proxy::start(&cfg);
 
+    // 未配置的域名 / 直接用 IP 访问：默认拒绝（403），且不透传到后端
     let resp = http_get(proxy.port, "evil.example.com", "/");
-    assert_eq!(status_of(&resp), 404);
+    assert_eq!(status_of(&resp), 403);
     assert!(
         !resp.contains("should-not-appear"),
         "未配置域名不能透传到后端: {resp}"

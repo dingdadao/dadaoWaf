@@ -13,6 +13,7 @@ pub mod metrics;
 pub mod policy;
 pub mod realip;
 pub mod reload;
+pub mod risk;
 pub mod rulefeed;
 mod server;
 pub mod tamper;

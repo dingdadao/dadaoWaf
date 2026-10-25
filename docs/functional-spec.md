@@ -489,6 +489,9 @@ real_ip:
     - 2c0f:f248::/32
     - 127.0.0.1/32                       # 本机 cloudflared
     - ::1/128
+  trusted_proxy_groups: []               # 从 IP 组订阅补充可信网段（组名，可多选）
+                                         # 与 trusted_proxies 取并集；云回源节点网段变化时
+                                         # 靠订阅自动跟上，不用手工改设置
   header_priority:                       # 按顺序尝试，首个有效值生效
     - CF-Connecting-IP
     - True-Client-IP
@@ -498,6 +501,8 @@ real_ip:
   on_untrusted_header: ignore            # ignore | reject（reject 返回 400）
   log_both: true                         # 日志同时记录直连 IP 与还原 IP
 ```
+
+**注意**：`trusted_proxy_groups` 只接受「放行」动作的 IP 组。把黑名单组当可信代理，等于允许这些 IP 伪造转发头绕过 ACL，实现中会忽略并在日志告警。
 
 #### 3.9.3 各 CDN 的头部对照
 
@@ -523,7 +528,7 @@ real_ip:
 
 ```
 输入: 直连 IP D，请求头集合 H
-1. 若 D 不在 trusted_proxies 中 → 直接返回 D（不信任任何头部），记 flag=untrusted_source
+1. 若 D 不在 trusted_proxies（含 trusted_proxy_groups 并入的网段）中 → 直接返回 D（不信任任何头部），记 flag=untrusted_source
 2. 按 header_priority 顺序遍历：
    a. 取头部值 V；不存在或为空 → 继续下一个
    b. 若 V 含多个值（XFF）：
@@ -784,6 +789,8 @@ POST /api/v1/acl/rules
 2. `priority` 数值大的优先
 3. `expires_at` 更早的优先（临时规则覆盖永久规则，便于快速止血）
 4. 创建时间更晚的优先
+
+**内网网段**：`acl.private_network` 命中的地址按配置处置（allow / normal / deny），且不参与 IP 组订阅黑名单——订阅源可能误收 `10.0.0.0/8` 等 bogon 段。管理员手写的黑名单优先于内网放行。
 
 ### 5.5 与自动封禁的关系
 
@@ -1300,7 +1307,7 @@ applications:
 | AC-10 | POST 请求上游 502 | **不重试**（非幂等），返回 502 |
 | AC-11 | 规则包验签失败 | 拒绝应用，保留旧版本，告警 |
 | AC-12 | 配置写错字段名 | 启动失败，提示"未知字段 xxx，是否想写 yyy" |
-| AC-13 | 未配置的域名访问 | 444 断开，无任何响应 |
+| AC-13 | 未配置的域名访问（含直接用 IP 访问） | 403 拒绝，不透传后端，记一条 ACL 事件 |
 | AC-14 | 路径 `//api/../admin` | 规范化后匹配 `/admin` 策略，不绕过 |
 | AC-15 | 内网设备访问 NAS | 默认放行，不检测 |
 | AC-16 | 经 Cloudflare 访问，`CF-Connecting-IP: 203.0.113.42` | 日志 `client_ip=203.0.113.42`、`direct_ip=Cloudflare 节点`、`source=cf-connecting-ip`；ACL 与限流按 203.0.113.42 生效 |
@@ -1312,6 +1319,11 @@ applications:
 | AC-22 | 观察模式到期（7 天） | 自动关闭并通知；若误报率 > 1% 则保持观察并告警 |
 | AC-23 | 两个应用声明同一域名 | 配置校验失败，明确指出冲突的应用 |
 | AC-24 | 应用 A 的 primary 出现在应用 B 的 aliases | 配置校验失败 |
+| AC-25 | 应用声明 `listen_ports=[5667]`，配置重载 | 2 秒内 `[::]:5667` 由 WAF 监听；`Host` 不带端口时按实际落地端口 5667 匹配该应用，不返回 403 |
+| AC-26 | 声明的端口已被其他进程占用 | 记录一次 warn 并持续重试，80/443 监听与现有流量不受影响 |
+| AC-27 | 保存应用时声明的端口与其他应用的非默认端口重复 | 保存失败并提示「端口 X 已被应用 `id` 占用」 |
+| AC-28 | 保存应用时声明的端口已被系统其他进程监听（读 `/proc/net/tcp{,6}` 的 LISTEN） | 保存失败并提示「端口 X 已被系统其他进程占用」；80/443 与管理端口另行判定 |
+| AC-29 | 保存应用时端口为管理面端口（如 9443） | 保存失败并提示「不能作为应用监听端口」 |
 
 ---
 

@@ -307,6 +307,9 @@ pub struct ServerConfig {
     pub listen: Vec<String>,
     /// HTTPS 监听地址，如 `"[::]:443"`。需要配置 `tls.cert` 与 `tls.key`
     pub tls_listen: Vec<String>,
+    /// 上游响应体的读超时。WebSocket 等长连接空闲超过该值会被中断，
+    /// pingora 默认 60s 对心跳间隔较大的移动端连接过短。
+    pub upstream_read_timeout: Duration,
     pub admin: AdminConfig,
 }
 
@@ -317,6 +320,7 @@ impl Default for ServerConfig {
             // 只列 0.0.0.0：在 Linux 上 [::]:80 默认是双栈，与 0.0.0.0:80 同时监听会冲突
             listen: vec!["0.0.0.0:80".to_string()],
             tls_listen: Vec::new(),
+            upstream_read_timeout: Duration::from_secs(300),
             admin: AdminConfig::default(),
         }
     }
@@ -443,6 +447,12 @@ pub struct RealIpConfig {
     pub preset: Option<RealIpPreset>,
     /// 可信代理网段。只有来自这些网段的请求才解析转发头。
     pub trusted_proxies: Vec<IpNet>,
+    /// 从订阅 IP 组补充的可信代理网段（填组名，可多选）。
+    ///
+    /// 云 CDN / 回源节点网段会变，靠订阅自动更新比手工维护可靠：
+    /// 组的条目在重载时并入 `trusted_proxies`，两者取并集。
+    #[serde(default)]
+    pub trusted_proxy_groups: Vec<String>,
     pub header_priority: Vec<String>,
     pub max_chain_depth: u8,
     pub on_untrusted_header: UntrustedHeaderAction,
@@ -457,6 +467,7 @@ impl Default for RealIpConfig {
             enabled: false,
             preset: None,
             trusted_proxies: Vec::new(),
+            trusted_proxy_groups: Vec::new(),
             header_priority: default_real_ip_headers(),
             max_chain_depth: 3,
             on_untrusted_header: UntrustedHeaderAction::Ignore,
@@ -839,7 +850,15 @@ fn default_ipgroup_expires() -> Duration {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct IpGroupSource {
+    /// 订阅地址。`kind = aliyun_esa` 时不用填。
+    #[serde(default)]
     pub url: String,
+    /// 来源类型。`aliyun_esa` 表示直接调阿里云 OpenAPI 取回源网段。
+    #[serde(default)]
+    pub kind: IpGroupSourceKind,
+    /// `kind = aliyun_esa` 时使用。
+    #[serde(default)]
+    pub aliyun: AliyunEsaSource,
     #[serde(default)]
     pub format: FeedFormat,
     #[serde(default = "default_feed_interval")]
@@ -848,6 +867,38 @@ pub struct IpGroupSource {
     pub timeout: Duration,
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
+}
+
+/// IP 组订阅的来源类型。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IpGroupSourceKind {
+    /// 普通 HTTPS 列表（chaitin、Spamhaus、FireHOL 等）
+    #[default]
+    Http,
+    /// 阿里云 ESA「源站防护」回源网段（OpenAPI `GetOriginProtection`）
+    AliyunEsa,
+}
+
+/// 阿里云 ESA 源站防护的接入参数。
+///
+/// ESA 的回源网段只从控制台复制或走 OpenAPI，没有公开订阅地址，
+/// 所以这里保存调用凭据，由 HomeWAF 自己按周期拉取形成订阅。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct AliyunEsaSource {
+    #[serde(default)]
+    pub access_key_id: String,
+    #[serde(default)]
+    pub access_key_secret: String,
+    /// 站点 ID，可从 ESA 控制台的站点概览或 ListSites 接口获取。
+    #[serde(default)]
+    pub site_id: String,
+    #[serde(default = "default_esa_region")]
+    pub region: String,
+}
+
+fn default_esa_region() -> String {
+    "cn-hangzhou".to_string()
 }
 
 fn default_feed_interval() -> Duration {
@@ -1020,6 +1071,13 @@ pub struct ChallengeConfig {
     pub difficulty: u8,
     /// 通过验证后的免打扰时长
     pub ttl: Duration,
+    /// 是否对中风险（30–59 分）启用滑块轨迹验证。
+    /// 本期只预留令牌字段，页面尚未渲染滑块。
+    pub slider: bool,
+    /// IP 风险分达到该值即升级人机验证
+    pub risk_challenge_threshold: u32,
+    /// IP 风险分达到该值直接拦截
+    pub risk_block_threshold: u32,
 }
 
 impl Default for ChallengeConfig {
@@ -1028,6 +1086,9 @@ impl Default for ChallengeConfig {
             enabled: true,
             difficulty: 4,
             ttl: Duration::from_secs(1_800),
+            slider: false,
+            risk_challenge_threshold: 30,
+            risk_block_threshold: 60,
         }
     }
 }
