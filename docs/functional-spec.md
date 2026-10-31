@@ -495,10 +495,16 @@ real_ip:
   header_priority:                       # 按顺序尝试，首个有效值生效
     - CF-Connecting-IP
     - True-Client-IP
+    - Ali-Cdn-Real-Ip
     - X-Real-IP
     - X-Forwarded-For
+  secret_header: null                    # 回源密钥头名，CDN 回源 IP 不可知时用
+  secret: null                           # 回源密钥值，支持 ${ENV_VAR}
   max_chain_depth: 3                     # XFF 最多回溯几层
   on_untrusted_header: ignore            # ignore | reject（reject 返回 400）
+  trust_private_source: true             # 私有网段来源自动可信（见 3.9.10）
+  trust_any_source: false                # 显式「全信」，等于关闭防伪造（见 3.9.10）
+  require_trusted_source: false          # true = 来源不可信直接 403（见 3.9.10）
   log_both: true                         # 日志同时记录直连 IP 与还原 IP
 ```
 
@@ -528,12 +534,22 @@ real_ip:
 
 ```
 输入: 直连 IP D，请求头集合 H
-1. 若 D 不在 trusted_proxies（含 trusted_proxy_groups 并入的网段）中 → 直接返回 D（不信任任何头部），记 flag=untrusted_source
+1. 来源是否可信（三种来源取「或」，任一命中即可信）：
+   a. D 在 trusted_proxies（含 trusted_proxy_groups 并入的网段）中 → 可信
+   b. 否则若配了 secret_header + secret，且该头的**任一值**与 secret 相等
+      （常量时间比较）→ 可信
+   c. 否则若 trust_private_source 且 D 是私有地址（RFC1918 / ULA / 回环 /
+      链路本地）→ 可信
+   d. 否则若 trust_any_source → 可信（显式选择，等于关闭防伪造）
+   e. 都不满足 → 直接返回 D（不信任任何头部），记 flag=untrusted_source
+      - 若同时开了 require_trusted_source → **请求直接 403**，不再继续后续流程
 2. 按 header_priority 顺序遍历：
    a. 取头部值 V；不存在或为空 → 继续下一个
    b. 若 V 含多个值（XFF）：
       - 从右向左遍历
-      - 跳过所有属于 trusted_proxies 的地址
+      - 跳过所有「可信跳」（trusted_proxies 命中的地址，以及 trust_private_source
+        开启时的私有地址）—— 注意这里**不看 trust_any_source**，否则每个 hop
+        都会被当成代理跳过，最终取到最左侧那个客户端可任意伪造的地址
       - 取第一个不在 trusted_proxies 中的地址
       - 若全部都是可信地址 → 取最左侧
       - 遍历深度不超过 max_chain_depth
@@ -551,9 +567,13 @@ real_ip:
 |---|---|
 | 客户端直接发 `X-Forwarded-For: 1.2.3.4` | 直连 IP 不在 trusted_proxies → 整个头部被忽略 |
 | 客户端发 `CF-Connecting-IP` 伪造 | 同上；且该头只在 Cloudflare 回源时存在 |
+| 客户端伪造回源密钥头 | 猜不到密钥就无法通过；比较用常量时间，多值头取任一命中 |
+| 公网绕过 CDN 直连源站 | 开 `require_trusted_source`：来源不可信一律 403，不靠 IP 白名单也能挡住 |
+| 内网客户端伪造转发头 | 默认允许（`trust_private_source`）；要收紧就关掉它并只留可信网段 |
 | 多层代理下污染 XFF 左侧 | 从右往左解析，跳过可信段 |
 | 私有地址注入（`XFF: 10.0.0.1`） | 解析结果若是私有地址，视为无效，回退直连 IP |
 | 超长 XFF（1000 个 IP） | 限制 `max_chain_depth`，超出部分忽略 |
+| 把 `trusted_proxies` 填 `0.0.0.0/0` 图省事 | 校验与设置保存**双重拒绝**：等于信任任何来源 |
 
 #### 3.9.6 下游影响
 
@@ -599,6 +619,139 @@ real_ip:
 ```
 
 预设只填 `trusted_proxies` 与 `header_priority`，其余字段用默认值。用户可在此基础上修改。
+`header_priority` 只在仍等于默认值时被预设覆盖，手工改过的头序不会被冲掉；
+`trusted_proxies` 与预设网段取并集，不会删掉手工条目。
+
+#### 3.9.9 CDN 回源 IP 不公开时的做法（回源密钥）
+
+阿里云 CDN、腾讯云 CDN 的回源节点 IP **不对外公开**：阿里云要走
+`DescribeL2VipsByDomain`，且要求日峰值带宽 ≥1Gbps 并提工单申请权限，
+返回的 IP 还会定期变化。这类 CDN 无法用网段白名单还原真实 IP，
+配了头名也只会被当成不可信来源而丢弃——日志里看到的永远是 CDN 回源节点 IP。
+
+替代做法是让 CDN 带一个「只有它知道」的标记，用它代替 IP 判定来源可信。
+`secret_header` / `secret` 支持两种模式：
+
+**模式一：严格（头名 + 固定值）**
+
+1. CDN 控制台的「自定义回源 HTTP 请求头」加一条固定值头，例如
+   `X-Origin-Verify: <32 字节随机串>`；
+2. HomeWAF 侧：
+
+```yaml
+real_ip:
+  enabled: true
+  preset: aliyun-cdn
+  trusted_proxies: []           # 留空即可，不需要知道回源 IP
+  secret_header: X-Origin-Verify
+  secret: "${ORIGIN_VERIFY_SECRET}"
+  header_priority:
+    - Ali-Cdn-Real-Ip           # CDN 强制写入的单值头，客户端伪造无效
+    - X-Forwarded-For
+```
+
+头名泄露也不致命，只要值猜不到。密钥用常量时间比较。
+
+**模式二：头名即密钥（CDN 把客户端 IP 写进自定义头）**
+
+阿里云 CDN 可以用自定义回源头直接承载客户端 IP（如
+`X-8f3a2b-Real-Forwarded-For`）。此时头名本身就是 bearer secret，
+不填 `secret` 即可：
+
+```yaml
+real_ip:
+  enabled: true
+  preset: aliyun-cdn
+  trusted_proxies: []
+  secret_header: X-8f3a2b-Real-Forwarded-For
+  secret: null                  # 不填 = 只认头名
+  header_priority:
+    - X-8f3a2b-Real-Forwarded-For
+    - Ali-Cdn-Real-Ip           # 兜底
+    - X-Forwarded-For
+```
+
+判定规则：请求带该头 **且** 其值是合法 IP（或含合法 IP 的逗号链）才认为经过 CDN。
+
+安全边界提醒：这条路退化为「头名不被猜到」。头名会以明文出现在 CDN 控制台、
+配置导出、录屏、以及任何回显请求头的上游应用里，**一旦泄露就等于向全网开放伪造**。
+因此头名要用足够随机的串，不要用 `*-Real-Forwarded-For` 这类可枚举的命名；
+能接受多配一条固定值头时，优先选模式一。
+
+#### 3.9.10 只服务可信来源（依赖判定 + 拒绝绕过）
+
+回源 IP 白名单能挡「公网绕过 CDN 直连源站」，可阿里云 / 腾讯云 CDN 根本拿不到
+网段。替代做法是**不判 IP，只判来源**，把可信来源定义成三类（取「或」）：
+
+| 可信来源 | 配置 | 说明 |
+|---|---|---|
+| 可信网段 | `trusted_proxies` + `trusted_proxy_groups` | 手动 IP 与订阅组取并集 |
+| CDN 回源标记 | `secret_header`（+ `secret`） | 头名即密钥 / 严格模式，见 3.9.9 |
+| 私有网段 | `trust_private_source`（默认开） | RFC1918 / ULA / 回环 / 链路本地 |
+
+第三类是关键：内网设备直连 WAF 本来就不带转发头，不该逼用户把 `10.0.0.0/8`、
+`192.168.0.0/16`、`fd00::/8` 一条条抄进 `trusted_proxies`；而且家宽 IPv6 前缀会变
+（运营商重新下发布前缀），手填的 `/64` 过几天就失效，ULA 与链路本地不会变。
+私有地址不可能从公网源站出来，所以这条不引入公网伪造面；代价仅是**同一内网内**
+的客户端可以伪造转发头，让日志记到假 IP。
+
+推荐组合（回源 IP 拿不到时）：
+
+```yaml
+real_ip:
+  enabled: true
+  trusted_proxies: []                        # 不需要回源 IP
+  secret_header: X-8f3a2b-Real-Forwarded-For # 头名即密钥
+  secret: null
+  trust_private_source: true                 # 内网直连自动可信
+  require_trusted_source: true               # 既非内网、又没带标记头 → 403
+  header_priority:
+    - X-8f3a2b-Real-Forwarded-For
+```
+
+判定：
+- 直连 IP 是内网 / 命中可信网段 → 放行，按头序取 IP（没头就用直连 IP）；
+- 带正确的回源标记头 → 视为 CDN 回源，放行并取头；
+- 两者都不满足（公网直连源站）→ **403**，并落一条 `untrusted-source` 安全事件。
+
+**`trust_any_source`（显式全信）**：把来源判定整体短路成「恒真」，任何请求的
+转发头都采信。它存在的理由是「源站只能从可信链路到达」这种部署（WAF 只绑内网
+网卡、上游必须是某个反代）。但它**不能当默认值**，因为这是典型的 fail-open：
+
+- 默认开 → 「忘配网段」从「还原失效」静默降级成「全网可伪造 IP」，日志看不出区别；
+- 真正危险的是它让**普通 `X-Forwarded-For` 也变成通行证**（默认头序里就有它），
+  一个爬虫随手带上 `X-Forwarded-For: 8.8.8.8` 就能通过 `require_trusted_source`
+  的拒绝规则，而且日志里 `client_ip` 记的是它编的地址，ACL 封禁封不到真身。
+
+所以它是显式开关（默认 `false`），且与 `require_trusted_source` **互斥**：
+两个都开时后者永不触发，配置校验直接报错，控制台保存也拦。
+
+与 `on_untrusted_header: reject` 的区别：
+
+| 配置 | 不可信来源**带**转发头 | 不可信来源**不带**转发头 |
+|---|---|---|
+| `on_untrusted_header: reject` | 400 | 放行（用直连 IP） |
+| `require_trusted_source: true` | 403 | **403** |
+
+**代价（上线前必须确认）**：开启后者后，任何不经 CDN、也不是内网的公网访问都会被拒，
+包括 ACME HTTP-01 验证、第三方支付/登录回调、外部探针、健康检查、CDN 之外的
+直连应用端口（`listen_ports`）。这些要么改成经 CDN / 内网，要么加白。
+
+校验层有三道硬约束：
+1. `require_trusted_source: true` 但三类来源全不生效（网段/订阅/密钥全空且
+   `trust_private_source: false`）→ **拒绝保存**，否则全站包括控制台都是 403；
+2. `trust_any_source` 与 `require_trusted_source` 同时开 → 报错（自相矛盾）；
+3. `trust_any_source` 单独开 → 警告（提示防伪造已失效）。
+另外该模式只适合 CDN **覆盖写入单个 IP** 的头：若是追加语义，链尾会是 CDN 节点 IP，
+而回源 IP 又不在白名单里，跳不过去，取到的仍是 CDN IP。
+
+效果（两种模式一致）：带标记的请求 → 按头序还原真实 IP；
+直连源站绕过 CDN 的请求不带标记 → 按不可信来源处理，只用 TCP 直连 IP。
+配 `on_untrusted_header: reject` 可直接 400 掉这批绕过请求。
+
+**不要用 `trusted_proxies: 0.0.0.0/0` 代替**：那等于信任任何来源的转发头，
+客户端直连源站伪造一个 `X-Forwarded-For` 就能绕过 IP 封禁、单 IP 限流、
+自动封禁与 GeoIP，防护等于全关。校验器与控制台保存都会拒绝全网段。
 
 ---
 

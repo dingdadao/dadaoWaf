@@ -601,3 +601,454 @@
 - 遗留建议：控制台保存应用时，若上游命中「本机某应用的 `listen_ports`」应给出告警（自指/协议错配），
   否则同类误配仍会以「永久 503 + 少量握手错误」的形式静默存在。
 - 另注：`10.0.0.14:9443`（原雷池控制台）当前只有 22 端口在线，**雷池本体未运行**，与本项目无关。
+
+## 2026-10-31 真实 IP 还原：回源标记头信任 + 生产部署
+
+### 诊断（先看数据，别猜）
+
+- 现象：access 日志 `client_ip` 出现 CDN 回源节点 IP，`ip_source=direct`。
+- 10-30 全天统计：`xxxxxxx-Real-Forwarded-For` 20325 条、`direct`(private) 7931 条、
+  `direct`(**public**) 853 条、`X-Forwarded-For` 63 条。
+  公网样本 `240e:f7:c000:105:2::17b`、`240e:96c:6000:1e03:2::44` —— 中国电信 IPv6 段。
+- 根因：`trusted_proxies` 只有 `2408:8752:0:5:2::/64`（联通一个 /64）。CDN 跨运营商回源
+  出 `240e:` 段即判为不可信 → 整头丢弃 → 退回 TCP 直连 IP。
+- 澄清：`direct`(private) 里的 `10.0.0.29` 是办公 Mac 本机 IP，内网直连 WAF 时
+  日志记它本来就是**正确**的，不是反代丢头。别把它当 bug 修。
+- 为什么不能用网段白名单收口：阿里云 CDN 回源 IP 走 `DescribeL2VipsByDomain`，
+  要求日峰值带宽 ≥1Gbps 并提工单，且 IP 会漂移；官方文档自己也建议改用 Header 识别回源。
+
+### 代码改动
+
+- `RealIpConfig` 新增 `secret_header` / `secret`（值可选，留空 = **头名即密钥**，适用于
+  CDN 把客户端 IP 写进自定义头的场景）。
+- `realip::resolve()` 可信判定改为「IP 白名单 **或** 标记头校验」：
+  严格模式常量时间比较；头名模式要求值为合法 IP 或含 IP 的逗号链；`get_all` 任一值命中
+  （防 CDN 追加语义下被假值挤到后面）。
+- `RealIpPreset` 实装 `headers()` / `trusted_proxies()` / `needs_secret()`，`apply_preset()`
+  在重载时展开；只在头序仍为默认值时覆盖，网段取并集。默认头序加入 `Ali-Cdn-Real-Ip`。
+- `on_untrusted_header: reject` 接通 server 层（400，要求 `real_ip.enabled`）。
+- 控制台保存 real_ip 时拒绝 `0.0.0.0/0` 与 `::/0`（`check_real_ip_trust`），
+  与 validate 对齐 —— 否则界面能存、命令行拒绝，两条路径不一致。
+- 设置页新增：CDN 预设 / 不可信处置 / 回源标记头名 + 值，选预设自动同步头序。
+- 门禁：`cargo clippy --workspace --all-targets -- -D warnings` 通过；
+  `cargo test --workspace` 20 个套件全绿（新增 13 个用例）。
+
+### 生产部署（10.0.0.31）
+
+- 构建 `cargo zigbuild --release --target x86_64-unknown-linux-gnu -p homewaf`（Zig 0.14.1），
+  产物 18 047 144 B，`sha256 9b4cceb471900c44abe54042e3e7e7c070d6777195bd77cbcf455cdc6df4f48f`。
+- 备份 `backups/20261031-030546/`（旧二进制 `sha256 dd669524…` + db + wal + shm）。
+- 替换后 `active`；`80/443/9443` 与声明端口 `5667/8006/8443/8878/13789/65352` 全在；
+  回环 `pve` / `waf` / `fn` 均 200。
+- 配置：`settings.real_ip` 增加 `secret_header=xxxxxxx-Real-Forwarded-For`、`secret=null`，
+  `trusted_proxies` 保持原样（内网段 + 那个 /64 留着无害）。
+
+### 验证
+
+本地实例（`trusted_proxies` 置空，模拟"回源 IP 不可知"）四组对照：
+
+| 请求 | client_ip | ip_source |
+|---|---|---|
+| 带标记头 + Ali-Cdn-Real-Ip | `203.0.113.42` | `Ali-Cdn-Real-Ip` |
+| 不带任何头 | `127.0.0.1` | `direct` |
+| 只伪造 `X-Forwarded-For` | `127.0.0.1` | `direct` |
+| 标记头存在但值非 IP | `127.0.0.1` | `direct` |
+
+### 遗留
+
+- `main.rs:491` 把 `watch_path` 固定为 `None`（注释说明 DB 模式靠控制台显式重载），
+  所以 `--no-watch` 是空开关；**直接改库不会触发重载**，`touch` 主库也无效
+  （WAL 模式下写的是 `-wal`，主库 mtime 不变）。改库后必须重启或走控制台保存。
+- 电信段回源是否已被覆盖，需真实流量验证（今天的公网 direct 已归零，但样本还不够）。
+- `openwrt` / `pve` 的 SSH 主机密钥已变更，被 known_hosts 拒绝，未自动覆盖，待人工确认。
+
+## 2026-10-31 真实 IP：来源信任模型补齐（私有自动可信 / 显式全信 / 拒绝绕过）
+
+### 需求来源
+
+用户提出判定链：启用真实 IP → 有可信网段（手动 ∪ 订阅组）就只看网段 → 取头；
+没配网段就"默认全信" → 没取到配置的头就用直连 IP → 直连不是局域网就拒绝。
+
+第 2 条（空网段 = 全信）作为**默认行为**被否掉，改为显式开关 `trust_any_source`；
+第 3 条（非内网直连即拒）落成 `require_trusted_source`；「内网自动可信」落成
+`trust_private_source`，顺手解决 IPv6 前缀漂移的老问题。
+
+### 代码改动
+
+- `RealIpConfig` 新增 `trust_private_source`（默认 **true**）、`trust_any_source`
+  （默认 **false**）、`require_trusted_source`（默认 false）。
+- `realip::is_trusted` 拆成 `is_trusted`（含 `trust_any_source` 短路）与
+  `is_trusted_hop`（不含）。**XFF 链跳可信段必须用后者**：全信模式下若用前者，
+  每个 hop 都被当成代理跳过，最终取到最左侧那个客户端可任意伪造的地址。
+- 新增 `realip::is_private_source`：IPv4 用 `is_private/is_loopback/is_link_local`；
+  IPv6 手写 `fc00::/7`、`fe80::/10` 位运算 —— `is_unique_local` /
+  `is_unicast_link_local` 是 Rust 1.84 才稳定，低于本仓库 MSRV，clippy 报
+  `incompatible_msrv`。
+- `server.rs`：`realip::resolve` 之后新增拒绝分支（`require_trusted_source`），
+  403 + `EventKind::Acl` 事件（rules=`真实 IP 还原：来源不可信`）。
+- 校验三道闸：`require_trusted_source` 且三类来源全失效 → error；
+  `trust_any_source` + `require_trusted_source` 互斥 → error；
+  `trust_any_source` 单独开 → warn。控制台 `check_real_ip_trust` 同步前两道。
+- 设置页新增两个勾选框；`example.yaml`、`functional-spec.md` §3.9.2/3.9.4/3.9.5/3.9.10
+  同步。
+
+### 本地对照（`trusted_proxies` 全空，直连恒为 127.0.0.1）
+
+| 配置 | 请求 | 结果 |
+|---|---|---|
+| D：私有自动可信 + 拒绝不可信 + 标记头 | 无头 | 200，`client_ip=127.0.0.1` `direct` |
+| D | 带标记头 | 200，`client_ip=203.0.113.42` `X-8f3a2b-Real-Forwarded-For` |
+| D | 只带 `X-Forwarded-For: 1.2.3.4` | 200，`client_ip=1.2.3.4` ← 私有自动可信的代价 |
+| E：同上但 `trust_private_source: false` | 无头 | **403** |
+| E | 带标记头 | 200 |
+| F：`trust_any_source: true` | 只带 `X-Forwarded-For: 8.8.8.8` | 200，`client_ip=8.8.8.8` |
+
+F 这行就是「空网段默认全信」不能当默认值的证据：普通 XFF 变成通行证，
+`require_trusted_source` 形同虚设，日志记的还是伪造地址。
+
+### 门禁
+
+`cargo clippy --workspace --all-targets -D warnings` 通过；
+`cargo test --workspace` 全绿（新增 realip 5 个 + validate 3 个 + admin 1 个用例）。
+
+### 未做
+
+- 尚未部署到 10.0.0.31。生产 `settings.real_ip` 目前只有 `secret_header`，
+  `trusted_proxies` 为空 —— 一旦开 `require_trusted_source`，内网直连靠
+  `trust_private_source` 兜住（默认开），但 5667/8006/8443/8878/13789/65352
+  这些**公网直连声明端口**会被 403，需先确认这些端口是否仍对外。
+
+### 生产部署（10.0.0.31）与启用结果
+
+用户确认「回源都会透传数据过来」，即声明端口（5667/8006/8443/8878/13789/65352）
+同样带标记头。先用日志证伪了自己的担心，再开：
+
+近 6 小时 `ip_source=direct` 共 3240 条，明细只有三种：
+`10.0.0.29`（3216 条，办公 Mac，内网）、`127.0.0.1`（23 条，回环）、
+`2404:2280:1b8:0:2::a6`（**3 条**，v2rayN/edgetunnel 客户端直连 cf.niao.fun）。
+没有「大量公网直连声明端口」的流量，端口假设成立。
+
+部署：
+- 产物 18 060 952 B，`sha256 6b39f7eee8da6f9d8ea5eac5bfcf4181f12be2c5e372b687aa7306658d396ba6`。
+- 备份 `backups/20261031-035159/`（旧二进制 `sha256 9b4cceb4…` + db + wal + shm）。
+- 替换后 `active`；80/443/9443 与 5667/8006/8443/8878/13789/65352 全部 listening；
+  回环探测 `waf`/`niao`/`home` 200、`fn`/`pve`/`cf`/`home`(https) 200、
+  `ddoh`/`niao.fu` 404（应用层无 `/` 路由，非 WAF 拒绝）。
+- 先只部署（新开关默认全关，行为不变），确认健康后再改配置，分两步降低一次失败的面。
+
+启用：`settings.real_ip` 写入 `require_trusted_source=true`、`trust_private_source=true`、
+`trust_any_source=false`（改库前 dump 到 `/tmp/real_ip.before.json`），重启生效。
+
+验证（开启后 90 秒真实流量）：拒绝 0 条；status 200×160、401×6（应用鉴权）、404×2；
+`direct` 60 条全为 `10.0.0.29`（私有自动可信生效，没有被误 403）。
+
+定向验证拒绝分支（用本机公网 IPv6 自连，源地址即公网）：
+
+| 请求 | 结果 |
+|---|---|
+| 无标记头 | 403 + `untrusted-source` 事件（`direct_ip=2408:8352:e40:4faa::46c`） |
+| 带标记头 | 信任通过、`client_ip=203.0.113.42` `ip_source=xxxxxxx-Real-Forwarded-For`，随后被 `acl=黑名单规则 feed:pub-firehol-l1:2891:global` 拦下 |
+
+第二条顺带证明了一件重要的事：**还原出的 IP 真的进了后续 ACL 判定链**（测试 IP
+恰好命中了公共黑名单）。开启后累计拒绝仅 1 条，就是我这次定向测试。
+
+回滚：`python3` 把 `settings.real_ip` 的 `require_trusted_source` 改回 `false`
++ `systemctl restart homewaf`；或整库回滚到 `backups/20261031-035159/`。
+
+遗留：那条 v2rayN 客户端（`2404:2280:…`，6 小时 3 次）直连会被 403。
+要么让它走 CDN，要么保留 `require_trusted_source=false`。
+
+## 2026-10-31 清理被污染的历史数据（events / traffic）
+
+### 为什么必须清
+
+清洗前统计（`mode=ro` 只读，不改数据）：
+
+| 表 | 行数 | 问题 |
+|---|---|---|
+| `events` | 919 | **377 条（41%）的 `client_ip` 是 `240e:f7:…` 电信 CDN 回源段**；113 条是 `127.0.0.1`，UA 为 `curl`/`sqlmap`/`Nikto`/`Nuclei`/`masscan`，全是本机自测 |
+| `traffic_minutes` | 5983 | `unique_ips` / `unique_visitors` 按错误 IP 去重，去重结果无意义 |
+| `traffic_unique` | 1832 | 同上，按天 × IP hash 聚合 |
+| `bans` | 0 | 无残留误封（封禁已过期） |
+
+事件时间跨度 10-22 15:50 ~ 10-31 03:54 UTC，只有最后 2 条是 `require_trusted_source`
+生效后产生的，且那 2 条是部署验证的定向测试。也就是说**整表都是污染样本**，
+保留会让「攻击来源 TOP / 风险评分累积 / 自动封禁阈值」持续跑偏。
+
+### 做了什么
+
+1. 备份：`backups/20261031-035704-cleanup/homewaf.db.bak`（2 785 280 B，
+   用 `sqlite3.Connection.backup()` 而非 `cp`——WAL 模式下 cp 三个文件不保证一致）。
+2. 单事务清空 `events` / `traffic_minutes` / `traffic_unique`。
+3. `VACUUM` + `wal_checkpoint(TRUNCATE)`：库文件 2 727 936 → 335 872 B（-87%）。
+4. 未动：`applications`(10) / `feed_state`(8) / `tamper_baselines`(1) /
+   `settings` / `ip_groups` / `certificates` —— 这些与 client_ip 无关，是配置与基线。
+
+### 清理后验证
+
+- 服务 `active`，9 个端口在监听，无 `database is locked` / error。
+- 45 秒后 `traffic_minutes` 重新累积（9 个分钟桶），`traffic_unique` 10 行。
+- 3 分钟内来源分布：525 条 `ip_source=xxxxxxx-Real-Forwarded-For` →
+  `client_ip=2408:8352:e40:4faa:e96b:f343:247b:a233`（真实客户端公网 IPv6）；
+  90 条 `direct` → `10.0.0.29`（内网 Mac）。**零回源 IP**，还原链路正确。
+- `events` 暂为 0（攻击不是每时每刻都有），控制台趋势图会从零起形，24 小时后才有意义。
+
+### 顺带发现（未处理，留给用户决定）
+
+- `data/logs` 352 MB：历史访问日志同样记着错误的 client_ip，但属审计记录，不参与统计。
+- `backups` 499 MB / `journalctl` 586 MB：旧备份与系统日志。
+
+## 2026-10-31 公网链路验收：DNS 切阿里云后的记录正确性
+
+用户把 Mac 的 DNS 换成阿里云（`223.6.6.6`），验证公网访问是否记对。
+
+### 链路
+
+`home/pve/cf/ddoh/fn.niao.fun` → CNAME `*.a1.initww.com`（阿里云 ESA）→
+客户端连边缘 `2408:8752:0:5:3::c/d/e`（联通段，同城 10ms）→ 回源到源站。
+`qh/dns/cretd.niao.fun` 公网**无 A/AAAA 记录**，只能内网访问，不参与本次验证。
+
+### 关键：curl 必须绕开透明代理
+
+本 shell 里 `HTTPS_PROXY=http://127.0.0.1:63075`（WorkBuddy 隐身代理），
+直接 `curl` 的 `remote_ip` 会是 `127.0.0.1`、出口也不是本机网络，测了等于没测。
+必须 `curl --noproxy '*'`。
+
+### 结果
+
+同一客户端（Mac，全局 IPv6 `2408:8352:e40:4faa:…`）访问 5 个域名：
+
+| 域名 | client_ip | direct_ip（回源） | ip_source |
+|---|---|---|---|
+| home | `2408:8352:e40:4faa:a113:a416:63e6:73b7` | `2408:8752:0:5:2::70` | 标记头 |
+| pve | 同上 | `::10e` / `::45` | 标记头 |
+| ddoh | 同上 | `::35` | 标记头 |
+| fn | 同上 | `::63` | 标记头 |
+
+- 五个请求的 `client_ip` **完全一致**，跨应用还原一致。
+- `direct_ip` 每次不同：10 分钟内出现 **10 个不同回源地址** —— 回源池漂移的实证，
+  再次说明 IP 白名单不可行、标记头是唯一可行解。
+- 近 10 分钟统计：`client_ip` 误记为回源段 **0 条**；内网来源 357；公网真实 IP 613。
+
+### 两个容易误判的点
+
+1. `10.0.0.29` 出现在日志里**不是 bug**：那是 Mac 内网直连 WAF，记内网地址本就正确。
+2. macOS 的 IPv6 隐私地址会轮换：`ifconfig` 看到 `…:80c:62dc:1d73:7f2a`、
+   Cloudflare trace 看到 `…:62be:b4ff:fe1d:ab19`、WAF 记的是 `…:a113:a416:63e6:73b7`
+   —— 三个都不同但同属 `2408:8352:e40:4faa::/64`。判定"同一用户"必须按 /64 聚合，
+   `acl.ipv6_prefix_match: 64` 正是为此。
+
+### 附注
+
+`cf.niao.fun` 返回 `301 Location: https://baidu.com`、`server: ESA`，
+由边缘直接响应、不进源站，所以不会出现在 WAF 日志里。
+
+## 2026-10-31 统计页空态布局修复
+
+现象：清空历史数据后，「安全态势 / 防护报告 / 攻击防护」没数据，卡片高度不齐、
+布局散架。
+
+根因有两个，一个是**预期**、一个是**真缺陷**：
+
+1. 预期：这三块全部由 `events` 驱动。清理后 `events` 从 4 条新事件重新累积，
+   「防护报告」是按天聚合的日报，要跑满一天才有内容。流量分析（`traffic_minutes`）
+   已正常累积（清理后 67 个分钟桶），不受影响。
+2. 缺陷：`.chart` 没有 `min-height`，有数据时靠 SVG 撑到 220px，空数据时
+   `.empty` 只有 `padding: 24px`，整卡塌到 ~60px；`.dcard .empty` 同理。
+   同排卡片高度差一大截，看起来就是布局错乱。
+
+修复（`crates/admin/static/index.html`）：
+- `.chart`：`min-height: 236px`（与 `lineChart` 的绘图高 220 对齐）+ `display: grid;
+  place-items: center`，空态文字居中、有数据时不塌。
+- `.empty` / `.dcard .empty`：补 `min-height`（96px / 120px）+ flex 居中。
+  所有空态都是纯文本，改成 flex 不会破坏既有渲染。
+
+部署：`sha256 21e21a1b…`，备份 `backups/20261031-041909/`（旧 `6b39f7ee…`）。
+重启后 9 端口齐全，二进制内已含新 CSS。
+
+顺带验证：清理后新产生的 4 条 `events` 全是 `ratelimit/cc-ip`（ddoh 单 IP 限流），
+`client_ip=2408:8352:e40:4faa:…` 真实公网 IPv6，不是回源段 —— 记录链路正确。
+
+## 2026-10-31 合并上游三个功能提交并上线（JA4 / BOT 评分 / 应用级人机验证）
+
+拉取 `9fc9b17..35f6b57`（3 个提交），与本地 15 个未提交改动（3849 行）合并：
+
+- `99f662c` 人机验证改应用级开关 `features.challenge`，去掉全局
+  `challenge.enabled` 与 `policy.require_challenge`；非浏览器客户端不再一律 403，
+  风险分达 `risk_api_ban_threshold`（默认 50）封禁、否则记录后放行。
+- `90b7622` BOT 防护按 UA 启发式评分：0 分放行 / 40 分挑战（仅浏览器导航且应用开
+  人机验证，其余直接拦）/ 70 分拦截；搜索引擎爬虫 UA 白名单放行。
+- `35f6b57` 日志按应用拆分 `data/logs/{access,upstream,security}/{app}/`；
+  新增 `crates/proxy/src/ja4.rs`，pre-TLS 嗅探 ClientHello 算 JA4，
+  自定义规则支持 `ja4` / `tls_fingerprint` 条件（明文连接恒不命中）。
+
+### 合并冲突（仅 `crates/proxy/src/server.rs` 两处）
+
+1. `RequestCtx` 字段：上游加 `ja4`、本地加 `headers`，两者并存。
+2. `ctx.method` / `ctx.user_agent` 赋值：上游在路由后赋值，本地按「ACL 早退前必须
+   赋值」提到 553–556 行。**删上游重复赋值**，保留 `browser_like` / `can_challenge` /
+   `ctx.ja4` 计算。`ctx.query = query`（移动语义）与 555 行的 `query.clone()` 并存无碍。
+
+### 上线拦路 bug：`Policy.require_challenge` 移除导致存量应用解析失败
+
+`Policy` 开着 `deny_unknown_fields`，上游删掉了 `require_challenge` 字段，而生产库
+10 个应用的 body JSON 全都带这个键（值为 null）。`list_applications` 解码失败 →
+`load_state_from_db` 返回 Err → `main` 直接 `ExitCode::FAILURE`，**服务起不来**。
+
+修复：`Policy` 保留只读兼容位
+
+```rust
+#[serde(default, rename = "require_challenge", skip_serializing)]
+pub legacy_require_challenge: Option<bool>,
+```
+
+解析时吞掉、序列化不再写出（下次保存即清理）。回归测试
+`legacy_require_challenge_key_still_parses`（`crates/config/tests/roundtrip.rs`）。
+
+### 上线前预检（未动生产进程）
+
+- `app-list --db 生产库` → 10 个应用全部解析通过。
+- 用 sqlite backup API 复制生产库，`serve` 在 18080/18443/19443 起候选实例：
+  `apps=10 acl_rules=34222`，0 ERROR，日志目录已按应用拆分。
+- 新旧二进制 A/B（同一库副本，清空 `listen_ports` 让端口不参与路由）：
+  浏览器 / curl / python-requests / 空 UA / AhrefsBot / 伪浏览器 / sqlmap /
+  Googlebot / 未配置域名 —— 10 个场景状态码**完全一致**，无行为回归。
+
+### 部署
+
+- 备份 `backups/20261031-132824/`（db + wal + shm，旧二进制
+  `homewaf.bak-20261031-132824`）。
+- 新二进制 `sha256 a1896cae…`，PID 1301377 → 1301948 → 1302274，RSS 88→108MB。
+- 验证：8 端口齐全；7 个域名 + 控制台全 200；`ja4="t13d1518h2_8daaf6152771_e2d80978ab2e"`
+  （Chrome TLS）与 python ssl 客户端指纹不同；`data/logs/access/lei-*` 按应用分目录；
+  `traffic_minutes` 持续累积；0 ERROR。
+
+### 配置变更（用户确认）
+
+- 10 个应用全部 `features.challenge = true`，恢复升级前「全局开启」的保护面；
+  顺带清掉 body 里的 `policy.require_challenge` 旧键。
+- BOT 实测：给 `lei-13` 临时开 `features.bot`，用 5 类 UA 打 `/`，事件里
+  `generic_bot=50 / headless_ua=55 / automation_ua=35(log) / scanner_ua=80 /
+  ua_inconsistent=40` 全部按档处置；无头浏览器与「Chrome+bot 字样」在带
+  `Accept: text/html` 时下发 6645B 挑战页，`MyBot` 这类非主流 UA 直接空 403。
+  **实测后已把 bot 恢复默认关闭**，要长期启用需在控制台逐应用打开。
+- 注意：挑战页判定要求 `Accept: text/html` 或 `Sec-Fetch-*`（`is_browser_like`），
+  纯 XHR 拿不到挑战页，排查时别误判成 bug。
+
+## 2026-10-31 生产全功能回归（对新上线二进制）
+
+对新部署的 `a1896cae…` 做端到端功能回归，全部通过真实端口 + 真实上游，共 40+ 项。
+
+### 路由与协议（24 项全过）
+
+- 8 个域名 HTTP / 5 个域名 HTTPS 均到达正确上游；TLS 协商 TLSv1.3。
+- 应用声明端口 5667 / 8878 / 13789 / 8443 / 65352：`Host` 不带端口时按落地端口
+  匹配到对应应用（AC-25），不做错应用。
+- 未配置域名、直接 IP 访问 → 403 并记 `unknown-host` 事件（AC-13）。
+- 自定义规则 `rule-panel-public-deny`：`niao.fu/panel/*` → 403，其他路径不误伤。
+- 控制台 9443 → 200。
+
+### 真实 IP 还原
+
+- 带 `xxxxxxx-Real-Forwarded-For: 203.0.113.42` → 日志
+  `client_ip=203.0.113.42 direct_ip=127.0.0.1 ip_source=xxxxxxx-Real-Forwarded-For`，
+  随后被 firehol_l1 黑名单拦（该段是文档保留段，规则命中正确）。
+- 伪造 `X-Forwarded-For: 1.2.3.4`（无可信来源）→ 忽略，`client_ip` 仍是直连地址。
+
+### 检测规则（11 条逐条命中，事件里能对上规则名）
+
+| 载荷 | 得分 | 命中规则 |
+|---|---|---|
+| `/.env` | 50 | `local-pub-dotenv` |
+| `/.git/config` | 50 | `local-pub-git` |
+| `/phpmyadmin/index.php` | 75 | `webshell-upload-filename, local-pub-phpmyadmin` |
+| `/actuator/env` | 50 | `local-pub-actuator` |
+| `X-Api-Version: ${jndi:ldap://…}` | 160 | `log4j-jndi, local-pub-log4j` |
+| `/x.php?a=eval($_POST[1])` | 210 | `webshell-upload-filename, webshell-eval-superglobal, local-pub-webshell-eval` |
+| `sqlmap` UA | 80 | `scanner_ua` |
+| `/manager/html` | 25 | `local-pub-tomcat` |
+| `/.aws/credentials` | 80 | `local-pub-aws` |
+| `/..%2f..%2fetc/passwd` | 80 | `traversal-sensitive-file`（规范化后 path=`/etc/passwd`） |
+| `/a%0d%0aX-Injected:%201` | — | 400，控制字符在检测前就拒（符合设计） |
+| `/index.php%00.jpg` | — | 400，空字节同理 |
+
+### 自动封禁 / 限流
+
+- `/.env` 首次命中（50 分）即触发自动封禁：`bans` 写入 `127.0.0.1 reason=local-pub-dotenv`，
+  后续请求日志 `处于自动封禁中，拒绝 remaining_secs=297 offenses=1`，5 分钟到期自动解封。
+- 160 次连发（`per_ip_qps=100`）：96×200、8×429（`ratelimit/cc-ip`）、56×403（被同一波
+  触发的封禁短路）。分段符合预期。
+
+### 人机验证
+
+- 风险分 100（4 次自定义规则 deny × 25）后，浏览器导航请求拿到 6645B 挑战页；
+  同一时刻的非导航 XHR 不下发挑战页。
+- **发现**：`risk_challenge_threshold=80` 与 `risk_block_threshold=81` 只留 1 分宽的
+  挑战带，而风险增量是 10/25/50/80 的整数跳，实测直接从 75 跳到 100 被拦，
+  挑战页几乎不可能触发。要保留人机验证这道闸，建议把 block 阈值抬到 120~200
+  或把 challenge 阈值降到 50 左右。
+
+### 发现（待评估）
+
+1. **检测规则命中不进风险表**（此处初判有误，已在下一节更正）：`risks.add` 只在
+   自定义规则 deny(+25)、CC 突发、BOT 评分三处调用。封禁那条链路其实**是会累积的**
+   ——`BanTable::record` 按 `blocking_score` 1:1 累加，窗口内到 50 分就封，
+   所以「反复触发高危规则不会封」不成立；真正缺的是**风险分 / 人机验证**这条链路：
+   `Log` 类规则 `blocking_score` 恒为 0，永远进不了任何处置通道。
+2. `niao.fu` 根路径返回 404 是上游（10.0.0.14:7863）自己的响应，不是 WAF 行为。
+
+### 测试期间的临时改动（已全部恢复）
+
+- 为逐条验证规则、避免第一发就把源 IP 封掉，临时把 `acl.auto_ban.trigger_score`
+  调到 1000、`challenge.risk_block_threshold` 调到 200，测完已还原为 50 / 81。
+- 期间清过若干次 `bans` 表并重启；结束时 `bans=0`，服务 active，
+  7 个域名 + 控制台全 200，0 ERROR。
+
+## 2026-10-31 检测命中计入风险分 + 挑战阈值重标定
+
+针对回归里发现的两个问题做了修复并部署（`sha256 bc89e794…`，备份
+`backups/20261031-13xxxx/`，旧二进制 `homewaf.bin.bak-*`）。
+
+### 1. 检测命中计入风险表（`crates/proxy`）
+
+原先 `risks.add` 只有三个调用点：自定义规则 deny（+25）、CC 突发（+10）、
+BOT 评分（直接给分）。检测规则命中只走 `BanTable::record(blocking_score)`，
+而封禁分是 **1:1 累加、窗口内 50 分即封**——所以拦截类规则的升级路径其实很短
+（单发 ≥50 或两发 25 就封）。真正没有出口的是 `Log` 类规则：
+`blocking_score` 恒为 0，`record` 直接早退，反复触发毫无后果。
+
+修复：在检测命中处追加 `self.risks.add(ip, detect_weight(verdict.score))`，
+权重取**总命中分**（含 Log 类），折算 1/5 并封顶 20：
+
+| 命中分 | 风险分 |
+|---|---|
+| 25（medium） | 5 |
+| 50（high） | 10 |
+| 80（critical） | 16 |
+| ≥100（多规则叠加） | 20（封顶） |
+
+单发不会把风险打满，要重复触发才升级；240 分的单发也只算 20，避免一发入魂。
+`risk::detect_weight` 带三个单测（折算档位、叠加封顶、逐步升级到 Challenge/Block）。
+
+### 2. 挑战阈值重标定（配置）
+
+`risk_challenge_threshold` / `risk_block_threshold` 从 `80 / 81` 改为 `50 / 120`。
+原来只有 1 分宽的挑战带，而风险增量是 10/25/50/80 的整数跳，实测直接跨过被拦，
+挑战页几乎不可能出现。改后实测：
+
+- 自定义规则 deny（+25/次）：风险 50 分（第 2 次）即下发 6645B 挑战页，
+  原来是 100 分（第 4 次）；
+- 风险 120 分才进 Block 等级，再叠加 `risk_api_ban_threshold=50`（非浏览器客户端）。
+
+### 已验证
+
+- `cargo test --workspace` 全绿、`clippy` 0 告警。
+- 部署后 7 域名 + 控制台全 200，0 ERROR，8 端口齐全，`bans=0`。
+- 单次 `/manager/html` 命中（25 分）→ 403，随即浏览器导航仍 200（未误伤）；
+  同一规则两发累计 50 分 → 自动封禁（原有行为不变）。
+
+### 注意
+
+拦截类规则「先封再挑战」是现有结构的必然：封禁分 1:1 累积、50 分触发，
+比风险分快 5 倍。若希望「先挑战、屡犯才封」，需要把 `acl.auto_ban.trigger_score`
+抬到 150+ 或更高；只记录类规则不受影响，现在会正常升级到挑战。
