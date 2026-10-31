@@ -17,6 +17,7 @@ use homewaf_config::RateLimitAction;
 use homewaf_limit::{ConnGuard, LimitParams};
 use homewaf_store::{BanRecord, Event, EventKind, Store};
 
+use crate::bot::BotAction;
 use crate::challenge::{self, ChallengeService, CHALLENGE_PATH, COOKIE_NAME};
 use crate::headers::{self, ForwardedCtx};
 use crate::metrics::{TrafficMetrics, TrafficSample};
@@ -1064,6 +1065,74 @@ impl ProxyHttp for WafProxy {
                 risk_score,
                 "log",
             );
+        }
+
+        // BOT 防护：UA 启发式评分，按应用级开关分档处置。
+        // 白名单与已通过人机验证的会话跳过，避免误伤共享出口或循环挑战。
+        if policy.bot && !whitelisted && !ctx.challenge_passed {
+            let bot = crate::bot::assess(&ctx.user_agent);
+            if let Some(action) = bot.action() {
+                let signals = bot.signal_names();
+                ctx.matched_rule_names = signals.clone();
+                let action_name = match action {
+                    BotAction::Log => "log",
+                    BotAction::Challenge => "challenge",
+                    BotAction::Block => "block",
+                };
+                tracing::info!(
+                    target: "homewaf.security",
+
+                    req = %ctx.request_id,
+                    client_ip = ?ctx.client_ip,
+                    app = %app.id,
+                    score = bot.score,
+                    signals = %signals,
+                    action = action_name,
+                    "BOT 启发式评分命中"
+                );
+                match action {
+                    BotAction::Log => {
+                        self.record_security_event(
+                            ctx,
+                            EventKind::Detect,
+                            &app.id,
+                            &hit.normalized_path,
+                            &signals,
+                            bot.score,
+                            "log",
+                        );
+                    }
+                    // 浏览器页面且应用开了人机验证才下发挑战；其余一律拦截
+                    BotAction::Challenge if can_challenge => {
+                        ctx.blocked = true;
+                        return self
+                            .issue_challenge(
+                                session,
+                                &state,
+                                ctx,
+                                &app.id,
+                                ctx.client_ip,
+                                &path,
+                                403,
+                                RiskLevel::Challenge,
+                            )
+                            .await;
+                    }
+                    BotAction::Challenge | BotAction::Block => {
+                        self.record_security_event(
+                            ctx,
+                            EventKind::Detect,
+                            &app.id,
+                            &hit.normalized_path,
+                            &signals,
+                            bot.score,
+                            "block",
+                        );
+                        ctx.blocked = true;
+                        return write_text(session, 403, "疑似自动化流量").await;
+                    }
+                }
+            }
         }
 
         // CC 防护：ACL 明确放行的地址不参与限流

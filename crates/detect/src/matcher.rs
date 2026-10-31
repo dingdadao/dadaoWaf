@@ -271,6 +271,19 @@ mod tests {
     fn detects_command_injection() {
         let hits = ids("; cat /etc/passwd");
         assert!(hits.contains(&"cmdi-shell-separator"), "实际: {hits:?}");
+        assert!(ids("a=1|ls -la").contains(&"cmdi-shell-separator"));
+        assert!(ids("a=1;whoami").contains(&"cmdi-shell-separator"));
+        assert!(ids("a=1& whoami").contains(&"cmdi-shell-separator"));
+    }
+
+    #[test]
+    fn ampersand_param_is_not_command_injection() {
+        // 飞牛相册误报：`&id=` 是查询参数名，不是 `;id` 命令注入
+        let hits = ids(
+            "device_id=8B546980-4D49-4057-8506-0AAEC6AD644C&device_name=iPhone%2017%20Pro%20Max&id=69597&lan=zh-CN",
+        );
+        assert!(!hits.contains(&"cmdi-shell-separator"), "误报: {hits:?}");
+        assert!(ids("a=1&id=2&ls=3&sh=4").is_empty());
     }
 
     #[test]

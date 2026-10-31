@@ -433,7 +433,9 @@ pub const BUILTIN_RULES: &[Rule] = &[
         name: "命令注入分隔符",
         category: Category::CmdInjection,
         severity: Severity::Critical,
-        pattern: r"[;|&`]\s*(cat|ls|id|whoami|nc|wget|curl|bash|sh|python)\b",
+        // `&` 是查询串参数分隔符：`&id=` / `&ls=` 是正常参数，只有 `&` 后跟空白才当后台执行；
+        // 命令名后必须是空白/行尾/分隔符，紧跟 `=` 的参数名不算注入。
+        pattern: r"(?:[;|`]\s*|&\s+)(cat|ls|id|whoami|nc|wget|curl|bash|sh|python)(?:\s|[;|&`]|$)",
         targets: &[Target::Query, Target::Body],
         keywords: &[";", "|", "&", "`"],
         action: Action::Block,

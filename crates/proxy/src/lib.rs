@@ -6,6 +6,7 @@
 //! - 还原真实客户端 IP 并注入转发头
 //! - 请求/响应生命周期钩子（后续接入检测引擎）
 
+pub mod bot;
 pub mod challenge;
 pub mod custom_rule;
 pub mod headers;

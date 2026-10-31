@@ -28,6 +28,8 @@ pub struct EffectivePolicy {
     pub allow_methods: Option<Vec<String>>,
     /// 应用级人机验证开关：只有开启时才允许下发挑战页
     pub challenge: bool,
+    /// 应用级 BOT 防护开关（UA 启发式评分）
+    pub bot: bool,
 }
 
 impl EffectivePolicy {
@@ -157,6 +159,7 @@ fn apply_features(
         policy.cc_mode = CategoryMode::Off;
     }
     policy.challenge = features.challenge;
+    policy.bot = features.bot;
     policy
 }
 
@@ -209,6 +212,7 @@ fn resolve(
         deny_cidr,
         allow_methods,
         challenge: false,
+        bot: false,
     }
 }
 
@@ -568,6 +572,20 @@ mod tests {
             &LimitsConfig::default(),
         );
         assert!(!set.app(0).unwrap().cc_active());
+    }
+
+    #[test]
+    fn bot_feature_propagates_to_app_policy() {
+        let mut a = app("nas", Policy::default(), vec![]);
+        a.features.bot = true;
+        let set = PolicySet::build(
+            &[a],
+            &ProtectionConfig::default(),
+            RateLimitConfig::default(),
+            &LimitsConfig::default(),
+        );
+        assert!(set.app(0).unwrap().bot);
+        assert!(!set.global().bot, "全局策略不带应用级开关");
     }
 
     #[test]

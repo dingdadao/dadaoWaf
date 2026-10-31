@@ -3107,7 +3107,7 @@ function appCard(a) {
       <button class="chip ${a.enabled ? (observing ? 'off' : 'on') : 'off'}" onclick="toggleObserve(${idArg})" title="切换防护 / 观察模式">${a.enabled ? (observing ? '观察模式' : '防护模式') : '已禁用'}</button>
       <button class="chip ${f.attack ? 'on' : 'off'}" onclick="toggleFeature(${idArg}, 'attack')">攻击防护 ${f.attack ? '开' : '关'}</button>
       <button class="chip ${f.cc ? 'on' : 'off'}" onclick="toggleFeature(${idArg}, 'cc')">CC 防护 ${f.cc ? '开' : '关'}</button>
-      <button class="chip muted" disabled title="BOT 防护依赖指纹库，当前版本未启用">BOT 防护</button>
+      <button class="chip ${f.bot ? 'on' : 'off'}" onclick="toggleFeature(${idArg}, 'bot')" title="UA 启发式识别脚本、爬虫与扫描器">BOT 防护 ${f.bot ? '开' : '关'}</button>
       <button class="chip ${f.challenge ? 'on' : 'off'}" onclick="toggleFeature(${idArg}, 'challenge')" title="仅对浏览器页面下发 JS 人机验证；App/API 无法执行 JS，按风险分直接拦截">人机验证 ${f.challenge ? '开' : '关'}</button>
       <span class="app-card-actions">
         <button onclick="openAppDetail(${idArg})">详情</button>
@@ -3218,7 +3218,7 @@ function renderAppDetailActions() {
     <button class="chip ${a.enabled ? (observing ? 'off' : 'on') : 'off'}" onclick="detailToggleObserve()">${a.enabled ? (observing ? '观察' : '防护') : '已禁用'}</button>
     <button class="chip ${f.attack ? 'on' : 'off'}" onclick="detailToggleFeature('attack')">攻击防护 ${f.attack ? '开' : '关'}</button>
     <button class="chip ${f.cc ? 'on' : 'off'}" onclick="detailToggleFeature('cc')">CC 防护 ${f.cc ? '开' : '关'}</button>
-    <button class="chip muted" disabled title="依赖指纹库，当前版本未启用">BOT 防护</button>
+    <button class="chip ${f.bot ? 'on' : 'off'}" onclick="detailToggleFeature('bot')" title="UA 启发式识别脚本、爬虫与扫描器">BOT 防护 ${f.bot ? '开' : '关'}</button>
     <button class="chip ${f.challenge ? 'on' : 'off'}" onclick="detailToggleFeature('challenge')" title="仅对浏览器页面下发 JS 人机验证；App/API 无法执行 JS，按风险分直接拦截">人机验证 ${f.challenge ? '开' : '关'}</button>
     <button class="chip muted" disabled title="当前版本未启用">身份认证</button>
     <span class="app-card-actions">
