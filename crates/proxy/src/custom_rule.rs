@@ -32,6 +32,8 @@ pub struct RuleRequest<'a> {
     pub content_type: Option<&'a str>,
     pub cookie: Option<&'a str>,
     pub headers: &'a http::HeaderMap,
+    /// 该连接的 JA4 TLS 指纹。只有 HTTPS 终结连接才有值
+    pub ja4: Option<&'a str>,
     /// IP 组快照：组名 → 条目。由订阅加载后注入，用于 `ip_group` 条件。
     pub ip_groups: &'a HashMap<String, Vec<IpNet>>,
 }
@@ -205,6 +207,7 @@ fn actual_value(cond: &RuleCondition, req: &RuleRequest<'_>) -> Option<String> {
         "user_agent" | "ua" => req.user_agent.map(|v| v.to_string()),
         "content_type" => req.content_type.map(|v| v.to_string()),
         "cookie" => req.cookie.map(|v| v.to_string()),
+        "ja4" | "tls_fingerprint" => req.ja4.map(|v| v.to_string()),
         "header" | "headers" => {
             let name = cond.sub_k.as_deref()?;
             req.headers
@@ -244,6 +247,7 @@ mod tests {
             content_type: None,
             cookie: None,
             headers,
+            ja4: None,
             ip_groups: groups,
         }
     }
@@ -447,5 +451,24 @@ mod tests {
         let mut c = cond("header", "eq", &["1"]);
         c.sub_k = Some("x-debug".into());
         assert!(evaluate(&[rule(1, vec![vec![c]])], &r, NOW).is_some());
+    }
+
+    #[test]
+    fn ja4_condition_matches_only_when_present() {
+        let headers = http::HeaderMap::new();
+        let groups = HashMap::new();
+        let r = req(&headers, &groups);
+        let rules = vec![rule(1, vec![vec![cond("ja4", "prefix", &["t13d1516h2"])]])];
+        // 明文 HTTP 连接没有指纹，规则不命中，不能误伤
+        assert!(evaluate(&rules, &r, NOW).is_none());
+
+        let with_ja4 = RuleRequest {
+            ja4: Some("t13d1516h2_8daaf6152771_b186095e22b6"),
+            ..req(&headers, &groups)
+        };
+        assert!(matches!(
+            evaluate(&rules, &with_ja4, NOW),
+            Some(CustomDecision::Deny(_))
+        ));
     }
 }

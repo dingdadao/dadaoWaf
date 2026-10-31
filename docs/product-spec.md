@@ -180,10 +180,12 @@ routes:
 | 类型 | 说明 |
 |---|---|
 | IP 规则 | CIDR 网段，allow / deny |
-| 自定义规则 | 匹配路径 / UA / Header，执行 allow / deny / log |
+| 自定义规则 | 匹配路径 / UA / Header / JA4 指纹，执行 allow / deny / log |
 | 订阅源 | 外部 IP 库，带防投毒护栏 |
 
 **优先级**：白名单 > 黑名单 > 自定义规则 > 内网策略 > 检测。
+
+**JA4 指纹**：HTTPS 终结连接在 TLS 握手前解析 ClientHello 得出，作为 `ja4` 条件字段参与自定义规则匹配。明文 HTTP 连接没有指纹，`ja4` 条件一律不命中。
 
 ### 3.5 CC 防护
 

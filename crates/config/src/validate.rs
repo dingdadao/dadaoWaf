@@ -682,6 +682,8 @@ const KNOWN_CONDITION_KEYS: &[&str] = &[
     "ua",
     "content_type",
     "cookie",
+    "ja4",
+    "tls_fingerprint",
     "header",
     "headers",
 ];
@@ -912,7 +914,7 @@ fn validate_condition(
         ctx.error(
             format!("{base}.k"),
             format!(
-                "未知条件字段 `{}`（支持 IP / IP 组 / 路径 / 方法 / UA / 请求头 等）",
+                "未知条件字段 `{}`（支持 IP / IP 组 / 路径 / 方法 / UA / JA4 / 请求头 等）",
                 cond.k
             ),
         );

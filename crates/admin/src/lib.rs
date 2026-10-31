@@ -2122,7 +2122,7 @@ async fn set_app_enabled(
     }
 }
 
-/// 应用级快捷开关（攻击防护 / CC 防护）。列表卡片直接调这个接口切换，
+/// 应用级快捷开关（攻击防护 / CC 防护 / BOT 防护）。列表卡片直接调这个接口切换，
 /// 不必整份应用配置回传。
 async fn set_app_features(
     State(ctx): State<Ctx>,
@@ -3343,6 +3343,9 @@ struct LogQuery {
     /// 按请求 ID 精确过滤——把三个文件的同一条请求串起来
     #[serde(default)]
     req: Option<String>,
+    /// 只看某个应用的日志（目录名）；留空表示聚合全部应用
+    #[serde(default)]
+    app: Option<String>,
 }
 
 fn default_log_type() -> String {
@@ -3352,6 +3355,10 @@ fn default_log_type() -> String {
 fn default_log_limit() -> usize {
     200
 }
+
+/// 单次读取的字节上限。日志文件按天滚动后可能上百 MB，
+/// 只读尾部这一段就够看"最近发生了什么"，不必整文件读进内存。
+const LOG_TAIL_BYTES: u64 = 2 * 1024 * 1024;
 
 async fn list_logs(
     State(ctx): State<Ctx>,
@@ -3369,21 +3376,39 @@ async fn list_logs(
         }
     };
 
-    // 找该类型下最新的日志文件（按文件名倒序，文件名带日期）
-    let dir = ctx.log_dir.join(kind);
-    let Some(file) = latest_log_file(&dir) else {
-        return Json(serde_json::json!({
-            "lines": [],
-            "file": null,
-            "total": 0,
-        }))
-        .into_response();
+    let base = ctx.log_dir.join(kind);
+    // error 是全局单文件，其余按「类型/应用」两级存放
+    let apps = if kind == "error" {
+        Vec::new()
+    } else {
+        log_app_dirs(&base)
     };
 
-    let content = match std::fs::read_to_string(&file) {
-        Ok(c) => c,
-        Err(e) => return internal(format!("读取日志失败：{e}")).into_response(),
-    };
+    // 选定要读的文件：指定应用就读它的最新文件，否则每个应用各读一个
+    let mut sources: Vec<(String, std::path::PathBuf)> = Vec::new();
+    match q.app.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(app) => {
+            // app 参数用于拼路径，必须校验，禁止 `..` 逃出日志目录
+            if !is_safe_log_app(app) {
+                return (StatusCode::BAD_REQUEST, "非法的应用名").into_response();
+            }
+            if let Some(file) = latest_log_file(&base.join(app)) {
+                sources.push((app.to_string(), file));
+            }
+        }
+        None if kind == "error" => {
+            if let Some(file) = latest_log_file(&base) {
+                sources.push((String::new(), file));
+            }
+        }
+        None => {
+            for app in &apps {
+                if let Some(file) = latest_log_file(&base.join(app)) {
+                    sources.push((app.clone(), file));
+                }
+            }
+        }
+    }
 
     let needle = q
         .req
@@ -3392,29 +3417,37 @@ async fn list_logs(
         .or_else(|| q.q.clone())
         .filter(|s| !s.trim().is_empty());
 
-    let mut lines: Vec<&str> = content
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter(|l| match &needle {
-            Some(n) => l.contains(n.as_str()),
-            None => true,
-        })
-        .collect();
-
-    let total = lines.len();
-    // 最新的在最后，倒序取 limit 条
-    let take = q.limit.clamp(1, 2000);
-    if lines.len() > take {
-        lines = lines.split_off(lines.len() - take);
+    // 各文件内部按时间升序，合并后统一按时间戳倒序
+    let mut merged: Vec<(String, String)> = Vec::new();
+    for (_, file) in &sources {
+        let lines = match read_tail_lines(file, LOG_TAIL_BYTES) {
+            Ok(l) => l,
+            Err(e) => return internal(format!("读取日志失败：{e}")).into_response(),
+        };
+        for line in lines {
+            if line.trim().is_empty() {
+                continue;
+            }
+            if let Some(n) = &needle {
+                if !line.contains(n.as_str()) {
+                    continue;
+                }
+            }
+            merged.push((line_timestamp(&line).to_string(), line));
+        }
     }
-    lines.reverse();
+    merged.sort_by(|a, b| b.0.cmp(&a.0));
+
+    let total = merged.len();
+    let take = q.limit.clamp(1, 2000);
+    merged.truncate(take);
 
     // 解析成结构化条目：前端要按列展示，靠正则拆字符串太脆。
     // 解析失败的行保留原文，至少不丢信息。
-    let entries: Vec<serde_json::Value> = lines
+    let entries: Vec<serde_json::Value> = merged
         .iter()
         .map(
-            |line| match serde_json::from_str::<serde_json::Value>(line) {
+            |(_, line)| match serde_json::from_str::<serde_json::Value>(line) {
                 Ok(mut v) => {
                     if let Some(obj) = v.as_object_mut() {
                         obj.insert(
@@ -3428,14 +3461,89 @@ async fn list_logs(
             },
         )
         .collect();
+    let lines: Vec<&str> = merged.iter().map(|(_, l)| l.as_str()).collect();
+
+    let file_label = match sources.len() {
+        0 => None,
+        1 => sources[0]
+            .1
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_string()),
+        n => Some(format!("{n} 个应用的最新日志")),
+    };
 
     Json(serde_json::json!({
         "lines": lines,
         "entries": entries,
-        "file": file.file_name().and_then(|s| s.to_str()).unwrap_or(""),
+        "file": file_label,
+        "files": sources
+            .iter()
+            .map(|(app, f)| serde_json::json!({
+                "app": app,
+                "name": f.file_name().and_then(|s| s.to_str()).unwrap_or(""),
+            }))
+            .collect::<Vec<_>>(),
+        "apps": apps,
         "total": total,
     }))
     .into_response()
+}
+
+/// 日志目录名只允许字母数字与 `-_.`，且不能是 `.` / `..`。
+fn is_safe_log_app(app: &str) -> bool {
+    !app.is_empty()
+        && app
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+        && app.chars().any(|c| c != '.')
+}
+
+/// 列出某类型下的应用目录（已排序），用于控制台下拉与聚合读取。
+fn log_app_dirs(base: &std::path::Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return Vec::new();
+    };
+    let mut apps: Vec<String> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| e.file_name().to_str().map(|s| s.to_string()))
+        .collect();
+    apps.sort();
+    apps
+}
+
+/// 读文件末尾最多 `max_bytes` 字节并按行切分。
+///
+/// 首行可能被截断（从中间开始），直接丢弃，避免解析出半个 JSON。
+fn read_tail_lines(path: &std::path::Path, max_bytes: u64) -> std::io::Result<Vec<String>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path)?;
+    let len = f.metadata()?.len();
+    let truncated = len > max_bytes;
+    if truncated {
+        f.seek(SeekFrom::Start(len - max_bytes))?;
+    }
+    let mut buf = String::new();
+    f.read_to_string(&mut buf)?;
+    let mut lines: Vec<String> = buf.lines().map(|s| s.to_string()).collect();
+    if truncated && !lines.is_empty() {
+        lines.remove(0);
+    }
+    Ok(lines)
+}
+
+/// 取一行 JSON 里的 `timestamp` 字段；缺失时返回空串（排在最后）。
+fn line_timestamp(line: &str) -> &str {
+    const KEY: &str = "\"timestamp\":\"";
+    let Some(start) = line.find(KEY) else {
+        return "";
+    };
+    let rest = &line[start + KEY.len()..];
+    match rest.find('"') {
+        Some(end) => &rest[..end],
+        None => "",
+    }
 }
 
 /// 目录里文件名最大的那个（文件名前缀带日期，字符串序即时间序）。

@@ -1019,6 +1019,7 @@
               <a data-apptab="proxyConfig">高级配置</a>
               <a data-apptab="resource">应用路由</a>
               <a data-apptab="tamper">网页防篡改</a>
+              <a data-apptab="logs">日志</a>
             </div>
             <div id="app-detail"></div>
           </section>
@@ -1360,6 +1361,9 @@
           <header>
             <h2>运行日志</h2>
             <div class="filters">
+              <select id="log-app" onchange="loadLogs()">
+                <option value="">全部应用（聚合）</option>
+              </select>
               <select id="log-kind" onchange="loadLogs()">
                 <option value="access">访问日志</option>
                 <option value="upstream">反代日志</option>
@@ -3425,10 +3429,65 @@ function renderAppDetail() {
     return;
   }
 
+  if (appDetailTab === 'logs') {
+    el.innerHTML = `<div class="fieldset">
+      <div class="wide hint">只显示 <b>${esc(a.name || a.id)}</b> 自己的日志。系统入口的「日志」页可看全部应用的聚合视图。</div>
+      <div class="wide filters" style="margin:0">
+        <select id="ad-log-kind" onchange="loadAppLogs()">
+          <option value="access">访问日志</option>
+          <option value="upstream">反代日志</option>
+          <option value="security">安全日志</option>
+        </select>
+        <input id="ad-log-q" placeholder="关键字 / 请求 ID" style="min-width:200px"
+               onkeydown="if(event.key==='Enter')loadAppLogs()">
+        <select id="ad-log-limit" onchange="loadAppLogs()">
+          <option value="100">100 条</option>
+          <option value="200" selected>200 条</option>
+          <option value="500">500 条</option>
+        </select>
+        <button type="button" onclick="loadAppLogs()">刷新</button>
+      </div>
+      <div class="wide" id="ad-log-meta" style="font-size:12px;color:var(--muted)"></div>
+      <div class="wide" id="ad-logview"></div>
+    </div>`;
+    if (!appDetailNew) loadAppLogs();
+    return;
+  }
+
   el.innerHTML = `<div class="fieldset">
     <div class="wide hint">按路径把请求分发到不同上游。路径按前缀匹配，rewrite 支持 replace / strip_prefix 等模式。</div>
     <div class="wide"><textarea id="ad-routes" rows="10">${esc(JSON.stringify(a.routes || [], null, 2))}</textarea></div>
   </div>`;
+}
+
+/// 应用详情里的日志：固定只查当前应用，不提供「全部应用」。
+async function loadAppLogs() {
+  const view = document.getElementById('ad-logview');
+  const meta = document.getElementById('ad-log-meta');
+  if (!view || !currentApp) return;
+  const kind = document.getElementById('ad-log-kind').value;
+  const q = document.getElementById('ad-log-q').value.trim();
+  const limit = document.getElementById('ad-log-limit').value;
+
+  view.innerHTML = '<div class="empty">加载中…</div>';
+  try {
+    const params = new URLSearchParams({ kind, limit, app: currentApp.id });
+    if (q) params.set('q', q);
+    const res = await api('/logs?' + params);
+    meta.textContent = res.file
+      ? `${res.file} · 匹配 ${res.total} 条 · 显示最新 ${res.lines.length} 条`
+      : '暂无日志文件（该应用还没产生这类日志）';
+
+    const rows = res.lines
+      .map(l => { try { return JSON.parse(l); } catch { return null; } })
+      .filter(Boolean);
+    view.innerHTML = rows.length
+      ? renderLogTable(kind, rows)
+      : '<div class="empty">没有匹配的日志</div>';
+  } catch (e) {
+    view.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`;
+    meta.textContent = '';
+  }
 }
 
 function upstreamRow(u, i) {
@@ -3543,6 +3602,8 @@ function collectAppDetail() {
     };
     return;
   }
+  // 日志页签是只读视图，没有需要收集的字段
+  if (appDetailTab === 'logs') return;
   const raw = val('ad-routes').trim();
   if (raw) {
     try { a.routes = JSON.parse(raw); }
@@ -3642,6 +3703,7 @@ async function deleteApp(id) {
 const RULE_FIELD_LABEL = {
   src_ip: '源 IP', ip_group: 'IP 组', path: '路径', url: 'URL', host: 'Host',
   method: '请求方法', user_agent: 'User-Agent', header: '请求头', query: '查询参数',
+  ja4: 'JA4 指纹',
 };
 const RULE_OP_LABEL = {
   eq: '等于', ne: '不等于', contain: '包含', not_contain: '不包含',
@@ -4618,15 +4680,17 @@ function showEventDetail(i) {
     ['风险标签', riskTagsHtml(e.risk_tags)],
     ['风险分', String(e.score ?? 0)],
     ['请求 ID', e.request_id
-      ? `<code>${esc(e.request_id)}</code> <button onclick="gotoLogsByReq('${esc(e.request_id)}')">查看日志</button>`
+      ? `<code>${esc(e.request_id)}</code> <button onclick="gotoLogsByReq('${esc(e.request_id)}', '${esc(e.app || '')}')">查看日志</button>`
       : '—'],
   ]);
 }
 
-function gotoLogsByReq(req) {
+/// 从事件详情跳日志。带上应用时只看该应用的日志。
+function gotoLogsByReq(req, app) {
   hideDetail();
   gotoPage('logs');
   document.getElementById('log-q').value = req;
+  if (app) document.getElementById('log-app').value = app;
   loadLogs();
 }
 
@@ -4650,18 +4714,27 @@ async function loadLogs() {
   const view = document.getElementById('logview');
   const meta = document.getElementById('log-meta');
   const kind = document.getElementById('log-kind').value;
+  const app = document.getElementById('log-app').value;
   const q = document.getElementById('log-q').value.trim();
   const limit = document.getElementById('log-limit').value;
+
+  // 错误日志是全局单文件，应用筛选对它无意义
+  const appSel = document.getElementById('log-app');
+  appSel.disabled = kind === 'error';
 
   view.innerHTML = '<div class="empty">加载中…</div>';
   try {
     const params = new URLSearchParams({ kind, limit });
     if (q) params.set('q', q);
+    if (app && kind !== 'error') params.set('app', app);
     const res = await api('/logs?' + params);
 
+    fillLogApps(res.apps || [], app, kind === 'error');
+
+    const scope = app ? appLabel(app) : '全部应用';
     meta.textContent = res.file
-      ? `${res.file} · 匹配 ${res.total} 条 · 显示最新 ${res.lines.length} 条`
-      : '暂无日志文件（还没产生该类型的日志）';
+      ? `${scope} · ${res.file} · 匹配 ${res.total} 条 · 显示最新 ${res.lines.length} 条`
+      : `${scope} · 暂无日志文件（还没产生该类型的日志）`;
 
     const rows = res.lines
       .map(l => { try { return JSON.parse(l); } catch { return null; } })
@@ -4676,6 +4749,18 @@ async function loadLogs() {
     view.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`;
     meta.textContent = '';
   }
+}
+
+/// 填充日志页的应用下拉。保留当前选择，避免每次刷新跳回「全部应用」。
+function fillLogApps(apps, selected, disabled) {
+  const sel = document.getElementById('log-app');
+  if (!sel) return;
+  const names = Array.isArray(apps) ? apps : Object.keys(apps || {});
+  const current = selected || sel.value || '';
+  sel.innerHTML = '<option value="">全部应用（聚合）</option>' + names.map(id =>
+    `<option value="${esc(id)}" ${id === current ? 'selected' : ''}>${esc(appLabel(id) || id)}</option>`
+  ).join('');
+  sel.disabled = !!disabled;
 }
 
 const timeOnly = (ts) => ts ? new Date(ts).toLocaleTimeString('zh-CN', { hour12: false }) : '';

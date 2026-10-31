@@ -120,6 +120,8 @@ pub struct RequestCtx {
     pub method: String,
     /// User-Agent，写入事件
     pub user_agent: String,
+    /// 该连接的 JA4 TLS 指纹。仅 HTTPS 终结连接有值
+    pub ja4: Option<String>,
     /// 命中的检测规则名称（逗号分隔），供事件展示
     pub matched_rule_names: String,
 }
@@ -599,6 +601,18 @@ impl ProxyHttp for WafProxy {
         let browser_like = challenge::is_browser_like(&session.req_header().headers);
         // 应用开了人机验证才允许下发挑战页，否则只按风险处置
         let can_challenge = policy.challenge && browser_like;
+        // JA4 指纹在 TLS 握手前算出并按连接缓存，明文连接自然查不到
+        ctx.ja4 = session
+            .downstream_session
+            .client_addr()
+            .and_then(|c| c.as_inet().copied())
+            .zip(
+                session
+                    .downstream_session
+                    .server_addr()
+                    .and_then(|s| s.as_inet().copied()),
+            )
+            .and_then(|(peer, local)| crate::ja4::cache().lookup(peer, local));
 
         // 规范化后的路径不应含控制字符。`%0d%0a` 之类会被解码出来，
         // 继续转发时无法构造合法 URI（Pingora 报 invalid normalized uri），
@@ -674,6 +688,7 @@ impl ProxyHttp for WafProxy {
                 content_type: content_type.as_deref(),
                 cookie: cookie_header.as_deref(),
                 headers,
+                ja4: ctx.ja4.as_deref(),
                 ip_groups: &state.ip_groups,
             };
             crate::custom_rule::evaluate(&state.custom_rules, &creq, homewaf_acl::now_unix())
@@ -1742,6 +1757,7 @@ impl ProxyHttp for WafProxy {
 
                 req = %ctx.request_id,
                 app = ctx.app_index.map(|i| i.to_string()).unwrap_or_else(|| "-".to_string()),
+                app_id = ctx.app_id.as_str(),
                 upstream = %upstream,
                 backup = ctx.upstream_backup,
                 status = status,
@@ -1799,6 +1815,7 @@ impl ProxyHttp for WafProxy {
             ip_source = ctx.ip_source.as_ref().map(|s| s.as_str()).unwrap_or("-"),
             acl = ctx.acl_reason.as_deref().unwrap_or("-"),
             rules = ctx.matched_rule_names.as_str(),
+            ja4 = ctx.ja4.as_deref().unwrap_or("-"),
             latency_us = elapsed_us,
             "request"
         );
@@ -2324,6 +2341,10 @@ fn spawn_listener_server(
                     service.add_tcp(&addr);
                 }
             }
+            // 动态 HTTPS 端口同样需要 JA4 指纹
+            service
+                .endpoints()
+                .set_pre_tls_callback(Arc::new(crate::ja4::Ja4Sniffer));
 
             server.add_service(service);
             // 不调用 bootstrap()：它只在 `upgrade=true` 时接管旧进程的监听 fd，这里不需要。
@@ -2622,8 +2643,11 @@ pub fn run(state: SharedState, settings: ProxySettings) -> anyhow::Result<()> {
             tracing::info!(listen = %addr, mode = "https", "开始监听");
             service.add_tls_with_settings(addr, None, tls_settings);
         }
+        // JA4 指纹：握手前嗅探 ClientHello（读到的字节会原样放回）
+        service
+            .endpoints()
+            .set_pre_tls_callback(Arc::new(crate::ja4::Ja4Sniffer));
     }
-
     // 静态监听器都加完之后启动动态端口轮询：应用新声明的端口单独起 Server，
     // 已绑定的 80/443 不重建，因此加端口不会中断现有流量。
     let reserved: std::collections::BTreeSet<u16> = settings

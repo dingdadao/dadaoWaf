@@ -10,6 +10,7 @@ pub mod bot;
 pub mod challenge;
 pub mod custom_rule;
 pub mod headers;
+pub mod ja4;
 pub mod metrics;
 pub mod policy;
 pub mod realip;
