@@ -2077,8 +2077,9 @@ applications:
     upstreams:
       - { addr: 192.168.1.20, port: 3000 }
     expires_at: "2026-10-25T00:00:00+08:00"
+    features:
+      challenge: true           # 应用级人机验证
     policy:
-      require_challenge: true
       ratelimit:
         per_ip_qps: 5
 ```

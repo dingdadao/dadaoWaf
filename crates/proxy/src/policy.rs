@@ -26,7 +26,8 @@ pub struct EffectivePolicy {
     pub deny_cidr: Vec<IpNet>,
     /// 路由级允许的方法；`None` 表示不限制
     pub allow_methods: Option<Vec<String>>,
-    pub require_challenge: bool,
+    /// 应用级人机验证开关：只有开启时才允许下发挑战页
+    pub challenge: bool,
 }
 
 impl EffectivePolicy {
@@ -155,6 +156,7 @@ fn apply_features(
     if !features.cc {
         policy.cc_mode = CategoryMode::Off;
     }
+    policy.challenge = features.challenge;
     policy
 }
 
@@ -178,7 +180,6 @@ fn resolve(
     let mut allow_cidr = Vec::new();
     let mut deny_cidr = Vec::new();
     let mut max_body_size = limits.max_body_size.as_bytes();
-    let mut require_challenge = false;
 
     for p in &layers {
         if let Some(r) = p.ratelimit {
@@ -192,9 +193,6 @@ fn resolve(
         }
         if let Some(s) = p.max_body_size {
             max_body_size = s.as_bytes();
-        }
-        if let Some(c) = p.require_challenge {
-            require_challenge = c;
         }
     }
 
@@ -210,7 +208,7 @@ fn resolve(
         allow_cidr,
         deny_cidr,
         allow_methods,
-        require_challenge,
+        challenge: false,
     }
 }
 
@@ -570,6 +568,22 @@ mod tests {
             &LimitsConfig::default(),
         );
         assert!(!set.app(0).unwrap().cc_active());
+    }
+
+    #[test]
+    fn challenge_feature_propagates_to_app_and_routes() {
+        let mut a = app("nas", Policy::default(), vec![]);
+        a.features.challenge = true;
+        a.routes = vec![route("/admin", None)];
+        let set = PolicySet::build(
+            &[a],
+            &ProtectionConfig::default(),
+            RateLimitConfig::default(),
+            &LimitsConfig::default(),
+        );
+        assert!(set.app(0).unwrap().challenge);
+        assert!(set.resolve(0, Some(0)).unwrap().challenge);
+        assert!(!set.global().challenge, "全局策略不带应用级开关");
     }
 
     #[test]

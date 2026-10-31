@@ -1063,10 +1063,12 @@ pub enum RateLimitAction {
 }
 
 /// 人机验证（JS 工作量证明）参数。
+///
+/// 不设全局开关：是否允许对某个应用下发挑战页由 `AppFeatures::challenge` 决定，
+/// 这里只放难度、有效期与风险阈值这类全站共用的参数。
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct ChallengeConfig {
-    pub enabled: bool,
     /// 前导零的十六进制位数。每加 1 计算量约翻 16 倍，家用默认 4（平均 6.5 万次哈希）。
     pub difficulty: u8,
     /// 通过验证后的免打扰时长
@@ -1078,17 +1080,19 @@ pub struct ChallengeConfig {
     pub risk_challenge_threshold: u32,
     /// IP 风险分达到该值直接拦截
     pub risk_block_threshold: u32,
+    /// 非浏览器客户端（API/App）无法执行 JS 挑战，风险分达到该值直接封禁
+    pub risk_api_ban_threshold: u32,
 }
 
 impl Default for ChallengeConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
             difficulty: 4,
             ttl: Duration::from_secs(1_800),
             slider: false,
             risk_challenge_threshold: 30,
             risk_block_threshold: 60,
+            risk_api_ban_threshold: 50,
         }
     }
 }
@@ -1275,8 +1279,8 @@ pub enum TamperAction {
 
 /// 应用级快捷开关。
 ///
-/// `attack` / `cc` 直接参与请求策略解析；`bot` 与 `auth` 先保留字段，
-/// 便于后续接入 BOT 识别与身份认证，不影响现有配置兼容。
+/// `attack` / `cc` / `challenge` / `bot` 直接参与请求策略解析；`auth` 先保留字段，
+/// 便于后续接入身份认证，不影响现有配置兼容。
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AppFeatures {
@@ -1286,6 +1290,9 @@ pub struct AppFeatures {
     pub cc: bool,
     #[serde(default)]
     pub bot: bool,
+    /// 允许对本应用下发人机验证。关闭时只累积风险分，不弹验证页。
+    #[serde(default)]
+    pub challenge: bool,
     #[serde(default)]
     pub auth: bool,
 }
@@ -1296,6 +1303,7 @@ impl Default for AppFeatures {
             attack: true,
             cc: true,
             bot: false,
+            challenge: false,
             auth: false,
         }
     }
@@ -1602,7 +1610,6 @@ pub struct Policy {
     pub deny_cidr: Option<Vec<IpNet>>,
     pub max_body_size: Option<Size>,
     pub ratelimit: Option<RateLimitConfig>,
-    pub require_challenge: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]

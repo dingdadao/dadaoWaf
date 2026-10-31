@@ -361,7 +361,7 @@ fn validate_challenge(c: &ChallengeConfig, ctx: &mut Ctx) {
     if c.ttl.as_secs() == 0 {
         ctx.error("challenge.ttl", "挑战有效期不能为 0");
     }
-    if c.enabled && c.difficulty > 5 {
+    if c.difficulty > 5 {
         ctx.warn(
             "challenge.difficulty",
             "难度超过 5 会让性能较弱的手机/平板验证耗时超过数秒",

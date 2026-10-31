@@ -709,18 +709,77 @@ fn render_page(token: &str, difficulty: u8, app: &str) -> String {
     )
 }
 
+/// 判断请求是否来自能执行 JS 的浏览器页面。
+///
+/// 风险处置需要分流：浏览器可以下发 JS 挑战页；API 客户端（Alamofire、OkHttp、
+/// curl 等）不执行 HTML/JS，收到挑战页等同于 403，所以对它们不做挑战、直接按阈值封禁。
+pub fn is_browser_like(headers: &http::HeaderMap) -> bool {
+    let ua = headers
+        .get(http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if ua.is_empty() {
+        return false;
+    }
+
+    const API_CLIENTS: &[&str] = &[
+        "curl/",
+        "wget/",
+        "python-requests",
+        "python-urllib",
+        "okhttp",
+        "alamofire",
+        "dart/",
+        "go-http-client",
+        "axios/",
+        "postmanruntime",
+        "java/",
+        "libwww-perl",
+        "apache-httpclient",
+        "node-fetch",
+        "undici",
+        "reqwest",
+        "dalvik",
+        "cfnetwork",
+    ];
+    if API_CLIENTS.iter().any(|m| ua.contains(m)) {
+        return false;
+    }
+
+    let mainstream = ua.contains("mozilla/5.0")
+        && ["chrome/", "firefox/", "safari/", "edg/", "opr/", "version/"]
+            .iter()
+            .any(|m| ua.contains(m));
+    if !mainstream {
+        return false;
+    }
+
+    // 只是「浏览器 UA」还不够：SPA 的 XHR 也是浏览器 UA，但拿到 HTML 挑战页没法执行。
+    // 必须是页面导航（Accept 含 text/html 或 Sec-Fetch-* 表明是文档请求）。
+    let has = |name: &str, needle: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.to_ascii_lowercase().contains(needle))
+    };
+    has("accept", "text/html")
+        || has("sec-fetch-mode", "navigate")
+        || has("sec-fetch-dest", "document")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn cfg() -> ChallengeConfig {
         ChallengeConfig {
-            enabled: true,
             difficulty: 1,
             ttl: homewaf_config::Duration::from_secs(60),
             slider: false,
             risk_challenge_threshold: 30,
             risk_block_threshold: 60,
+            risk_api_ban_threshold: 50,
         }
     }
 
@@ -1153,5 +1212,69 @@ mod tests {
         assert_eq!(count_leading_zero_hex(&[0x00, 0x00]), 4);
         assert_eq!(count_leading_zero_hex(&[0x0f]), 1);
         assert_eq!(count_leading_zero_hex(&[0xf0]), 0);
+    }
+
+    fn hdrs(pairs: &[(&str, &str)]) -> http::HeaderMap {
+        let mut map = http::HeaderMap::new();
+        for (k, v) in pairs {
+            map.insert(
+                http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                http::HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        map
+    }
+
+    #[test]
+    fn browser_navigation_is_browser_like() {
+        let h = hdrs(&[
+            (
+                "user-agent",
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36",
+            ),
+            ("accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"),
+        ]);
+        assert!(is_browser_like(&h));
+
+        let ios = hdrs(&[
+            (
+                "user-agent",
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1",
+            ),
+            ("sec-fetch-mode", "navigate"),
+        ]);
+        assert!(is_browser_like(&ios));
+    }
+
+    #[test]
+    fn native_api_clients_are_not_browser_like() {
+        // 飞牛 App 用的 Alamofire，收到 HTML 挑战页等于 403
+        let fal = hdrs(&[
+            (
+                "user-agent",
+                "Runner/1.37.1 (com.trim.app.ios; build:1371055; iOS 27.0.1) Alamofire/5.11.2",
+            ),
+            ("accept", "application/json"),
+        ]);
+        assert!(!is_browser_like(&fal));
+
+        assert!(!is_browser_like(&hdrs(&[("user-agent", "curl/8.7.1")])));
+        assert!(!is_browser_like(&hdrs(&[("user-agent", "okhttp/4.12.0")])));
+        assert!(!is_browser_like(&hdrs(&[])));
+    }
+
+    #[test]
+    fn browser_xhr_is_not_browser_like() {
+        // 浏览器 UA 但请求的是 JSON 接口：不能下发 HTML 挑战页
+        let xhr = hdrs(&[
+            (
+                "user-agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36",
+            ),
+            ("accept", "application/json, text/plain, */*"),
+            ("sec-fetch-mode", "cors"),
+            ("sec-fetch-dest", "empty"),
+        ]);
+        assert!(!is_browser_like(&xhr));
     }
 }

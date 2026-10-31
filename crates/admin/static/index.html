@@ -3080,7 +3080,8 @@ function targetSummary(a) {
 }
 
 const appObserve = (a) => a?.policy?.observe_mode?.enabled === true;
-const appFeatures = (a) => ({ attack: true, cc: true, bot: false, auth: false, ...(a?.features || {}) });
+const appFeatures = (a) => ({ attack: true, cc: true, bot: false, challenge: false, auth: false, ...(a?.features || {}) });
+const featureLabel = (k) => ({ attack: '攻击防护', cc: 'CC 防护', bot: 'BOT 防护', challenge: '人机验证' }[k] || k);
 
 function appCard(a) {
   const domains = [a.domains?.primary, ...(a.domains?.aliases || [])].filter(Boolean);
@@ -3107,6 +3108,7 @@ function appCard(a) {
       <button class="chip ${f.attack ? 'on' : 'off'}" onclick="toggleFeature(${idArg}, 'attack')">攻击防护 ${f.attack ? '开' : '关'}</button>
       <button class="chip ${f.cc ? 'on' : 'off'}" onclick="toggleFeature(${idArg}, 'cc')">CC 防护 ${f.cc ? '开' : '关'}</button>
       <button class="chip muted" disabled title="BOT 防护依赖指纹库，当前版本未启用">BOT 防护</button>
+      <button class="chip ${f.challenge ? 'on' : 'off'}" onclick="toggleFeature(${idArg}, 'challenge')" title="仅对浏览器页面下发 JS 人机验证；App/API 无法执行 JS，按风险分直接拦截">人机验证 ${f.challenge ? '开' : '关'}</button>
       <span class="app-card-actions">
         <button onclick="openAppDetail(${idArg})">详情</button>
         <button onclick="toggleApp(${idArg}, ${a.enabled ? 'false' : 'true'})">${a.enabled ? '禁用' : '启用'}</button>
@@ -3146,7 +3148,7 @@ async function toggleFeature(id, key) {
     await api(`/apps/${encodeURIComponent(id)}/features`, {
       method: 'POST', body: JSON.stringify(features),
     });
-    showMsg(`${id} 已${features[key] ? '开启' : '关闭'}${key === 'attack' ? '攻击防护' : ' CC 防护'}`);
+    showMsg(`${id} 已${features[key] ? '开启' : '关闭'}${featureLabel(key)}`);
     loadApps(); loadStatistics();
   } catch (e) { showMsg('操作失败：' + e.message, 'error'); }
 }
@@ -3182,7 +3184,7 @@ function blankApp() {
     timeouts: { connect: '5s', read: '60s', write: '60s', idle: '75s', request: null },
     health_check: {}, retry: { enabled: false, attempts: 2 },
     headers: {}, websocket: false, expires_at: null,
-    features: { attack: true, cc: true, bot: false, auth: false },
+    features: { attack: true, cc: true, bot: false, challenge: false, auth: false },
     tamper: { enabled: false, paths: [], action: 'block' },
     access_mode: 'proxy',
     static_site: { root: '', index: 'index.html', spa_fallback: false },
@@ -3217,6 +3219,7 @@ function renderAppDetailActions() {
     <button class="chip ${f.attack ? 'on' : 'off'}" onclick="detailToggleFeature('attack')">攻击防护 ${f.attack ? '开' : '关'}</button>
     <button class="chip ${f.cc ? 'on' : 'off'}" onclick="detailToggleFeature('cc')">CC 防护 ${f.cc ? '开' : '关'}</button>
     <button class="chip muted" disabled title="依赖指纹库，当前版本未启用">BOT 防护</button>
+    <button class="chip ${f.challenge ? 'on' : 'off'}" onclick="detailToggleFeature('challenge')" title="仅对浏览器页面下发 JS 人机验证；App/API 无法执行 JS，按风险分直接拦截">人机验证 ${f.challenge ? '开' : '关'}</button>
     <button class="chip muted" disabled title="当前版本未启用">身份认证</button>
     <span class="app-card-actions">
       <button onclick="detailToggleEnabled()">${a.enabled ? '禁用应用' : '启用应用'}</button>
@@ -3233,7 +3236,7 @@ async function detailToggleFeature(key) {
     });
     currentApp.features = features;
     renderAppDetailActions(); loadApps(); loadStatistics();
-    showMsg(`${key === 'attack' ? '攻击防护' : 'CC 防护'}已${features[key] ? '开启' : '关闭'}`);
+    showMsg(`${featureLabel(key)}已${features[key] ? '开启' : '关闭'}`);
   } catch (e) { showMsg('操作失败：' + e.message, 'error'); }
 }
 
@@ -3392,8 +3395,8 @@ function renderAppDetail() {
       <h3>头部改写（JSON）</h3>
       <div class="wide"><textarea id="ad-headers" rows="3" placeholder='{"request":{"set":{},"add":{},"remove":[]}}'>${esc(JSON.stringify(a.headers || {}, null, 2))}</textarea></div>
       <h3>策略覆盖（JSON，留空跟随全局）</h3>
-      <div class="wide"><textarea id="ad-policy" rows="4" placeholder='{ "preset": "strict", "require_challenge": true }'>${esc(JSON.stringify(Object.fromEntries(Object.entries(a.policy || {}).filter(([, v]) => v != null)), null, 2))}</textarea></div>
-      <div class="wide hint">策略支持 preset / protection / observe_mode / block_threshold / ratelimit / require_challenge / allow_cidr / deny_cidr / max_body_size / allow_methods。</div>
+      <div class="wide"><textarea id="ad-policy" rows="4" placeholder='{ "preset": "strict", "block_threshold": 30 }'>${esc(JSON.stringify(Object.fromEntries(Object.entries(a.policy || {}).filter(([, v]) => v != null)), null, 2))}</textarea></div>
+      <div class="wide hint">策略支持 preset / protection / observe_mode / block_threshold / ratelimit / allow_cidr / deny_cidr / max_body_size / allow_methods。人机验证请用上方的应用级开关。</div>
     </div>`;
     return;
   }
@@ -4991,12 +4994,11 @@ function renderSettings(s) {
       <div><label for="set-iqps">单 IP QPS（0 为不限）</label><input type="number" id="set-iqps" min="0" value="${rl.per_ip_qps ?? 100}"></div>
       <div><label for="set-urlqps">单 URL QPS（0 为不限）</label><input type="number" id="set-urlqps" min="0" value="${rl.per_url_qps ?? 200}"></div>
       <div><label for="set-conn">单 IP 并发连接（0 为不限）</label><input type="number" id="set-conn" min="0" value="${rl.per_ip_conn ?? 64}"></div>
-      <div class="hint">按 1 秒滑动窗口统计。人机验证需先在上方开启“人机验证”。</div>
+      <div class="hint">按 1 秒滑动窗口统计。选「人机验证后放行」时，只有应用开启了「人机验证」才会弹挑战页。</div>
     </div>
     <div class="fieldset">
       <h3>人机验证</h3>
-      <label class="row"><input type="checkbox" id="set-ch-enabled" ${ch.enabled ? 'checked' : ''}>
-        启用 JS 工作量证明挑战</label>
+      <div class="hint">是否对某个应用弹挑战页由「防护应用」里的「人机验证」开关单独控制（默认关闭）。这里只配置难度、有效期与风险阈值。</div>
       <div><label for="set-ch-difficulty">难度（1–8，前导零位数）</label>
         <input type="number" id="set-ch-difficulty" min="1" max="8" value="${ch.difficulty ?? 4}"></div>
       <div><label for="set-ch-ttl">通过后免验证时长（秒）</label>
@@ -5070,7 +5072,6 @@ async function saveSettings() {
     rl.per_ip_conn = numVal('set-conn');
 
     const ch = { ...settingsCache.challenge };
-    ch.enabled = document.getElementById('set-ch-enabled').checked;
     ch.difficulty = Math.min(8, Math.max(1, numVal('set-ch-difficulty')));
     ch.ttl = Math.max(30, numVal('set-ch-ttl')) + 's';
     ch.slider = document.getElementById('set-ch-slider').checked;

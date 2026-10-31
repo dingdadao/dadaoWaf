@@ -155,7 +155,6 @@ routes:
 | `observe_mode` | 只记录不拦截 |
 | `block_threshold` | 拦截分数 |
 | `ratelimit` | 整份替换全局限流配置（需显式 `enabled: true`） |
-| `require_challenge` | 强制人机验证 |
 | `allow_cidr` / `deny_cidr` | 应用级 CIDR |
 | `max_body_size` | 请求体检测上限 |
 | `allow_methods` | HTTP 方法白名单 |
@@ -216,7 +215,9 @@ routes:
 - 挑战页：内联 JS SHA-256 工作量证明，不依赖第三方；纯 HTTP 环境也可用
 - token：HMAC-SHA256 签名，绑定应用、客户端 IP 与过期时间；通过后写入同签名 Cookie
 - 难度：前导零十六进制位数（默认 4），每 +1 计算量约翻 16 倍
-- 触发条件：路由 `require_challenge`、CC 超限且动作配为 `challenge`
+- 触发条件：应用级「人机验证」开关（默认关闭）+ 浏览器页面导航；CC 超限且动作配为 `challenge`
+- 非浏览器客户端（App / API / curl）无法执行 JS，不退化为挑战，直接按风险分处置
+- 应用未开人机验证时只累积风险分，达到 `risk_api_ban_threshold` 才 403
 - 已通过验证的请求仍受硬限流约束（验证只证明「不是脚本」，不等于无限配额）
 
 **UA 指纹**：识别常见扫描器 / 爬虫库，可选放行搜索引擎。

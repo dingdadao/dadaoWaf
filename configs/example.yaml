@@ -185,14 +185,18 @@ ratelimit:
   action: block               # block / challenge / log
 
 # 人机验证：HMAC token + JS 工作量证明
+#
+# 是否对某个应用下发挑战页由该应用的 features.challenge 决定（默认关闭），
+# 这里只配置全站共用的难度、有效期与风险阈值。
 challenge:
-  enabled: true
   difficulty: 4               # 前导零十六进制位数，每 +1 计算量约 ×16
   ttl: 30m                    # 通过后免验证时长
   slider: false               # 滑块预留开关（本期不渲染）
   # 风险分阈值：>= challenge 要求人机验证，>= block 直接拦截
   risk_challenge_threshold: 30
   risk_block_threshold: 60
+  # 非浏览器客户端（App / API / curl）无法执行 JS，达到该分直接封禁
+  risk_api_ban_threshold: 50
 
 logging:
   level: info
@@ -227,7 +231,6 @@ applications:
         policy:
           preset: strict
           require_auth: totp
-          require_challenge: true   # 管理后台一律先过人机验证
           allow_cidr:
             - 192.168.1.0/24
             - fd00::/8
@@ -251,6 +254,8 @@ applications:
         port: 2342
     timeouts:
       read: 300s                # 大文件下载不断流
+    features:                   # 应用级快捷开关
+      challenge: false          # 不弹人机验证页，风险分照常累积
     policy:
       preset: lenient           # 相册从宽，避免误拦上传
       max_body_size: 2GB

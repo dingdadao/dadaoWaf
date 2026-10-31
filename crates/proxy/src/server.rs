@@ -594,6 +594,10 @@ impl ProxyHttp for WafProxy {
         ctx.app_id = app.id.clone();
         ctx.method = method.clone();
         ctx.user_agent = user_agent.clone().unwrap_or_default();
+        // 能否接受 JS 挑战：浏览器页面导航可以；API/App/curl 拿到挑战页等同 403
+        let browser_like = challenge::is_browser_like(&session.req_header().headers);
+        // 应用开了人机验证才允许下发挑战页，否则只按风险处置
+        let can_challenge = policy.challenge && browser_like;
 
         // 规范化后的路径不应含控制字符。`%0d%0a` 之类会被解码出来，
         // 继续转发时无法构造合法 URI（Pingora 报 invalid normalized uri），
@@ -735,7 +739,7 @@ impl ProxyHttp for WafProxy {
                     );
                     ctx.acl_reason = Some(format!("自定义规则要求人机验证：{name}"));
                     ctx.blocked = true;
-                    if state.challenge.enabled {
+                    if can_challenge {
                         let level = ctx
                             .client_ip
                             .map(|ip| {
@@ -759,7 +763,7 @@ impl ProxyHttp for WafProxy {
                             )
                             .await;
                     }
-                    return write_text(session, 403, "人机验证未启用").await;
+                    return write_text(session, 403, "人机验证不可用").await;
                 }
             }
             Some(crate::custom_rule::CustomDecision::Log(name)) => {
@@ -981,16 +985,17 @@ impl ProxyHttp for WafProxy {
             return write_empty(session, 403).await;
         }
 
-        // 应用/路由要求人机验证；风险等级达到 Challenge 时同样升级为挑战
+        // 风险等级达到 Challenge 时升级为人机验证。
+        //
+        // 两条硬规则：
+        // 1. 只有浏览器页面导航才可能弹挑战页，API/App/curl 拿不到可执行的 JS；
+        // 2. 只有应用开了「人机验证」才对它下发挑战页。
+        // 任一条不满足就退化为按风险处置：达到封禁阈值直接 403，否则记录后放行。
         let risk_challenge = risk_level == RiskLevel::Challenge;
-        if (policy.require_challenge || risk_challenge) && !challenge_passed && !ctx.acl_allowed {
-            ctx.blocked = true;
-            if state.challenge.enabled {
-                let level = if risk_challenge {
-                    RiskLevel::Challenge
-                } else {
-                    RiskLevel::Normal
-                };
+        let can_challenge = policy.challenge && browser_like;
+        if risk_challenge && !challenge_passed && !ctx.acl_allowed {
+            if can_challenge {
+                ctx.blocked = true;
                 return self
                     .issue_challenge(
                         session,
@@ -1000,28 +1005,65 @@ impl ProxyHttp for WafProxy {
                         ctx.client_ip,
                         &path,
                         403,
-                        level,
+                        RiskLevel::Challenge,
                     )
                     .await;
             }
-            // 要求挑战但挑战功能被关闭：保守拦截，而不是静默放行
+            if risk_score >= state.challenge.risk_api_ban_threshold {
+                if let Some(ip) = ctx.client_ip {
+                    self.bans.record(ip, 50, now_secs);
+                }
+                tracing::warn!(
+                    target: "homewaf.security",
+
+                    req = %ctx.request_id,
+                    client_ip = ?ctx.client_ip,
+                    app = %app.id,
+                    risk_score,
+                    browser_like,
+                    app_challenge = policy.challenge,
+                    "无法下发人机验证且风险分达封禁阈值，直接封禁"
+                );
+                self.record_security_event(
+                    ctx,
+                    EventKind::Challenge,
+                    &app.id,
+                    &hit.normalized_path,
+                    if browser_like {
+                        "risk-ban"
+                    } else {
+                        "risk-ban-api"
+                    },
+                    risk_score,
+                    "block",
+                );
+                ctx.blocked = true;
+                return write_empty(session, 403).await;
+            }
+            tracing::info!(
+                target: "homewaf.security",
+
+                req = %ctx.request_id,
+                client_ip = ?ctx.client_ip,
+                app = %app.id,
+                risk_score,
+                browser_like,
+                app_challenge = policy.challenge,
+                "无法下发人机验证，风险分未达封禁阈值，记录后放行"
+            );
             self.record_security_event(
                 ctx,
                 EventKind::Challenge,
                 &app.id,
                 &hit.normalized_path,
-                "challenge",
+                if browser_like {
+                    "risk-log"
+                } else {
+                    "risk-log-api"
+                },
                 risk_score,
-                "block",
+                "log",
             );
-            tracing::warn!(
-                target: "homewaf.security",
-
-                req = %ctx.request_id,
-                app = %app.id,
-                "require_challenge 已开启但 challenge.enabled=false，按拦截处理"
-            );
-            return write_text(session, 403, "人机验证未启用").await;
         }
 
         // CC 防护：ACL 明确放行的地址不参与限流
@@ -1049,7 +1091,8 @@ impl ProxyHttp for WafProxy {
                         RateLimitAction::Log => false,
                         RateLimitAction::Block => true,
                         RateLimitAction::Challenge => {
-                            if !state.challenge.enabled || challenge_passed {
+                            // 无法下发挑战（非浏览器或应用未开人机验证）时按 429 拦截
+                            if !can_challenge || challenge_passed {
                                 true
                             } else {
                                 ctx.conn_guard.take();

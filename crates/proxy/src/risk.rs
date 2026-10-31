@@ -290,12 +290,12 @@ mod tests {
 
     fn cfg() -> ChallengeConfig {
         ChallengeConfig {
-            enabled: true,
             difficulty: 4,
             ttl: homewaf_config::Duration::from_secs(1800),
             slider: false,
             risk_challenge_threshold: 30,
             risk_block_threshold: 60,
+            risk_api_ban_threshold: 50,
         }
     }
 
