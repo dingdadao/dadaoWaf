@@ -566,3 +566,38 @@
 ### 当前进度估计
 
 基线（初始提交）→ 防护增强 → 规则订阅 → 指标底座 → GeoIP → 统计 API → 深色四页签控制台与防护大屏 → 防护应用 / 攻击防护 / 系统设置 → 网页防篡改 → 证书管理 / 多证书 SNI / 远程部署 API → 雷池配置同步 → 人机验证增强 → 证书管理排查 → 二次生产部署 → 雷池开放 API → Certd 证书推送 → 订阅源合并 → 生产部署 → 访问控制重构 → 检测黑名单 → PHP2Shell 规则与控制台交互打磨，任务 #12–#35 已全部入库。整体功能完成度约 **88%**（对照差距分析）。
+
+---
+
+## 2026-10-31 生产部署（风险评分 / 挑战令牌 v2）
+
+### 质量门禁与构建
+
+- `cargo clippy --workspace --all-targets -- -D warnings` 全绿；`cargo test --workspace` **632 通过 / 0 失败**。
+- 构建：`cargo zigbuild --release --target x86_64-unknown-linux-gnu -p homewaf`，Zig **0.14.1**。
+- 产物：18 017 448 字节，`sha256 dd669524461e052cb9823aef0797328733ec2e90e0523e943a70659380f34582`，源码提交 `794693d`。
+- 注意：本机原先没有 zig（`cargo-zigbuild` 报 `Failed to find zig`），已下载 0.14.1 到
+  `~/.local/opt/zig-aarch64-macos-0.14.1`，未改动 brew 与系统 PATH。
+
+### 部署过程
+
+- 备份 `backups/20261031-020641/`：旧二进制（`sha256 0b6082df…`）+ `homewaf.db` + `-wal`/`-shm`。
+- 按既有顺序替换：传 `homewaf.new` → `stop` + `pkill -9 -x homewaf` → `mv` → `start`；替换后二进制 sha256 与本地一致。
+- 结果：`active`；`80 / 443 / 9443` 与「应用声明端口」`5667 / 8006 / 8443 / 8878 / 13789 / 65352` 全部监听；
+  `fn` / `pve` / `cretd` / `waf` 回环实测均 200；启动无 panic，RSS 约 79 MB。
+- 登录方式沉淀：新增部署专用密钥 `~/.ssh/waf`，`~/.ssh/config` 增加别名 `waf`（`10.0.0.31`），免密可直接 `ssh waf`。
+
+### waf.niao.fun 503 修复（配置缺陷，非代码回归）
+
+- 现象：`waf.niao.fun` / `wafs.niao.fun` / `niao.fun`（应用 `lei-7`，名称 `wafs`，描述「家用防火墙」）
+  80/443 一律 503，日志 `status=503 upstream="-" app_id="lei-7"`，延迟仅 80 µs（未真正建连）。
+- 根因：该应用上游被设为 `http://10.0.0.31:8443`，而 `8443` 是本机 **`lei-14`（ddoh.niao.fun）申报的
+  TLS 动态监听端口**（`app_declared_ports` 判定该端口有应用 `tls.mode != off` → 以 https 绑定）。
+  明文 HTTP 探活打到 TLS 端口 → handshake 失败 → 主动健康检查连续 `unhealthy_threshold` 次后摘除唯一上游 →
+  此后所有请求「无可用上游」直接 503，且每 5 秒刷一条
+  `Downstream handshake error ... received corrupt message of type InvalidContentType`。
+- 修复：上游改为 `http://127.0.0.1:9443`（管理面真实监听端口，`GET /` 返回 200 + 控制台 HTML）。
+  改完 `waf.niao.fun` / `wafs.niao.fun` / `niao.fun` 全部 **200**（269 632 字节控制台页面），握手错误日志归零。
+- 遗留建议：控制台保存应用时，若上游命中「本机某应用的 `listen_ports`」应给出告警（自指/协议错配），
+  否则同类误配仍会以「永久 503 + 少量握手错误」的形式静默存在。
+- 另注：`10.0.0.14:9443`（原雷池控制台）当前只有 22 端口在线，**雷池本体未运行**，与本项目无关。
