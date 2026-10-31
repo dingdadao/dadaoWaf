@@ -43,17 +43,37 @@ acme:
 
 # 真实客户端 IP。前面有 CDN / Tunnel / frp 时必须开启。
 real_ip:
-  enabled: false                # 未配置可信网段时解析头部等于允许伪造
+  enabled: false                # 未配置可信来源时解析头部等于允许伪造
   preset: cloudflare            # cloudflare | aliyun-cdn | tencent-cdn | cloudfront | frp
-  trusted_proxies: []
+                                # 预设只补 header_priority 与固定回环网段，不改其余字段
+  trusted_proxies: []           # 可信代理网段。禁止填 0.0.0.0/0
   header_priority:
     - CF-Connecting-IP
     - True-Client-IP
+    - Ali-Cdn-Real-Ip           # 阿里云 CDN 强制写入的单值头，客户端伪造无效
     - X-Real-IP
     - X-Forwarded-For
+  # 回源标记：CDN 回源 IP 不公开 / 会漂移时用它代替网段白名单。
+  # 阿里云 CDN 的 DescribeL2VipsByDomain 要求日峰值带宽 ≥1Gbps 且需工单申请，
+  # 拿不到时就在 CDN 控制台「自定义回源 HTTP 请求头」加一条头，两种用法：
+  #   严格模式：头写固定值（X-Origin-Verify: <32 字节随机串>），头名+值都填；
+  #   头名即密钥：头直接承载客户端 IP（如 X-8f3a2b-Real-Forwarded-For），只填头名。
+  # 来源可信 = 直连 IP 命中 trusted_proxies **或** 该头通过校验。
+  # 注意：头名即密钥的安全性等于「头名不泄露」，优先选严格模式。
+  secret_header: null           # 例："X-Origin-Verify"
+  secret: null                  # 支持 "${ORIGIN_VERIFY_SECRET}"；留空 = 只认头名
   max_chain_depth: 3
-  on_untrusted_header: ignore
-  log_both: true
+  on_untrusted_header: ignore   # ignore | reject（不可信来源带转发头时返回 400）
+  trust_private_source: true    # 私有网段来源自动可信（RFC1918 / ULA / 回环 / 链路本地）。
+                                # 内网设备直连不必把手填网段抄进 trusted_proxies，
+                                # 家宽 IPv6 前缀变化也不受影响（靠 ULA / 链路本地兜）。
+                                # 代价：同一内网的客户端能伪造转发头，日志会记到假 IP。
+  require_trusted_source: false # true = 来源不可信直接 403，只服务可信来源。
+                                # 用于「回源 IP 拿不到、又不想让公网绕过 CDN 直连源站」：
+                                # 内网/可信网段、回源标记头都不命中的请求一律拒绝。
+                                # 代价是 ACME 验证、第三方回调、外部探针、
+                                # 直连 listen_ports 都会被误伤。
+  log_both: true                 # 日志同时记录直连 IP 与还原 IP
 
 limits:
   max_header_size: 32KB

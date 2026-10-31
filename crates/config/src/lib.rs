@@ -200,10 +200,12 @@ applications:
 
     #[test]
     fn warnings_are_returned_not_fatal() {
+        // 关掉私有网段自动可信后，仍没有网段/订阅/密钥 → 应有「没有可信来源」警告
         let cfg = format!(
             r#"
 real_ip:
   enabled: true
+  trust_private_source: false
 {MINIMAL}"#
         );
         let (_, warnings) = from_str_with_warnings(&cfg).unwrap();

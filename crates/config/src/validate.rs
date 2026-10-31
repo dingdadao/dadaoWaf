@@ -224,17 +224,132 @@ fn validate_acme(acme: &AcmeConfig, ctx: &mut Ctx) {
 // ============================================================
 
 fn validate_real_ip(real_ip: &RealIpConfig, ctx: &mut Ctx) {
+    // 密钥相关的结构问题与开关无关：只配一半比不配更危险，先报出来
+    match (&real_ip.secret_header, &real_ip.secret) {
+        (Some(name), Some(secret)) => {
+            if name.is_empty() {
+                ctx.error("real_ip.secret_header", "回源密钥头名不能为空");
+            } else if !is_valid_header_name(name) {
+                ctx.error(
+                    "real_ip.secret_header",
+                    format!("`{name}` 不是合法的 HTTP 头名"),
+                );
+            }
+            // 未展开的 ${ENV} 交给运行期；展开后过短的密钥挡不住猜
+            if !secret.trim().is_empty() && !secret.contains("${") && secret.trim().len() < 16 {
+                ctx.error("real_ip.secret", "回源密钥至少 16 个字符，太短等于没有");
+            }
+            if real_ip
+                .header_priority
+                .iter()
+                .any(|h| h.eq_ignore_ascii_case(name))
+            {
+                ctx.warn(
+                    "real_ip.header_priority",
+                    format!("`{name}` 是回源密钥头，不应出现在转发头优先级里（否则可能把密钥当 IP 解析）"),
+                );
+            }
+        }
+        // 只填头名 = 「头名即密钥」模式：安全边界是头名不被猜到
+        (Some(name), None) => {
+            if name.is_empty() {
+                ctx.error("real_ip.secret_header", "回源密钥头名不能为空");
+            } else {
+                if !is_valid_header_name(name) {
+                    ctx.error(
+                        "real_ip.secret_header",
+                        format!("`{name}` 不是合法的 HTTP 头名"),
+                    );
+                }
+                ctx.warn(
+                    "real_ip.secret",
+                    "未填密钥值，按「头名即密钥」处理：只要请求带这个头就算经过 CDN。\
+                     头名一旦泄露（控制台截图、配置导出、上游回显请求头）等于向全网开放，\
+                     建议头名用随机串，并尽量只让 CDN 回源这条路径能到达源站",
+                );
+            }
+        }
+        (None, Some(_)) => ctx.error(
+            "real_ip.secret_header",
+            "配了 secret 但没配 secret_header，密钥信任不会生效",
+        ),
+        (None, None) => {}
+    }
+
     if !real_ip.enabled {
+        if real_ip.has_secret_header() {
+            ctx.warn(
+                "real_ip.enabled",
+                "已配置回源密钥但真实 IP 还原处于关闭状态，还原逻辑不会执行",
+            );
+        }
         return;
     }
-    if real_ip.trusted_proxies.is_empty()
-        && real_ip.trusted_proxy_groups.is_empty()
-        && real_ip.preset.is_none()
-    {
+
+    let preset_has_ips = real_ip
+        .preset
+        .is_some_and(|p| !p.trusted_proxies().is_empty());
+    let has_ip_source = !real_ip.trusted_proxies.is_empty()
+        || !real_ip.trusted_proxy_groups.is_empty()
+        || preset_has_ips;
+
+    // 「拒绝不可信来源」至少要有一种可信来源，否则谁都过不来
+    // （控制台自己也会被拦，只能改库救场）。私有网段自动可信算一种。
+    let has_private_trust = real_ip.trust_private_source;
+    if real_ip.trust_any_source {
+        // 与「拒绝不可信来源」互斥：全信之后没有「不可信来源」，后者永不触发
+        if real_ip.require_trusted_source {
+            ctx.error(
+                "real_ip.trust_any_source",
+                "「信任所有来源」与「拒绝不可信来源」互相矛盾：前者让所有来源都算可信，\
+                 后者永远不会触发。要挡公网直连请关掉「信任所有来源」",
+            );
+        }
         ctx.warn(
-            "real_ip.trusted_proxies",
-            "已启用真实 IP 还原但未配置可信网段，所有转发头都会被忽略",
+            "real_ip.trust_any_source",
+            "已选择「信任所有来源」：任何请求的转发头都会被采信，X-Forwarded-For 可被任意伪造，\
+             ACL 封禁 / 单 IP 限流 / 自动封禁都会失效。只在源站无法被公网直达时才这么配",
         );
+    }
+    if real_ip.require_trusted_source
+        && !has_ip_source
+        && !real_ip.has_secret_header()
+        && !has_private_trust
+        && !real_ip.trust_any_source
+    {
+        ctx.error(
+            "real_ip.require_trusted_source",
+            "开启「拒绝不可信来源」却没有任何可信来源（可信网段 / 订阅组 / 回源密钥头全空，\
+             且私有网段自动可信已关闭），所有请求都会被拒绝；请先填内网网段或回源密钥头名",
+        );
+    } else if real_ip.require_trusted_source
+        && !real_ip.has_secret_header()
+        && !real_ip.trust_any_source
+    {
+        // 只靠内网：公网 CDN 回源也会被拒，等于要求「源站完全不对公网开放」
+        ctx.warn(
+            "real_ip.require_trusted_source",
+            "已开启「拒绝不可信来源」但没有回源密钥头：只有内网/可信网段的请求能通过，\
+             公网 CDN 回源同样会被拒。若流量要经过 CDN，请补 secret_header",
+        );
+    }
+
+    if !has_ip_source
+        && !real_ip.has_secret_header()
+        && !has_private_trust
+        && !real_ip.trust_any_source
+    {
+        if real_ip.preset.is_some_and(|p| p.needs_secret()) {
+            ctx.warn(
+                "real_ip.secret_header",
+                "该 CDN 的回源 IP 不公开且会漂移，只配 preset 还原不了真实 IP：请在 CDN 控制台的「自定义回源 HTTP 请求头」加一条头，再填 secret_header（可只填头名）",
+            );
+        } else {
+            ctx.warn(
+                "real_ip.trusted_proxies",
+                "已启用真实 IP 还原但没有可信来源（网段 / 订阅组 / 回源密钥），所有转发头都会被忽略，日志记的是代理的 IP",
+            );
+        }
     }
     if real_ip.trusted_proxies.len() > 512 {
         ctx.warn(
@@ -1554,9 +1669,11 @@ mod tests {
 
     #[test]
     fn real_ip_without_trusted_proxies_warns() {
+        // 私有网段自动可信关掉、又没有任何网段/订阅/密钥 → 所有头都会被忽略
         let config = Config {
             real_ip: RealIpConfig {
                 enabled: true,
+                trust_private_source: false,
                 ..Default::default()
             },
             applications: vec![app("a", "a.home.lan")],
@@ -1567,6 +1684,62 @@ mod tests {
             .warnings
             .iter()
             .any(|w| w.path.contains("trusted_proxies")));
+    }
+
+    #[test]
+    fn real_ip_trust_any_source_warns() {
+        let config = Config {
+            real_ip: RealIpConfig {
+                enabled: true,
+                trust_any_source: true,
+                ..Default::default()
+            },
+            applications: vec![app("a", "a.home.lan")],
+            ..Default::default()
+        };
+        let report = validate(&config);
+        assert!(report
+            .warnings
+            .iter()
+            .any(|w| w.path.contains("trust_any_source")));
+    }
+
+    #[test]
+    fn real_ip_trust_any_conflicts_with_require_trusted() {
+        // 两个开关同时开 = 后者永不触发，必须报错而不是静默失效
+        let config = Config {
+            real_ip: RealIpConfig {
+                enabled: true,
+                trust_any_source: true,
+                require_trusted_source: true,
+                ..Default::default()
+            },
+            applications: vec![app("a", "a.home.lan")],
+            ..Default::default()
+        };
+        let report = validate(&config);
+        assert!(report
+            .errors
+            .iter()
+            .any(|e| e.path.contains("trust_any_source")));
+    }
+
+    #[test]
+    fn real_ip_private_auto_trust_needs_no_warning() {
+        // 默认开着私有网段自动可信，内网直连本来就能还原，不该再喊「没有可信来源」
+        let config = Config {
+            real_ip: RealIpConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            applications: vec![app("a", "a.home.lan")],
+            ..Default::default()
+        };
+        let report = validate(&config);
+        assert!(!report
+            .warnings
+            .iter()
+            .any(|w| w.message.contains("没有可信来源")));
     }
 
     #[test]

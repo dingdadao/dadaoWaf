@@ -449,6 +449,10 @@ fn cmd_serve(
     // 流量指标由代理写入、控制台读取，必须共享同一个实例
     let metrics = std::sync::Arc::new(homewaf_proxy::TrafficMetrics::new());
 
+    // 启动时刻同时决定「重启前/后」流量分界（种子合并、控制台历史合并都用它），
+    // 必须与代理侧同源，跨分钟边界也不能错位
+    let started_at = homewaf_acl::now_unix();
+
     // 启动控制台（独立线程，不阻塞代理）
     let admin_addr = shared.load_full().server.admin.listen.clone();
     if !admin_addr.is_empty() {
@@ -468,7 +472,7 @@ fn cmd_serve(
                 .parent()
                 .map(std::path::Path::to_path_buf)
                 .unwrap_or_else(|| std::path::PathBuf::from(".")),
-            started_at: homewaf_acl::now_unix(),
+            started_at,
             listen: listen.clone(),
             tls_listen: tls_listen.clone(),
             admin_addr: admin_addr.clone(),
@@ -492,6 +496,7 @@ fn cmd_serve(
         allow_regex,
         watch_interval: std::time::Duration::from_secs(2),
         events_retention_days: 30,
+        started_at,
     };
     let _ = no_watch;
 

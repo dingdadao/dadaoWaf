@@ -87,6 +87,9 @@ pub struct Event {
     pub kind: EventKind,
     pub client_ip: String,
     pub app: String,
+    /// 请求的 Host 头（不含端口）。未匹配应用的探测打在哪个域名上全靠它。
+    #[serde(default)]
+    pub host: String,
     pub path: String,
     /// 命中的规则 id，逗号分隔
     pub rules: String,
@@ -103,6 +106,9 @@ pub struct Event {
     pub user_agent: String,
     /// 风险标签（逗号分隔），如 `fingerprint_forged,headless_ua`
     pub risk_tags: String,
+    /// 原始请求头快照（`name: value` 逐行），供事后溯源
+    #[serde(default)]
+    pub headers: String,
 }
 
 impl Event {
@@ -114,6 +120,7 @@ impl Event {
             kind,
             client_ip: client_ip.into(),
             app: String::new(),
+            host: String::new(),
             path: String::new(),
             rules: String::new(),
             rule_names: String::new(),
@@ -124,6 +131,7 @@ impl Event {
             query: String::new(),
             user_agent: String::new(),
             risk_tags: String::new(),
+            headers: String::new(),
         }
     }
 
@@ -159,6 +167,16 @@ impl Event {
 
     pub fn with_app(mut self, app: impl Into<String>) -> Self {
         self.app = app.into();
+        self
+    }
+
+    pub fn with_host(mut self, host: impl Into<String>) -> Self {
+        self.host = host.into();
+        self
+    }
+
+    pub fn with_headers(mut self, headers: impl Into<String>) -> Self {
+        self.headers = headers.into();
         self
     }
 
@@ -206,6 +224,64 @@ pub struct EventFilter {
     pub q: Option<String>,
 }
 
+/// 本地时区偏移（秒）。部署在 UTC+8，没有夏令时，固定偏移即可。
+/// 报表的「自然日」按本地日界切分，否则 UTC 日界会让「10-31 日报」
+/// 实际覆盖本地 10-31 08:00 ~ 11-01 08:00，白天的数据被切到两天里。
+pub const TZ_OFFSET_SECS: i64 = 8 * 3_600;
+
+/// Unix 秒对齐到本地自然日起点（返回的仍是 Unix 秒）。
+pub fn local_day_start(ts: i64) -> i64 {
+    ts - (ts + TZ_OFFSET_SECS).rem_euclid(86_400)
+}
+
+/// u128 哈希列表打包成大端字节流（每 16 字节一个），存 BLOB 列。
+fn pack_hashes128(v: &[u128]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(v.len() * 16);
+    for x in v {
+        out.extend_from_slice(&x.to_be_bytes());
+    }
+    out
+}
+
+fn unpack_hashes128(b: &[u8]) -> Vec<u128> {
+    b.chunks_exact(16)
+        .map(|c| u128::from_be_bytes(c.try_into().expect("16 字节对齐")))
+        .collect()
+}
+
+fn pack_hashes64(v: &[u64]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(v.len() * 8);
+    for x in v {
+        out.extend_from_slice(&x.to_be_bytes());
+    }
+    out
+}
+
+fn unpack_hashes64(b: &[u8]) -> Vec<u64> {
+    b.chunks_exact(8)
+        .map(|c| u64::from_be_bytes(c.try_into().expect("8 字节对齐")))
+        .collect()
+}
+
+/// 老库行没有哈希列时，从明细 JSON 里降级取 IP / 访客。
+/// IP 列表在明细里有截断（200 条/分钟），访客哈希是完整的。
+#[derive(serde::Deserialize, Default)]
+struct DetailUniques {
+    #[serde(default)]
+    ips: Vec<(String, u32)>,
+    #[serde(default)]
+    visitors: Vec<u64>,
+}
+
+/// 文本形式的 IP 转 u128 哈希（与代理层 `ip_key` 同一编码）。
+fn hash_of_ip(s: &str) -> Option<u128> {
+    use std::net::IpAddr;
+    match s.parse::<IpAddr>().ok()? {
+        IpAddr::V4(v4) => Some(u32::from(v4) as u128),
+        IpAddr::V6(v6) => Some(u128::from(v6)),
+    }
+}
+
 /// 一条分钟级流量聚合。
 #[derive(Debug, Clone, Default)]
 pub struct TrafficBucketRow {
@@ -218,9 +294,9 @@ pub struct TrafficBucketRow {
     pub status_5xx: u64,
     pub unique_ips: u64,
     pub unique_visitors: u64,
-    /// IP 的 u128 形式，用于日报按天去重。
+    /// IP 的 u128 形式，落库为哈希集合，供窗口内独立 IP 去重。
     pub ips: Vec<u128>,
-    /// (IP, UA) 哈希，用于日报独立访客。
+    /// (IP, UA) 哈希，落库为哈希集合，供窗口内独立访客去重。
     pub visitors: Vec<u64>,
     /// 明细快照 JSON（状态码分布、Top、来源 IP）。旧库行为空字符串。
     pub detail: String,
@@ -448,7 +524,8 @@ impl Store {
             );
             CREATE INDEX IF NOT EXISTS idx_traffic_minute ON traffic_minutes(minute);
 
-            -- 每天的去重集合。分钟独立 IP 相加会重复，日报/周报必须按天去重。
+            -- 每天的去重集合（旧口径，v0.3 起只删不写）：窗口去重改用
+            -- traffic_minutes 的 ip_hashes/visitor_hashes 列，按分钟存哈希集合。
             CREATE TABLE IF NOT EXISTS traffic_unique (
                 day   INTEGER NOT NULL,
                 app   TEXT NOT NULL,
@@ -469,6 +546,8 @@ impl Store {
             ("ua", "TEXT NOT NULL DEFAULT ''"),
             ("rule_names", "TEXT NOT NULL DEFAULT ''"),
             ("risk_tags", "TEXT NOT NULL DEFAULT ''"),
+            ("host", "TEXT NOT NULL DEFAULT ''"),
+            ("headers", "TEXT NOT NULL DEFAULT ''"),
         ] {
             ensure_column(&conn, "events", column, decl);
         }
@@ -479,6 +558,9 @@ impl Store {
             "detail",
             "TEXT NOT NULL DEFAULT ''",
         );
+        // 窗口去重用的哈希集合列（v0.3 新增）。老行是 NULL，读取时降级用明细 JSON。
+        ensure_column(&conn, "traffic_minutes", "ip_hashes", "BLOB");
+        ensure_column(&conn, "traffic_minutes", "visitor_hashes", "BLOB");
         Ok(())
     }
 
@@ -566,15 +648,16 @@ impl Store {
         let conn = self.conn.lock().map_err(|_| StoreError::Poisoned)?;
         conn.execute(
             r#"
-            INSERT INTO events (ts, kind, client_ip, app, path, rules, score, action,
-                                request_id, method, query, ua, rule_names, risk_tags)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+            INSERT INTO events (ts, kind, client_ip, app, host, path, rules, score, action,
+                                request_id, method, query, ua, rule_names, risk_tags, headers)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
             "#,
             params![
                 event.ts,
                 event.kind.as_str(),
                 event.client_ip,
                 event.app,
+                event.host,
                 event.path,
                 event.rules,
                 event.score,
@@ -584,7 +667,8 @@ impl Store {
                 event.query,
                 event.user_agent,
                 event.rule_names,
-                event.risk_tags
+                event.risk_tags,
+                event.headers
             ],
         )?;
         Ok(conn.last_insert_rowid())
@@ -616,6 +700,7 @@ impl Store {
                   AND (?6 IS NULL OR ts <= ?6)
                   AND (?7 IS NULL OR path LIKE '%' || ?7 || '%')
                   AND (?8 IS NULL OR path LIKE '%' || ?8 || '%'
+                       OR host LIKE '%' || ?8 || '%'
                        OR rules LIKE '%' || ?8 || '%'
                        OR rule_names LIKE '%' || ?8 || '%'
                        OR ua LIKE '%' || ?8 || '%'
@@ -637,8 +722,8 @@ impl Store {
 
             let mut stmt = conn.prepare(
                 r#"
-                SELECT id, ts, kind, client_ip, app, path, rules, score, action,
-                       request_id, method, query, ua, rule_names, risk_tags
+                SELECT id, ts, kind, client_ip, app, host, path, rules, score, action,
+                       request_id, method, query, ua, rule_names, risk_tags, headers
                 FROM events
                 WHERE (?1 IS NULL OR kind = ?1)
                   AND (?2 IS NULL OR client_ip = ?2)
@@ -648,6 +733,7 @@ impl Store {
                   AND (?6 IS NULL OR ts <= ?6)
                   AND (?7 IS NULL OR path LIKE '%' || ?7 || '%')
                   AND (?8 IS NULL OR path LIKE '%' || ?8 || '%'
+                       OR host LIKE '%' || ?8 || '%'
                        OR rules LIKE '%' || ?8 || '%'
                        OR rule_names LIKE '%' || ?8 || '%'
                        OR ua LIKE '%' || ?8 || '%'
@@ -677,16 +763,18 @@ impl Store {
                         kind: EventKind::parse_kind(&row.get::<_, String>(2)?),
                         client_ip: row.get(3)?,
                         app: row.get(4)?,
-                        path: row.get(5)?,
-                        rules: row.get(6)?,
-                        score: row.get(7)?,
-                        action: row.get(8)?,
-                        request_id: row.get(9)?,
-                        method: row.get(10)?,
-                        query: row.get(11)?,
-                        user_agent: row.get(12)?,
-                        rule_names: row.get(13)?,
-                        risk_tags: row.get(14)?,
+                        host: row.get(5)?,
+                        path: row.get(6)?,
+                        rules: row.get(7)?,
+                        score: row.get(8)?,
+                        action: row.get(9)?,
+                        request_id: row.get(10)?,
+                        method: row.get(11)?,
+                        query: row.get(12)?,
+                        user_agent: row.get(13)?,
+                        rule_names: row.get(14)?,
+                        risk_tags: row.get(15)?,
+                        headers: row.get(16)?,
                     })
                 },
             )?;
@@ -900,6 +988,56 @@ impl Store {
         })
     }
 
+    /// 每个 IP 最近一条带上游归属地头（`ali-ip-`）的事件 headers 快照。
+    ///
+    /// 控制台用它把 CDN 边缘注入的国家 / 城市覆盖到归属地展示上。一个 IP
+    /// 可能同时有经 CDN（带头）与直连（不带头）的事件，只取最近一条带头的。
+    pub fn latest_geo_headers(
+        &self,
+        ips: &[String],
+        since: i64,
+        until: i64,
+    ) -> Result<std::collections::HashMap<String, String>, StoreError> {
+        let mut out = std::collections::HashMap::new();
+        if ips.is_empty() {
+            return Ok(out);
+        }
+        self.with_conn(|conn| {
+            // IN 列表受 SQLite 变量数限制，分块查；窗口函数保证每 IP 只回一行
+            for chunk in ips.chunks(80) {
+                let placeholders = vec!["?"; chunk.len()].join(",");
+                let sql = format!(
+                    r#"
+                    SELECT client_ip, headers FROM (
+                        SELECT client_ip, headers,
+                               ROW_NUMBER() OVER (
+                                   PARTITION BY client_ip ORDER BY ts DESC, id DESC
+                               ) AS rn
+                        FROM events
+                        WHERE ts >= ? AND ts < ?
+                          AND headers LIKE '%ali-ip-%'
+                          AND client_ip IN ({placeholders})
+                    ) WHERE rn = 1
+                    "#
+                );
+                let mut stmt = conn.prepare(&sql)?;
+                let mut args: Vec<&dyn rusqlite::types::ToSql> = vec![&since, &until];
+                for ip in chunk {
+                    args.push(ip);
+                }
+                let rows = stmt.query_map(args.as_slice(), |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })?;
+                for row in rows {
+                    let (ip, headers) = row?;
+                    out.entry(ip).or_insert(headers);
+                }
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
     /// 应用维度的事件排行，`(应用, 事件数)`，按事件数倒序。
     pub fn event_app_counts(
         &self,
@@ -999,8 +1137,11 @@ impl Store {
     // 流量统计
     // ============================================================
 
-    /// 写入一批分钟聚合与去重集合。重复写入同一分钟会覆盖计数，
-    /// 去重集合用 `INSERT OR IGNORE`，因此重放安全。
+    /// 写入一批分钟聚合。重复写入同一分钟会覆盖计数与哈希集合——
+    /// 代理侧重启时会先种子合并再累加，同一分钟的计数只增不减，覆盖写安全。
+    ///
+    /// IP / 访客哈希集合随行落库（`ip_hashes`/`visitor_hashes` BLOB），
+    /// 短窗口去重时逐行取并集，不再走按天去重的 `traffic_unique`（该表只删不写）。
     pub fn save_traffic(&self, rows: &[TrafficBucketRow]) -> Result<(), StoreError> {
         if rows.is_empty() {
             return Ok(());
@@ -1012,8 +1153,8 @@ impl Store {
                 r#"
                 INSERT INTO traffic_minutes
                     (minute, app, requests, pv, blocked, status_4xx, status_5xx,
-                     unique_ips, unique_visitors, detail)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                     unique_ips, unique_visitors, detail, ip_hashes, visitor_hashes)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
                 ON CONFLICT(minute, app) DO UPDATE SET
                     requests        = excluded.requests,
                     pv              = excluded.pv,
@@ -1022,7 +1163,9 @@ impl Store {
                     status_5xx      = excluded.status_5xx,
                     unique_ips      = excluded.unique_ips,
                     unique_visitors = excluded.unique_visitors,
-                    detail          = excluded.detail
+                    detail          = excluded.detail,
+                    ip_hashes       = excluded.ip_hashes,
+                    visitor_hashes  = excluded.visitor_hashes
                 "#,
                 params![
                     row.minute,
@@ -1035,30 +1178,18 @@ impl Store {
                     row.unique_ips as i64,
                     row.unique_visitors as i64,
                     row.detail,
+                    pack_hashes128(&row.ips),
+                    pack_hashes64(&row.visitors),
                 ],
             )?;
-
-            let day = row.minute - row.minute.rem_euclid(86_400);
-            for ip in &row.ips {
-                tx.execute(
-                    "INSERT OR IGNORE INTO traffic_unique (day, app, kind, hash)
-                     VALUES (?1, ?2, 'ip', ?3)",
-                    params![day, row.app, format!("{ip:032x}")],
-                )?;
-            }
-            for v in &row.visitors {
-                tx.execute(
-                    "INSERT OR IGNORE INTO traffic_unique (day, app, kind, hash)
-                     VALUES (?1, ?2, 'visitor', ?3)",
-                    params![day, row.app, format!("{v:016x}")],
-                )?;
-            }
         }
         tx.commit()?;
         Ok(())
     }
 
-    /// 汇总一段时间。独立 IP / 访客按天去重，跨天范围也能得到正确值。
+    /// 汇总一段时间。独立 IP / 访客按窗口内逐分钟哈希集合并集去重，
+    /// 1 小时窗口不会把当天的独立 IP 全算进来（旧的按天去重口径在短窗口下
+    /// 虚高 7~14 倍）。老库行没有哈希列时降级用明细 JSON，截断差额只能近似补回。
     pub fn traffic_totals(
         &self,
         since: i64,
@@ -1079,20 +1210,44 @@ impl Store {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )?;
 
-        let day_start = since - since.rem_euclid(86_400);
-        let distinct = |kind: &str| -> Result<u64, StoreError> {
-            conn.query_row(
-                r#"
-                SELECT COUNT(DISTINCT hash) FROM traffic_unique
-                WHERE day >= ?1 AND day <= ?2 AND kind = ?3
-                  AND (?4 IS NULL OR app = ?4)
-                "#,
-                params![day_start, until, kind, app],
-                |r| r.get::<_, i64>(0),
-            )
-            .map(|n| n as u64)
-            .map_err(StoreError::from)
-        };
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT ip_hashes, visitor_hashes, unique_ips, unique_visitors, detail
+            FROM traffic_minutes
+            WHERE minute >= ?1 AND minute < ?2 AND (?3 IS NULL OR app = ?3)
+            "#,
+        )?;
+        let rows = stmt.query_map(params![since, until, app], |r| {
+            Ok((
+                r.get::<_, Option<Vec<u8>>>(0)?,
+                r.get::<_, Option<Vec<u8>>>(1)?,
+                r.get::<_, i64>(2)? as u64,
+                r.get::<_, i64>(3)? as u64,
+                r.get::<_, String>(4)?,
+            ))
+        })?;
+        let mut ip_set: std::collections::HashSet<u128> = std::collections::HashSet::new();
+        let mut vis_set: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        // 明细截断导致无法枚举的差额，按行记名额（跨行可能重叠，最多略偏高）
+        let mut ip_gap = 0u64;
+        let mut vis_gap = 0u64;
+        for row in rows {
+            let (ip_blob, vis_blob, unique_ips, unique_visitors, detail) = row?;
+            let (ips, visitors) = match (ip_blob, vis_blob) {
+                (Some(ib), Some(vb)) => (unpack_hashes128(&ib), unpack_hashes64(&vb)),
+                _ => {
+                    let d: DetailUniques = serde_json::from_str(&detail).unwrap_or_default();
+                    (
+                        d.ips.iter().filter_map(|(s, _)| hash_of_ip(s)).collect(),
+                        d.visitors,
+                    )
+                }
+            };
+            ip_gap += unique_ips.saturating_sub(ips.len() as u64);
+            vis_gap += unique_visitors.saturating_sub(visitors.len() as u64);
+            ip_set.extend(ips);
+            vis_set.extend(visitors);
+        }
 
         Ok(TrafficTotals {
             requests: requests as u64,
@@ -1100,8 +1255,8 @@ impl Store {
             blocked: blocked as u64,
             status_4xx: status_4xx as u64,
             status_5xx: status_5xx as u64,
-            unique_ips: distinct("ip")?,
-            unique_visitors: distinct("visitor")?,
+            unique_ips: ip_set.len() as u64 + ip_gap,
+            unique_visitors: vis_set.len() as u64 + vis_gap,
         })
     }
 
@@ -1148,6 +1303,7 @@ impl Store {
     }
 
     /// 按固定宽度聚合趋势，供日报/大屏历史曲线使用。
+    /// 分组边界按本地时区（UTC+8）对齐，日粒度的点才是真正的本地自然日。
     pub fn traffic_series(
         &self,
         since: i64,
@@ -1159,7 +1315,7 @@ impl Store {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 r#"
-                SELECT (minute / ?4) * ?4 AS bucket,
+                SELECT ((minute + ?5) / ?4) * ?4 - ?5 AS bucket,
                        COALESCE(SUM(requests), 0),
                        COALESCE(SUM(blocked), 0)
                 FROM traffic_minutes
@@ -1167,7 +1323,7 @@ impl Store {
                 GROUP BY bucket ORDER BY bucket
                 "#,
             )?;
-            let rows = stmt.query_map(params![since, until, app, group], |r| {
+            let rows = stmt.query_map(params![since, until, app, group, TZ_OFFSET_SECS], |r| {
                 Ok(TrafficPoint {
                     ts: r.get(0)?,
                     requests: r.get::<_, i64>(1)? as u64,
@@ -1182,12 +1338,12 @@ impl Store {
         })
     }
 
-    /// 有流量数据的日期列表（按天聚合，倒序）。
+    /// 有流量数据的日期列表（按本地自然日聚合，倒序）。
     pub fn traffic_days(&self, since: i64, limit: usize) -> Result<Vec<TrafficDay>, StoreError> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 r#"
-                SELECT (minute / 86400) * 86400 AS day,
+                SELECT ((minute + ?3) / 86400) * 86400 - ?3 AS day,
                        COALESCE(SUM(requests), 0),
                        COALESCE(SUM(blocked), 0)
                 FROM traffic_minutes
@@ -1195,7 +1351,7 @@ impl Store {
                 GROUP BY day ORDER BY day DESC LIMIT ?2
                 "#,
             )?;
-            let rows = stmt.query_map(params![since, limit as i64], |r| {
+            let rows = stmt.query_map(params![since, limit as i64, TZ_OFFSET_SECS], |r| {
                 Ok(TrafficDay {
                     day: r.get(0)?,
                     requests: r.get::<_, i64>(1)? as u64,
@@ -1210,17 +1366,17 @@ impl Store {
         })
     }
 
-    /// 每天每类事件数，供报表列表与安全态势历史使用。
+    /// 每天每类事件数，供报表列表与安全态势历史使用（本地自然日）。
     pub fn daily_event_counts(&self, since: i64) -> Result<Vec<(i64, String, usize)>, StoreError> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 r#"
-                SELECT (ts / 86400) * 86400 AS day, kind, COUNT(*)
+                SELECT ((ts + ?2) / 86400) * 86400 - ?2 AS day, kind, COUNT(*)
                 FROM events WHERE ts >= ?1
                 GROUP BY day, kind ORDER BY day DESC
                 "#,
             )?;
-            let rows = stmt.query_map(params![since], |r| {
+            let rows = stmt.query_map(params![since, TZ_OFFSET_SECS], |r| {
                 Ok((
                     r.get::<_, i64>(0)?,
                     r.get::<_, String>(1)?,
@@ -1235,9 +1391,9 @@ impl Store {
         })
     }
 
-    /// 删除早于 `before` 的流量聚合与去重集合。
+    /// 删除早于 `before` 的流量聚合与旧口径去重集合。
     pub fn prune_traffic(&self, before: i64) -> Result<usize, StoreError> {
-        let day = before - before.rem_euclid(86_400);
+        let day = local_day_start(before);
         let conn = self.conn.lock().map_err(|_| StoreError::Poisoned)?;
         let n = conn.execute(
             "DELETE FROM traffic_minutes WHERE minute < ?1",
@@ -1477,11 +1633,13 @@ mod tests {
         let s = store();
         let e = Event::new(NOW, EventKind::Detect, "203.0.113.9")
             .with_app("nas")
+            .with_host("nas.home.lan")
             .with_path("/api")
             .with_rules("sqli-union-select")
             .with_score(50)
             .with_action("block")
-            .with_risk_tags("fingerprint_forged,challenge_failed");
+            .with_risk_tags("fingerprint_forged,challenge_failed")
+            .with_headers("host: nas.home.lan\ncookie: a=1\n");
         let id = s.insert_event(&e).unwrap();
         assert!(id > 0);
 
@@ -1491,6 +1649,38 @@ mod tests {
         assert_eq!(events[0].client_ip, "203.0.113.9");
         assert_eq!(events[0].score, 50);
         assert_eq!(events[0].risk_tags, "fingerprint_forged,challenge_failed");
+        assert_eq!(events[0].host, "nas.home.lan");
+        assert_eq!(events[0].headers, "host: nas.home.lan\ncookie: a=1\n");
+    }
+
+    #[test]
+    fn query_events_matches_host_keyword() {
+        let s = store();
+        s.insert_event(
+            &Event::new(NOW, EventKind::Acl, "1.1.1.1")
+                .with_host("apiproxy.niao.fun")
+                .with_rules("unknown-host")
+                .with_action("block"),
+        )
+        .unwrap();
+        s.insert_event(
+            &Event::new(NOW + 1, EventKind::Acl, "2.2.2.2")
+                .with_host("home.niao.fun")
+                .with_rules("unknown-host")
+                .with_action("block"),
+        )
+        .unwrap();
+
+        // 关键字搜域名：能定位到探测的是哪个域名
+        let (events, total) = s
+            .query_events(&EventFilter {
+                q: Some("apiproxy".to_string()),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(events[0].host, "apiproxy.niao.fun");
     }
 
     #[test]
@@ -1990,6 +2180,33 @@ mod tests {
     }
 
     #[test]
+    fn latest_geo_headers_takes_newest_per_ip() {
+        let s = store();
+        // 1.1.1.1：先不带头（直连），后带头（经 CDN）→ 取后者
+        s.insert_event(&Event::new(NOW, EventKind::Detect, "1.1.1.1").with_headers("accept: */*"))
+            .unwrap();
+        s.insert_event(
+            &Event::new(NOW + 1, EventKind::Detect, "1.1.1.1")
+                .with_headers("cdn-loop: esa;loop=1\nali-ip-country: CN\nali-ip-city: Changsha"),
+        )
+        .unwrap();
+        // 2.2.2.2：只有不带头的事件 → 不应出现
+        s.insert_event(&Event::new(NOW + 2, EventKind::Detect, "2.2.2.2"))
+            .unwrap();
+
+        let got = s
+            .latest_geo_headers(
+                &["1.1.1.1".to_string(), "2.2.2.2".to_string()],
+                NOW,
+                NOW + 10,
+            )
+            .unwrap();
+        assert_eq!(got.len(), 1, "只返回带 ali-ip- 头的 IP");
+        assert!(got["1.1.1.1"].contains("ali-ip-city: Changsha"));
+        assert!(s.latest_geo_headers(&[], NOW, NOW + 10).unwrap().is_empty());
+    }
+
+    #[test]
     fn rule_feed_package_roundtrip() {
         let s = store();
         assert!(s.load_rule_feed_package("official").unwrap().is_none());
@@ -2069,7 +2286,7 @@ mod tests {
         assert_eq!(all.requests, 18);
         assert_eq!(all.blocked, 3);
         assert_eq!(all.status_4xx, 6);
-        assert_eq!(all.unique_ips, 2, "同一 IP 跨分钟/应用按天去重");
+        assert_eq!(all.unique_ips, 2, "同一 IP 跨分钟/应用按窗口并集去重");
         assert_eq!(all.unique_visitors, 2);
 
         let nas = s
@@ -2147,12 +2364,69 @@ mod tests {
                 .requests,
             0
         );
-        // 去重集合按天保留，当天其余分钟的报表仍可正确去重
+        // 独立 IP 随分钟行一起消失：去重集合不再按天长留，
+        // 否则会出现「请求数 0、独立 IP 2」这种对不上的报表
         assert_eq!(
             s.traffic_totals(minute, minute + 60, None)
                 .unwrap()
                 .unique_ips,
-            2
+            0
         );
+    }
+
+    #[test]
+    fn traffic_totals_uniques_are_window_scoped() {
+        let s = store();
+        let minute = NOW - NOW.rem_euclid(60);
+        s.save_traffic(&[traffic_row(minute, "nas", 4)]).unwrap();
+        let mut later = traffic_row(minute + 3_600, "nas", 4);
+        later.ips = vec![3, 4];
+        later.unique_ips = 2;
+        later.visitors = vec![33, 44];
+        later.unique_visitors = 2;
+        s.save_traffic(&[later]).unwrap();
+
+        // 窗口外分钟的 IP 不能算进窗口内（旧的按天去重会虚高）
+        let w = s.traffic_totals(minute, minute + 60, None).unwrap();
+        assert_eq!(w.unique_ips, 2);
+        assert_eq!(w.unique_visitors, 2);
+
+        // 跨小时窗口取并集，重复 IP 只算一次
+        let all = s.traffic_totals(minute, minute + 3_660, None).unwrap();
+        assert_eq!(all.unique_ips, 4);
+        assert_eq!(all.unique_visitors, 4);
+
+        // 同 IP 出现在两分钟，不重复计数
+        s.save_traffic(&[traffic_row(minute + 120, "nas", 1)])
+            .unwrap();
+        let w = s.traffic_totals(minute, minute + 180, None).unwrap();
+        assert_eq!(w.unique_ips, 2);
+        assert_eq!(w.unique_visitors, 2);
+    }
+
+    #[test]
+    fn traffic_totals_falls_back_to_detail_for_legacy_rows() {
+        let s = store();
+        let minute = NOW - NOW.rem_euclid(60);
+        let mut row = traffic_row(minute, "nas", 5);
+        row.ips = vec![];
+        row.visitors = vec![];
+        row.unique_ips = 1;
+        row.unique_visitors = 1;
+        row.detail = r#"{"statuses":{"200":5},"ips":[["8.8.8.8",5]],"visitors":[7]}"#.to_string();
+        s.save_traffic(&[row]).unwrap();
+        // 模拟老库行：哈希列是 NULL，只有明细 JSON
+        {
+            let conn = s.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE traffic_minutes SET ip_hashes = NULL, visitor_hashes = NULL",
+                [],
+            )
+            .unwrap();
+        }
+
+        let t = s.traffic_totals(minute, minute + 60, None).unwrap();
+        assert_eq!(t.unique_ips, 1, "从明细还原 IP 集合");
+        assert_eq!(t.unique_visitors, 1);
     }
 }

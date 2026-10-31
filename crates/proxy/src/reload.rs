@@ -123,6 +123,9 @@ impl RuntimeState {
 
         // 可信代理网段 = 手工填写 + 订阅组条目。云回源 IP 会变，靠订阅自动跟上。
         let mut real_ip = config.real_ip;
+        // 预设先展开，再并入订阅组：preset 可能补上回环地址与专有头序。
+        real_ip.apply_preset();
+        real_ip.expand_secret();
         merge_trusted_groups(&mut real_ip, &config.ip_groups, &ip_groups);
 
         let mut rules = homewaf_acl::rules_from_config(&config.acl);

@@ -92,7 +92,7 @@
   tr:last-child td { border-bottom: none; }
   code { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; }
 
-  .tag { display: inline-block; padding: 1px 8px; border-radius: 4px; font-size: 12px; background: var(--accent-soft); color: var(--accent); }
+  .tag { display: inline-block; padding: 1px 8px; border-radius: 4px; font-size: 12px; background: var(--accent-soft); color: var(--accent); white-space: nowrap; }
   .tag.deny, .tag.block { background: rgba(239,122,122,.14); color: var(--danger); }
   .tag.allow { background: rgba(102,217,168,.14); color: var(--ok); }
   .tag.log, .tag.observe { background: rgba(227,179,65,.14); color: var(--warn); }
@@ -107,7 +107,12 @@
   button.primary { background: var(--accent); color: #1a1a1a; border-color: var(--accent); font-weight: 600; }
   button.primary:hover { background: #e8c9ae; }
 
-  .empty { padding: 28px 16px; color: var(--muted); text-align: center; font-size: 13px; }
+  /* 空态占位：最小高度 + 居中，避免空数据时容器塌陷导致卡片高度不齐 */
+  .empty {
+    padding: 28px 16px; color: var(--muted); text-align: center; font-size: 13px;
+    min-height: 96px; box-sizing: border-box;
+    display: flex; align-items: center; justify-content: center;
+  }
 
   form { padding: 16px; display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); align-items: end; border-bottom: 1px solid var(--border); }
   form .wide { grid-column: 1 / -1; }
@@ -262,7 +267,13 @@
   }
   .dcard > header h2 { font-size: 13px; margin: 0; font-weight: 600; color: var(--s-text); }
   .dcard > header .muted { font-size: 11px; color: var(--s-muted); }
-  .dcard .empty { color: var(--s-muted); font-size: 12px; padding: 24px 14px; text-align: center; }
+  /* 空态占位：给最小高度并垂直居中，避免数据为空时卡片塌成一行字、
+     同排卡片高度不齐。min-height 与下方 .chart 的绘图区保持同一量级。 */
+  .dcard .empty {
+    color: var(--s-muted); font-size: 12px; padding: 24px 14px; text-align: center;
+    min-height: 120px; box-sizing: border-box;
+    display: flex; align-items: center; justify-content: center;
+  }
 
   .stats-cols { display: grid; gap: 12px; margin-bottom: 12px; }
   .stats-cols.two { grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
@@ -273,7 +284,9 @@
     .stats-cols.wide-left, .stats-cols.maprow, .stats-cols.report-cols { grid-template-columns: 1fr; }
   }
 
-  .chart { padding: 8px 6px 4px; }
+  /* min-height 与 lineChart 的绘图高度（H=220）对齐：
+     没数据时容器不塌陷，空态文字也居中，同排卡片高度才整齐 */
+  .chart { padding: 8px 6px 4px; min-height: 236px; box-sizing: border-box; display: grid; place-items: center; }
   .chart-svg { display: block; width: 100%; }
   .chart-svg .grid { stroke: #353535; stroke-width: 1; stroke-dasharray: 3 4; }
   .chart-svg .axis { fill: #8b9097; font-size: 10px; }
@@ -299,6 +312,37 @@
   .globe-canvas { display: block; width: 100%; height: 300px; cursor: grab; touch-action: none; }
   .globe-canvas:active { cursor: grabbing; }
   .screen-shell .globe-canvas { height: 320px; }
+  /* 科技连线地图 */
+  .arc-canvas { display: block; width: 100%; height: 300px; cursor: crosshair; touch-action: none; }
+  .screen-shell .arc-canvas { height: 320px; }
+  .map-tip {
+    position: absolute; pointer-events: none; z-index: 5; max-width: 260px;
+    background: rgba(10,22,38,.92); border: 1px solid rgba(56,214,255,.45);
+    border-radius: 8px; padding: 8px 12px; font-size: 12px; color: #cfeaff;
+    box-shadow: 0 6px 24px rgba(0,0,0,.45), 0 0 12px rgba(56,214,255,.18);
+    transform: translate(14px, -50%); white-space: nowrap;
+  }
+  .map-tip.flip { transform: translate(calc(-100% - 14px), -50%); }
+  .map-tip.hidden { display: none; }
+  .map-tip .t1 { font-weight: 600; color: #7fe3ff; font-size: 13px; }
+  .map-tip .t2 { color: #9fc6dd; margin-top: 2px; }
+  .map-tip .t2 b { color: #fff; font-weight: 600; }
+  .screen-shell.light .map-tip {
+    background: rgba(255,252,247,.97); border-color: rgba(196,110,50,.45); color: #5a4630;
+    box-shadow: 0 6px 24px rgba(120,80,40,.18);
+  }
+  .screen-shell.light .map-tip .t1 { color: #b05f28; }
+  .screen-shell.light .map-tip .t2 { color: #8a6f56; }
+  .screen-shell.light .map-tip .t2 b { color: #3a2a1a; }
+  /* 南海诸岛插图（领土要素） */
+  .scs-box { fill: rgba(18,18,18,.35); stroke: #4a4a4a; stroke-width: 1; }
+  .scs-line { stroke: #5f5f5f; stroke-width: 1; stroke-dasharray: 3 2; fill: none; }
+  .scs-dot { fill: #6f6f6f; }
+  .scs-label { fill: #8b9097; font-size: 7px; }
+  .screen-shell.light .scs-box { fill: rgba(255,255,255,.4); stroke: #c9beb2; }
+  .screen-shell.light .scs-line { stroke: #b5a696; }
+  .screen-shell.light .scs-dot { fill: #a08a74; }
+  .screen-shell.light .scs-label { fill: #8a745c; }
 
   .rank-h { padding: 10px 14px 0; font-size: 11px; color: var(--s-muted); }
   .ranklist { padding: 6px 14px 12px; display: grid; gap: 7px; }
@@ -307,7 +351,13 @@
     gap: 8px; align-items: center; font-size: 12px;
   }
   .rankrow .idx { color: #6f6f6c; font-variant-numeric: tabular-nums; }
+  /* 名称 + 可选小字（归属地）两行布局，IP 排行不再挤成一行截断 */
+  .rankrow .nm-wrap { min-width: 0; display: flex; flex-direction: column; gap: 1px; }
   .rankrow .nm { color: #d0d0cd; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .rankrow .nm-sub {
+    color: var(--s-muted); font-size: 11px; line-height: 1.35;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
   .rankrow .track { height: 6px; background: #2a2a2a; border-radius: 4px; overflow: hidden; }
   .rankrow .fill { display: block; height: 100%; border-radius: 4px; background: linear-gradient(90deg, #8c7a68, #f1d6bf); }
   .rankrow .num { text-align: right; color: var(--s-text); font-variant-numeric: tabular-nums; }
@@ -612,7 +662,7 @@
   }
 
   /* ---------- 标签与状态 ---------- */
-  .tag { background: var(--accent-soft); color: #f1d6bf; border-radius: 5px; }
+  .tag { background: var(--accent-soft); color: #f1d6bf; border-radius: 5px; white-space: nowrap; }
   .tag.deny, .tag.block { background: rgba(240, 106, 106, 0.14); color: #f39a9a; }
   .tag.allow { background: rgba(61, 220, 151, 0.14); color: #6fe0b4; }
   .tag.log, .tag.observe { background: rgba(227, 179, 65, 0.14); color: #e8c06a; }
@@ -680,7 +730,45 @@
   .pager { border-top: 1px solid var(--border); }
 
   #attack-events, #events { overflow-x: auto; }
-  #attack-events table, #events table { min-width: 680px; }
+  /* 事件表：固定列宽 + 单行省略。防止「人机验证」竖排、超长查询串撑爆行高 */
+  #attack-events table, #events table { min-width: 1180px; table-layout: fixed; }
+  #attack-events td, #events td,
+  #attack-events th, #events th {
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    vertical-align: middle;
+  }
+  #attack-events .mono, #events .mono { font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+  #attack-events .col-time, #events .col-time { width: 132px; font-size: 11px; }
+  #attack-events .col-kind, #events .col-kind { width: 92px; }
+  #attack-events .col-ip, #events .col-ip { width: 236px; }
+  #attack-events .col-host, #events .col-host { width: 148px; font-size: 11px; }
+  #attack-events .col-app, #events .col-app { width: 104px; }
+  #attack-events .col-path { width: auto; font-size: 11px; }
+  #events .col-req { width: auto; }
+  #attack-events .col-rules, #events .col-rules { width: 168px; }
+  #attack-events .col-tags, #events .col-tags { width: 112px; }
+  #attack-events .col-score, #events .col-score { width: 54px; text-align: center; }
+  #attack-events .col-action, #events .col-action { width: 78px; }
+  #attack-events .col-op { width: 76px; }
+  #events .col-detail { width: 64px; }
+  /* IP 单元格：IP 一行 + 归属地小字一行 */
+  .ev-ip code {
+    display: block; font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 11px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .ev-ip .geo-sub {
+    display: block; margin-top: 2px; font-size: 11px; color: var(--muted);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .req-path { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 11px; }
+  /* 展开的原始 JSON 行不受 nowrap / 裁剪限制 */
+  #attack-events .rawrow td, #events .rawrow td {
+    overflow: visible; white-space: normal; text-overflow: clip;
+  }
+  .rawrow pre {
+    white-space: pre-wrap; word-break: break-all;
+    max-height: 320px; overflow: auto; margin: 0;
+  }
 
   /* ---------- 防护应用：卡片列表（对齐雷池 /sites） ---------- */
   .app-grid {
@@ -927,7 +1015,8 @@
                     <button data-region="cn">中国</button>
                   </div>
                   <div class="seg" id="map-style">
-                    <button data-style="flat" class="on">平面</button>
+                    <button data-style="arc" class="on">连线</button>
+                    <button data-style="flat">平面</button>
                     <button data-style="globe">地球</button>
                   </div>
                 </div>
@@ -1109,7 +1198,7 @@
             <option value="">全部处置</option><option value="block">拦截</option>
             <option value="log">记录</option><option value="observe">观察</option>
           </select>
-          <input id="attack-q" placeholder="IP / 路径 / 规则关键字" onkeydown="if(event.key==='Enter'){attackPage=0;loadAttack()}">                    
+          <input id="attack-q" placeholder="IP / 域名 / 路径 / 规则关键字" onkeydown="if(event.key==='Enter'){attackPage=0;loadAttack()}">                    
           <button onclick="attackPage=0;loadAttack()">查询</button>
           <button onclick="exportAttack()">导出 CSV</button>
           <label class="row" style="margin:0;font-size:12px"><input type="checkbox" id="attack-auto" onchange="toggleAttackAuto()"> 自动刷新</label>
@@ -1344,7 +1433,7 @@
                 <option value="log">记录</option><option value="observe">观察</option>
               </select>
               <input id="ev-ip" placeholder="来源 IP" onkeydown="if(event.key==='Enter'){eventPage=0;loadEvents()}">
-              <input id="ev-q" placeholder="路径 / 规则 / UA / 请求 ID" style="min-width:200px"
+              <input id="ev-q" placeholder="域名 / 路径 / 规则 / UA / 请求 ID" style="min-width:220px"
                      onkeydown="if(event.key==='Enter'){eventPage=0;loadEvents()}">
               <button onclick="eventPage=0;loadEvents()">查询</button>
               <button onclick="exportEvents()">导出 CSV</button>
@@ -1539,7 +1628,8 @@
         <header>
           <h2>访问来源地图（24 小时）</h2>
           <div class="seg" id="screen-map-style">
-            <button data-style="flat" class="on">平面</button>
+            <button data-style="arc" class="on">连线</button>
+            <button data-style="flat">平面</button>
             <button data-style="globe">地球</button>
           </div>
           <div class="seg" id="screen-map-region">
@@ -2126,9 +2216,9 @@ document.getElementById('nav').addEventListener('click', (e) => {
 // ============================================================
 const STATS = {
   tab: 'traffic', range: 86400, app: '',
-  mapRegion: 'world', mapMode: 'all', geoCache: {}, mapStyle: 'flat',
+  mapRegion: 'world', mapMode: 'all', geoCache: {}, mapStyle: 'arc',
   reports: [], reportDay: null,
-  screenTimer: null, screenLight: false, screenRegion: 'world', screenGeo: null, screenMapStyle: 'flat',
+  screenTimer: null, screenLight: false, screenRegion: 'world', screenGeo: null, screenMapStyle: 'arc',
 };
 
 const CAT_LABELS = {
@@ -2285,7 +2375,10 @@ function rankList(el, items, opts = {}) {
   const label = opts.label || ((n) => n);
   el.innerHTML = `<div class="ranklist">${items.map((it, i) => `<div class="rankrow">
     <span class="idx">${i + 1}</span>
-    <span class="nm" title="${esc(it.name)}">${esc(label(it.name))}</span>
+    <span class="nm-wrap">
+      <span class="nm" title="${esc(it.name)}">${esc(label(it.name))}</span>
+      ${it.sub ? `<span class="nm-sub" title="${esc(it.sub)}">${esc(it.sub)}</span>` : ''}
+    </span>
     <span class="track"><span class="fill" style="width:${Math.max(2, it.count / max * 100)}%"></span></span>
     <span class="num">${fmtNum(it.count)}</span>
   </div>`).join('')}</div>`;
@@ -2302,6 +2395,9 @@ const WORLD_POLYS = [
   [[-45,60],[-20,70],[-20,83],[-60,83],[-55,70]],
   [[130,31],[136,35],[141,41],[145,44],[142,39],[138,34],[132,31]],
   [[-8,50],[-4,58],[2,58],[0,51]],
+  // 领土要素：海南岛、台湾岛（世界视图下同样可见）
+  [[108.7,19.2],[110.5,20.1],[111.5,18.3],[108.8,18.2]],
+  [[120,25.3],[121.9,25],[121.5,22.2],[120.2,22.6]],
 ];
 const CN_POLYS = [
   [[73.5,39.5],[76,40],[80,42],[85,45],[88,48],[90,47.5],[95,49],[98,52],[105,51],[110,49],[116,50],[120,53],[126,53],[130,49],[134,48],[135,45],[130,42],[124,41],[122,37],[121,31],[122,29],[120,25],[117,23],[110,21],[108,21],[106,22],[104,22],[101,21],[99,22],[97,24],[98,27],[95,28],[92,28],[88,28],[85,29],[81,30],[79,32],[78,35],[75,37]],
@@ -2318,10 +2414,14 @@ function pointInPoly(lon, lat, poly) {
   return inside;
 }
 
+const MAP_CFG_CACHE = {};
 function mapConfig(region) {
-  return region === 'cn'
+  if (MAP_CFG_CACHE[region]) return MAP_CFG_CACHE[region];
+  const cfg = region === 'cn'
     ? { lon0: 73, lon1: 135, lat0: 54, lat1: 18, step: 1.1, W: 600, H: 349, polys: CN_POLYS }
     : { lon0: -180, lon1: 180, lat0: 84, lat1: -56, step: 3, W: 600, H: 233, polys: WORLD_POLYS };
+  MAP_CFG_CACHE[region] = cfg;
+  return cfg;
 }
 
 const MAP_DOTS = {};
@@ -2353,6 +2453,25 @@ function mapNotes(geo) {
   return note + badge;
 }
 
+// 南海诸岛插图（领土要素示意）：标准地图右下角小图，含断续线与岛群点。
+// 内部坐标系 0..40 × 0..64，与绘制目标等比缩放。
+const SCS_DASHES = [[27,7,32,10],[32,10,35,15],[35,15,36,22],[36,22,35,30],[35,30,32,39],[32,39,27,47],[27,47,21,53],[21,53,14,57]];
+const SCS_ISLANDS = [[10,13],[13,11],[15,19],[12,22],[17,26],[13,29],[20,34],[16,37],[22,41],[15,43],[19,47],[13,48],[23,50],[17,52],[25,54]];
+
+function scsInsetSvg(cfg) {
+  const w = cfg.W * 0.075, h = cfg.H * 0.32;
+  const x = cfg.W - w - cfg.W * 0.012, y = cfg.H - h - cfg.H * 0.035;
+  const sx = w / 40, sy = h / 64;
+  const dashes = SCS_DASHES.map(([x1, y1, x2, y2]) =>
+    `<line x1="${(x1 * sx).toFixed(1)}" y1="${(y1 * sy).toFixed(1)}" x2="${(x2 * sx).toFixed(1)}" y2="${(y2 * sy).toFixed(1)}"/>`).join('');
+  const isls = SCS_ISLANDS.map(([ix, iy]) =>
+    `<rect x="${(ix * sx - 1).toFixed(1)}" y="${(iy * sy - 1).toFixed(1)}" width="2" height="2"/>`).join('');
+  return `<g transform="translate(${x.toFixed(1)},${y.toFixed(1)})">`
+    + `<rect x="0" y="0" width="${w.toFixed(1)}" height="${h.toFixed(1)}" class="scs-box"/>`
+    + `<g class="scs-line">${dashes}</g><g class="scs-dot">${isls}</g>`
+    + `<text x="${(w / 2).toFixed(1)}" y="${(h - 3).toFixed(1)}" text-anchor="middle" class="scs-label">南海诸岛</text></g>`;
+}
+
 function syncMapChrome(el, geo) {
   el.querySelectorAll('.map-note,.map-badge').forEach(n => n.remove());
   el.insertAdjacentHTML('beforeend', mapNotes(geo));
@@ -2360,6 +2479,7 @@ function syncMapChrome(el, geo) {
 
 function mapHtml(region, geo, hot, style) {
   if (style === 'globe') return `<canvas class="globe-canvas"></canvas>${mapNotes(geo)}`;
+  if (style === 'arc') return `<canvas class="arc-canvas"></canvas>${mapNotes(geo)}`;
   const cfg = mapConfig(region);
   const base = mapDots(region);
   const pts = (geo && geo.points ? geo.points : []).filter(p =>
@@ -2369,10 +2489,11 @@ function mapHtml(region, geo, hot, style) {
     const x = (p.longitude - cfg.lon0) / (cfg.lon1 - cfg.lon0) * cfg.W;
     const y = (cfg.lat0 - p.latitude) / (cfg.lat0 - cfg.lat1) * cfg.H;
     const r = (2 + Math.sqrt((p.count || 1) / max) * 5.5).toFixed(1);
+    const label = p.name ? `${p.name} · ` : '';
     return `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="${r}" class="geo-point${hot ? ' hot' : ''}">`
-      + `<title>${p.latitude.toFixed(2)}, ${p.longitude.toFixed(2)} · ${fmtNum(p.count)} 次</title></circle>`;
+      + `<title>${esc(label)}${fmtNum(p.count || 0)} 次 · ${p.latitude.toFixed(2)}, ${p.longitude.toFixed(2)}</title></circle>`;
   }).join('');
-  return `<svg viewBox="0 0 ${cfg.W} ${cfg.H}">${base}${pins}</svg>${mapNotes(geo)}`;
+  return `<svg viewBox="0 0 ${cfg.W} ${cfg.H}">${base}${pins}${scsInsetSvg(cfg)}</svg>${mapNotes(geo)}`;
 }
 
 // ---------- 旋转地球（canvas 正交投影） ----------
@@ -2583,6 +2704,442 @@ function mountGlobe(key, el, region, geo, hot) {
   return inst;
 }
 
+// ---------- 科技连线地图（canvas：来源城市 → 目的地流光弧线） ----------
+// 与平面点阵共用轮廓几何（viewBox 坐标），canvas 端等比缩放投影。
+const ARC_MAPS = {};
+const ARC_MAX_ARCS = 36;   // 动态弧线数量上限，超出的来源只画点
+const ARC_MAX_MARKS = 120; // 发光标记数量上限，更远的降级为小点
+
+const MAP_DOT_LISTS = {};
+function mapDotList(region) {
+  if (MAP_DOT_LISTS[region]) return MAP_DOT_LISTS[region];
+  const cfg = mapConfig(region);
+  const out = [];
+  for (let lon = cfg.lon0; lon <= cfg.lon1; lon += cfg.step) {
+    for (let lat = cfg.lat1; lat <= cfg.lat0; lat += cfg.step) {
+      if (!cfg.polys.some(poly => pointInPoly(lon, lat, poly))) continue;
+      out.push([
+        (lon - cfg.lon0) / (cfg.lon1 - cfg.lon0) * cfg.W,
+        (cfg.lat0 - lat) / (cfg.lat0 - cfg.lat1) * cfg.H,
+      ]);
+    }
+  }
+  MAP_DOT_LISTS[region] = out;
+  return out;
+}
+
+// 南海诸岛插图（canvas 版，与 scsInsetSvg 同一套示意数据）
+function drawScsInset(ctx, x, y, w, h, c) {
+  const sx = w / 40, sy = h / 64;
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.fillStyle = c.insetBg;
+  ctx.fillRect(0, 0, w, h);
+  ctx.strokeStyle = c.insetBorder;
+  ctx.lineWidth = 1;
+  ctx.strokeRect(0.5, 0.5, w - 1, h - 1);
+  ctx.strokeStyle = c.insetLine;
+  ctx.lineWidth = Math.max(1, sx * 0.7);
+  ctx.setLineDash([sx * 2.4, sx * 1.8]);
+  for (const [x1, y1, x2, y2] of SCS_DASHES) {
+    ctx.beginPath();
+    ctx.moveTo(x1 * sx, y1 * sy);
+    ctx.lineTo(x2 * sx, y2 * sy);
+    ctx.stroke();
+  }
+  ctx.setLineDash([]);
+  ctx.fillStyle = c.insetLine;
+  for (const [ix, iy] of SCS_ISLANDS) {
+    ctx.fillRect(ix * sx - 1, iy * sy - 1, 2, 2);
+  }
+  ctx.fillStyle = c.insetLabel;
+  ctx.font = `${Math.max(7, sy * 1.1).toFixed(0)}px sans-serif`;
+  ctx.textAlign = 'center';
+  ctx.fillText('南海诸岛', w / 2, h - sy * 1.2);
+  ctx.restore();
+}
+
+function createArcMap(canvas, region, geo, hot) {
+  const ctx = canvas.getContext('2d');
+  const TAU = Math.PI * 2;
+  const reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const st = {
+    region, geo, hot: !!hot,
+    hover: -1, pinned: false, pinnedIdx: -1,
+    last: 0, raf: 0, W: 0, H: 0, dpr: 0, s: 1, ox: 0, oy: 0,
+    base: null, baseKey: '', view: null,
+  };
+
+  const tip = document.createElement('div');
+  tip.className = 'map-tip hidden';
+  canvas.parentElement.appendChild(tip);
+
+  const isLight = () => {
+    const shell = canvas.closest('.screen-shell');
+    return !!(shell && shell.classList.contains('light'));
+  };
+
+  const palette = () => (isLight()
+    ? {
+        bg1: '#f8f3ec', bg2: '#e7dccd', grid: 'rgba(140,104,72,.10)',
+        dot: 'rgba(154,128,106,.50)', dotHi: 'rgba(210,110,50,.85)',
+        arcRGB: '196,110,50', destRGB: '44,122,90', scan: '196,110,50',
+        insetBg: 'rgba(248,243,236,.85)', insetBorder: 'rgba(160,130,100,.5)',
+        insetLine: 'rgba(160,130,100,.75)', insetLabel: '#8a745c',
+      }
+    : {
+        bg1: '#081120', bg2: '#0d1c30', grid: 'rgba(56,214,255,.08)',
+        dot: 'rgba(56,214,255,.38)', dotHi: 'rgba(56,214,255,.9)',
+        arcRGB: '56,214,255', destRGB: '53,224,161', scan: '56,214,255',
+        insetBg: 'rgba(8,17,32,.8)', insetBorder: 'rgba(56,214,255,.35)',
+        insetLine: 'rgba(56,214,255,.55)', insetLabel: 'rgba(120,190,230,.9)',
+      });
+
+  function fit() {
+    const dpr = window.devicePixelRatio || 1;
+    const w = canvas.clientWidth || 520;
+    const h = canvas.clientHeight || 300;
+    if (st.W !== w || st.H !== h || st.dpr !== dpr) {
+      canvas.width = Math.round(w * dpr);
+      canvas.height = Math.round(h * dpr);
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      st.W = w; st.H = h; st.dpr = dpr;
+      const cfg = mapConfig(st.region);
+      st.s = Math.min(w / cfg.W, h / cfg.H);
+      st.ox = (w - cfg.W * st.s) / 2;
+      st.oy = (h - cfg.H * st.s) / 2;
+      st.baseKey = '';
+    }
+    return { W: st.W, H: st.H };
+  }
+
+  function proj(lon, lat) {
+    const cfg = mapConfig(st.region);
+    return [
+      st.ox + (lon - cfg.lon0) / (cfg.lon1 - cfg.lon0) * cfg.W * st.s,
+      st.oy + (cfg.lat0 - lat) / (cfg.lat0 - cfg.lat1) * cfg.H * st.s,
+    ];
+  }
+
+  // 底图层缓存：背景渐变 + 淡网格 + 陆地点阵（确定性伪随机亮度做质感）+ 南海诸岛插图
+  function baseLayer(pal) {
+    const key = `${st.region}|${st.W}x${st.H}@${st.dpr}|${isLight()}`;
+    if (st.base && st.baseKey === key) return st.base;
+    const off = document.createElement('canvas');
+    off.width = canvas.width; off.height = canvas.height;
+    const b = off.getContext('2d');
+    b.setTransform(st.dpr, 0, 0, st.dpr, 0, 0);
+
+    const g = b.createLinearGradient(0, 0, 0, st.H);
+    g.addColorStop(0, pal.bg1);
+    g.addColorStop(1, pal.bg2);
+    b.fillStyle = g;
+    b.fillRect(0, 0, st.W, st.H);
+
+    b.strokeStyle = pal.grid;
+    b.lineWidth = 1;
+    const stepPx = 44;
+    for (let x = stepPx; x < st.W; x += stepPx) { b.beginPath(); b.moveTo(x, 0); b.lineTo(x, st.H); b.stroke(); }
+    for (let y = stepPx; y < st.H; y += stepPx) { b.beginPath(); b.moveTo(0, y); b.lineTo(st.W, y); b.stroke(); }
+
+    const dots = mapDotList(st.region);
+    for (let i = 0; i < dots.length; i++) {
+      const px = st.ox + dots[i][0] * st.s;
+      const py = st.oy + dots[i][1] * st.s;
+      // 确定性伪随机（索引哈希），每次重建一致
+      const w = ((i * 2654435761) >>> 0) / 4294967295;
+      const bright = w > 0.82;
+      b.fillStyle = bright ? pal.dotHi : pal.dot;
+      const sz = bright ? 1.8 : 1.3;
+      b.fillRect(px, py, sz, sz);
+    }
+
+    const iw = Math.max(34, st.W * 0.07), ih = Math.max(58, st.H * 0.30);
+    drawScsInset(b, st.W - iw - st.W * 0.012, st.H - ih - st.H * 0.035, iw, ih, pal);
+
+    st.base = off;
+    st.baseKey = key;
+    return off;
+  }
+
+  function qPoint(x1, y1, cx, cy, x2, y2, t) {
+    const u = 1 - t;
+    return [u * u * x1 + 2 * u * t * cx + t * t * x2, u * u * y1 + 2 * u * t * cy + t * t * y2];
+  }
+
+  function draw(ts) {
+    const { W, H } = fit();
+    const pal = palette();
+    const rgb = st.hot ? '255,107,129' : pal.arcRGB;
+
+    ctx.drawImage(baseLayer(pal), 0, 0, W, H);
+
+    // 缓慢漂移的扫描光带（reduced-motion 时跳过）
+    if (!reduce) {
+      const sweep = ((ts / 34) % (W + 300)) - 150;
+      const sg = ctx.createLinearGradient(sweep - 120, 0, sweep + 120, 0);
+      sg.addColorStop(0, `rgba(${pal.scan},0)`);
+      sg.addColorStop(.5, `rgba(${pal.scan},${isLight() ? .05 : .07})`);
+      sg.addColorStop(1, `rgba(${pal.scan},0)`);
+      ctx.fillStyle = sg;
+      ctx.fillRect(sweep - 120, 0, 240, H);
+    }
+
+    const cfg = mapConfig(st.region);
+    const pts = ((st.geo && st.geo.points) || []).filter(p =>
+      p.longitude >= cfg.lon0 && p.longitude <= cfg.lon1 && p.latitude >= cfg.lat1 && p.latitude <= cfg.lat0);
+    pts.sort((a, b) => (b.count || 0) - (a.count || 0));
+    const max = Math.max(1, ...pts.map(p => p.count || 1));
+    st.view = pts;
+
+    const destLat = (st.geo && st.geo.dest_lat) ?? 39.9042;
+    const destLon = (st.geo && st.geo.dest_lon) ?? 116.4074;
+    const [dx, dy] = proj(destLon, destLat);
+
+    // 弧线：来源 → 目的地，贝塞尔大弧 + 流光粒子
+    const arcN = Math.min(pts.length, ARC_MAX_ARCS);
+    for (let i = 0; i < arcN; i++) {
+      const p = pts[i];
+      const [x1, y1] = proj(p.longitude, p.latitude);
+      const vx = dx - x1, vy = dy - y1;
+      const dist = Math.hypot(vx, vy) || 1;
+      const lift = Math.min(0.32, 22 / dist + 0.14);
+      const cx = (x1 + dx) / 2 - vy * lift;
+      const cy = (y1 + dy) / 2 + vx * lift;
+
+      const wgt = Math.sqrt((p.count || 1) / max);
+      const isHover = i === st.hover;
+      const alpha = isHover ? 0.95 : 0.26 + 0.4 * wgt;
+
+      const grad = ctx.createLinearGradient(x1, y1, dx, dy);
+      grad.addColorStop(0, `rgba(${rgb},${(alpha * 0.15).toFixed(3)})`);
+      grad.addColorStop(.45, `rgba(${rgb},${(alpha * 0.8).toFixed(3)})`);
+      grad.addColorStop(1, `rgba(${rgb},${(alpha * 0.22).toFixed(3)})`);
+      ctx.strokeStyle = grad;
+      ctx.lineWidth = isHover ? 1.2 + 1.6 * wgt + 1.2 : 1.2 + 1.6 * wgt;
+      ctx.beginPath();
+      ctx.moveTo(x1, y1);
+      ctx.quadraticCurveTo(cx, cy, dx, dy);
+      if (isHover) {
+        ctx.shadowBlur = 12;
+        ctx.shadowColor = `rgba(${rgb},.75)`;
+      }
+      ctx.stroke();
+      ctx.shadowBlur = 0;
+
+      // 流光粒子：沿弧线向目的地漂移，尾部光晕
+      const phases = reduce ? [0.45] : [(ts / 2600 + i * 0.13) % 1, (ts / 2600 + i * 0.13 + 0.5) % 1];
+      for (let k = 0; k < phases.length; k++) {
+        const t = phases[k];
+        const [hx, hy] = qPoint(x1, y1, cx, cy, dx, dy, t);
+        const hr = isHover ? 3 : (k === 0 ? 2.2 : 1.5);
+        const hg = ctx.createRadialGradient(hx, hy, 0, hx, hy, hr * 3.2);
+        hg.addColorStop(0, `rgba(${rgb},.85)`);
+        hg.addColorStop(1, `rgba(${rgb},0)`);
+        ctx.fillStyle = hg;
+        ctx.beginPath();
+        ctx.arc(hx, hy, hr * 3.2, 0, TAU);
+        ctx.fill();
+        ctx.fillStyle = `rgba(255,255,255,${k === 0 ? .9 : .6})`;
+        ctx.beginPath();
+        ctx.arc(hx, hy, hr * 0.62, 0, TAU);
+        ctx.fill();
+      }
+    }
+
+    // 来源点：光晕 + 核心 + 脉冲环
+    for (let i = 0; i < pts.length; i++) {
+      const p = pts[i];
+      const [x, y] = proj(p.longitude, p.latitude);
+      const wgt = Math.sqrt((p.count || 1) / max);
+      const isHover = i === st.hover;
+      if (i < ARC_MAX_MARKS) {
+        const base = 2 + wgt * 4.2;
+        const halo = ctx.createRadialGradient(x, y, 0, x, y, base * 3);
+        halo.addColorStop(0, `rgba(${rgb},${isHover ? .52 : .26})`);
+        halo.addColorStop(1, `rgba(${rgb},0)`);
+        ctx.fillStyle = halo;
+        ctx.beginPath();
+        ctx.arc(x, y, base * 3, 0, TAU);
+        ctx.fill();
+        ctx.fillStyle = `rgba(${rgb},${isHover ? 1 : .9})`;
+        ctx.beginPath();
+        ctx.arc(x, y, base * (isHover ? 1.3 : .85), 0, TAU);
+        ctx.fill();
+        if (i < 24 && !reduce) {
+          const ph = ((ts / 2200) + i * 0.37) % 1;
+          ctx.strokeStyle = `rgba(${rgb},${((1 - ph) * .5).toFixed(3)})`;
+          ctx.lineWidth = 1.2;
+          ctx.beginPath();
+          ctx.arc(x, y, base * (1.4 + 3.2 * ph), 0, TAU);
+          ctx.stroke();
+        }
+      } else {
+        ctx.fillStyle = `rgba(${rgb},.45)`;
+        ctx.fillRect(x - 0.8, y - 0.8, 1.6, 1.6);
+      }
+    }
+
+    // 目的地枢纽：光环 + 旋转虚线环 + 准星 + 标签
+    const dRGB = pal.destRGB;
+    const halo = ctx.createRadialGradient(dx, dy, 0, dx, dy, 26);
+    halo.addColorStop(0, `rgba(${dRGB},.38)`);
+    halo.addColorStop(1, `rgba(${dRGB},0)`);
+    ctx.fillStyle = halo;
+    ctx.beginPath();
+    ctx.arc(dx, dy, 26, 0, TAU);
+    ctx.fill();
+    ctx.save();
+    ctx.translate(dx, dy);
+    ctx.rotate(reduce ? 0 : ts / 4200);
+    ctx.strokeStyle = `rgba(${dRGB},.75)`;
+    ctx.lineWidth = 1.4;
+    ctx.setLineDash([5, 5]);
+    ctx.beginPath();
+    ctx.arc(0, 0, 14, 0, TAU);
+    ctx.stroke();
+    ctx.restore();
+    ctx.setLineDash([]);
+    ctx.strokeStyle = `rgba(${dRGB},.9)`;
+    ctx.lineWidth = 1.6;
+    ctx.beginPath();
+    ctx.arc(dx, dy, 8, 0, TAU);
+    ctx.stroke();
+    ctx.fillStyle = `rgba(${dRGB},1)`;
+    ctx.beginPath();
+    ctx.arc(dx, dy, 3.4, 0, TAU);
+    ctx.fill();
+    ctx.strokeStyle = `rgba(${dRGB},.5)`;
+    ctx.lineWidth = 1;
+    for (const [a, b, c2, d2] of [[0, -21, 0, -11], [0, 11, 0, 21], [-21, 0, -11, 0], [11, 0, 21, 0]]) {
+      ctx.beginPath();
+      ctx.moveTo(dx + a, dy + b);
+      ctx.lineTo(dx + c2, dy + d2);
+      ctx.stroke();
+    }
+    ctx.font = '11px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillStyle = `rgba(${dRGB},.95)`;
+    ctx.fillText('目的地', dx, dy + 34);
+  }
+
+  // ---------- 悬停 / 点击交互 ----------
+  function nearest(mx, my) {
+    const pts = st.view || [];
+    let best = -1, bestD = 15 * 15;
+    for (let i = 0; i < pts.length && i < ARC_MAX_MARKS; i++) {
+      const [x, y] = proj(pts[i].longitude, pts[i].latitude);
+      const d = (x - mx) * (x - mx) + (y - my) * (y - my);
+      if (d < bestD) { bestD = d; best = i; }
+    }
+    return best;
+  }
+
+  function showTip(i, mx, my) {
+    const p = (st.view || [])[i];
+    if (!p) return;
+    const name = p.name || `${p.latitude.toFixed(2)}, ${p.longitude.toFixed(2)}`;
+    tip.innerHTML = `<div class="t1">${esc(name)}</div>`
+      + `<div class="t2"><b>${fmtNum(p.count || 0)}</b> 次访问 → 目的地</div>`;
+    tip.classList.remove('hidden');
+    tip.classList.toggle('flip', mx > st.W - 170);
+    const top = Math.min(Math.max(my, 28), st.H - 28);
+    tip.style.left = (mx + canvas.offsetLeft) + 'px';
+    tip.style.top = (top + canvas.offsetTop) + 'px';
+  }
+
+  function clearHover() {
+    st.hover = -1;
+    tip.classList.add('hidden');
+    resume();
+  }
+
+  function hoverAt(mx, my) {
+    const idx = nearest(mx, my);
+    if (idx !== st.hover) {
+      st.hover = idx;
+      resume();
+    }
+    if (idx >= 0) showTip(idx, mx, my);
+    else tip.classList.add('hidden');
+    return idx;
+  }
+
+  canvas.addEventListener('pointermove', (e) => {
+    if (st.pinned) return;
+    const r = canvas.getBoundingClientRect();
+    hoverAt(e.clientX - r.left, e.clientY - r.top);
+  });
+  canvas.addEventListener('pointerleave', () => {
+    if (!st.pinned) clearHover();
+  });
+  canvas.addEventListener('click', (e) => {
+    const r = canvas.getBoundingClientRect();
+    const mx = e.clientX - r.left, my = e.clientY - r.top;
+    const idx = hoverAt(mx, my);
+    if (idx >= 0) {
+      st.pinned = st.pinnedIdx !== idx;
+      st.pinnedIdx = st.pinned ? idx : -1;
+    } else {
+      st.pinned = false;
+      st.pinnedIdx = -1;
+      clearHover();
+    }
+  });
+
+  function frame(ts) {
+    st.raf = 0;
+    if (!canvas.isConnected || canvas.offsetParent === null) return;
+    draw(ts);
+    st.raf = requestAnimationFrame(frame);
+  }
+
+  function resume() {
+    if (!canvas.isConnected) return;
+    if (reduce) {
+      draw(st.last || performance.now());
+      return;
+    }
+    if (!st.raf) {
+      st.last = 0;
+      st.raf = requestAnimationFrame(frame);
+    }
+  }
+
+  return {
+    canvas,
+    set(region, geo, hot) {
+      if (region !== st.region) {
+        // 区域切换后比例与底图都要重建
+        st.baseKey = '';
+        st.W = 0;
+      }
+      st.region = region;
+      st.geo = geo;
+      st.hot = !!hot;
+      if (st.hover >= ((geo && geo.points) || []).length) clearHover();
+    },
+    resume,
+  };
+}
+
+// 复用已有连线图实例，避免定时刷新打断悬停与动画
+function mountArc(key, el, region, geo, hot) {
+  const old = ARC_MAPS[key];
+  if (old && old.canvas.isConnected && el.contains(old.canvas)) {
+    old.set(region, geo, hot);
+    old.resume();
+    syncMapChrome(el, geo);
+    return old;
+  }
+  const canvas = el.querySelector('canvas.arc-canvas');
+  if (!canvas) return null;
+  const inst = createArcMap(canvas, region, geo, hot);
+  ARC_MAPS[key] = inst;
+  inst.resume();
+  return inst;
+}
+
 
 // ---------- 流量分析 ----------
 async function loadStatistics() {
@@ -2675,12 +3232,14 @@ async function renderTrafficMap() {
   }
 }
 
-// 统一入口：地球模式复用已有 canvas，避免定时刷新把旋转角度重置
+// 统一入口：地球 / 连线模式复用已有 canvas，避免定时刷新把动画状态重置
 function renderMapInto(el, key, region, geo, hot, style) {
-  const reuse = style === 'globe' && mountGlobe(key, el, region, geo, hot);
+  const reuse = (style === 'globe' && mountGlobe(key, el, region, geo, hot))
+    || (style === 'arc' && mountArc(key, el, region, geo, hot));
   if (reuse) return;
   el.innerHTML = mapHtml(region, geo, hot, style);
   if (style === 'globe') mountGlobe(key, el, region, geo, hot);
+  if (style === 'arc') mountArc(key, el, region, geo, hot);
 }
 
 function renderGeoList(geo) {
@@ -2748,7 +3307,7 @@ async function loadSecurity() {
       ? `<table class="darktable"><thead><tr><th>来源 IP</th><th>归属地</th><th class="num">次数</th></tr></thead>
         <tbody>${ips.map(ip => `<tr>
           <td class="mono">${esc(ip.ip)}</td>
-          <td class="geo">${esc(geoText(ip.geo))}</td>
+          <td class="geo" title="${esc(geoTitle(ip.geo))}">${esc(geoText(ip.geo))}</td>
           <td class="num">${fmtNum(ip.count)}</td>
         </tr>`).join('')}</tbody></table>`
       : '<div class="empty">暂无攻击来源</div>';
@@ -2756,11 +3315,12 @@ async function loadSecurity() {
     const recent = d.recent || [];
     document.getElementById('sec-recent').innerHTML = recent.length
       ? `<table class="darktable"><thead><tr>
-          <th>时间</th><th>类型</th><th>来源 IP</th><th>应用</th><th>路径</th><th>处置</th>
-        </tr></thead><tbody>${recent.map(e => `<tr>
+          <th>时间</th><th>类型</th><th>来源 IP</th><th>域名</th><th>应用</th><th>路径</th><th>处置</th>
+        </tr></thead>        <tbody>${recent.map(e => `<tr>
           <td>${fmtTime(e.ts)}</td>
           <td>${esc(kindLabel(e.kind))}</td>
-          <td class="mono">${esc(e.client_ip)}</td>
+          <td class="mono ev-ip"><code>${esc(e.client_ip)}</code>${e.geo ? `<span class="geo-sub" title="${esc(geoTitle(e.geo))}">${esc(geoText(e.geo))}</span>` : ''}</td>
+          <td class="mono">${esc(e.host || '—')}</td>
           <td>${esc(appLabel(e.app))}</td>
           <td class="mono">${esc(e.path || '—')}</td>
           <td><span class="tag ${esc(e.action)}">${esc(actionLabel(e.action))}</span></td>
@@ -2771,17 +3331,33 @@ async function loadSecurity() {
   }
 }
 
+// 运营商 / 机房短名：rank 列表里放不下完整 ASN，映射成常见中文名
+const ISP_SHORT = [
+  [/UNICOM|CNCGROUP|CHINA169/i, '联通'], [/TELECOM|CHINANET/i, '电信'], [/MOBILE|CMNET/i, '移动'],
+  [/CERNET/i, '教育网'], [/TENCENT/i, '腾讯'], [/ALIBABA|ALIYUN/i, '阿里'], [/AMAZON|\bAWS\b/i, 'AWS'],
+  [/GOOGLE/i, 'Google'], [/MICROSOFT|AZURE/i, '微软'], [/BAIDU/i, '百度'], [/HUAWEI/i, '华为'],
+];
+const ispShort = (g) => {
+  const s = (g && (g.isp || g.asn)) || '';
+  if (!s) return '';
+  for (const [re, name] of ISP_SHORT) if (re.test(s)) return name;
+  return g.isp || '';
+};
 const geoText = (g) => {
   if (!g) return '—';
   const parts = [g.country, g.province, g.city].filter(Boolean);
+  const isp = ispShort(g);
+  if (isp) parts.push(isp);
   return parts.length ? parts.join(' / ') : '—';
 };
+// 完整运营商 / ASN（机房），放 title 提示
+const geoTitle = (g) => (g ? [g.isp, g.asn].filter(Boolean).join(' · ') : '');
 
 function ipTable(ips) {
   if (!ips || !ips.length) return '<div class="empty">暂无数据</div>';
   return `<table class="darktable"><thead><tr><th>来源 IP</th><th>归属地</th><th class="num">次数</th></tr></thead>
     <tbody>${ips.map(ip => `<tr>
-      <td class="mono">${esc(ip.ip)}</td><td class="geo">${esc(geoText(ip.geo))}</td>
+      <td class="mono">${esc(ip.ip)}</td><td class="geo" title="${esc(geoTitle(ip.geo))}">${esc(geoText(ip.geo))}</td>
       <td class="num">${fmtNum(ip.count)}</td></tr>`).join('')}</tbody></table>`;
 }
 
@@ -2953,7 +3529,7 @@ async function loadScreen() {
     document.getElementById('screen-ips').innerHTML = ips.length
       ? `<table class="darktable"><thead><tr><th>来源 IP</th><th>归属地</th><th class="num">次数</th></tr></thead>
         <tbody>${ips.map(ip => `<tr><td class="mono">${esc(ip.ip)}</td>
-          <td class="geo">${esc(geoText(ip.geo))}</td><td class="num">${fmtNum(ip.count)}</td></tr>`).join('')}</tbody></table>`
+          <td class="geo" title="${esc(geoTitle(ip.geo))}">${esc(geoText(ip.geo))}</td><td class="num">${fmtNum(ip.count)}</td></tr>`).join('')}</tbody></table>`
       : '<div class="empty">今日暂无攻击来源</div>';
   } catch (e) {
     document.getElementById('screen-sub').textContent = '加载失败：' + e.message;
@@ -4578,21 +5154,26 @@ async function loadEvents() {
       : kind === 'challenge' ? '风险分'
       : '分数';
     el.innerHTML = `<table>
-      <thead><tr><th>时间</th><th>类型</th><th>来源 IP</th><th>请求</th><th>命中规则</th><th>风险标签</th><th>${scoreHeader}</th><th>处置</th><th>应用</th><th></th></tr></thead>
+      <thead><tr>
+        <th class="col-time">时间</th><th class="col-kind">类型</th><th class="col-ip">来源 IP</th>
+        <th class="col-host">域名</th><th class="col-req">请求</th><th class="col-rules">命中规则</th>
+        <th class="col-tags">风险标签</th><th class="col-score">${scoreHeader}</th>
+        <th class="col-action">处置</th><th class="col-app">应用</th><th class="col-detail"></th>
+      </tr></thead>
       <tbody>${events.map((e, i) => `<tr>
-        <td style="white-space:nowrap">${fmtTime(e.ts)}</td>
-        <td>${esc(kindLabel(e.kind))}</td>
-        <td><code>${esc(e.client_ip)}</code></td>
-        <td style="max-width:340px">
-          <div><span class="tag">${esc(e.method || '-')}</span> <code style="font-size:12px">${esc(e.path || '-')}</code></div>
-          ${e.query ? `<div class="sub" style="margin:2px 0 0;word-break:break-all">?${esc(e.query)}</div>` : ''}
-        </td>
-        <td style="max-width:280px;word-break:break-all">${esc(ruleLabel(e.rule_names || e.rules))}</td>
-        <td style="max-width:200px;word-break:break-all">${riskTagsHtml(e.risk_tags)}</td>
-        <td>${e.score}</td>
-        <td><span class="tag ${esc(e.action)}">${esc(actionLabel(e.action))}</span></td>
-        <td>${esc(appLabel(e.app))}</td>
-        <td><button onclick="showEventDetail(${i})">详情</button></td>
+        <td class="col-time">${fmtTime(e.ts)}</td>
+        <td class="col-kind"><span class="tag">${esc(kindLabel(e.kind))}</span></td>
+        <td class="col-ip ev-ip"><code>${esc(e.client_ip)}</code>${e.geo ? `<span class="geo-sub" title="${esc(geoTitle(e.geo))}">${esc(geoText(e.geo))}</span>` : ''}</td>
+        <td class="col-host mono" title="${esc(e.host || '')}">${esc(e.host || '—')}</td>
+        <td class="col-req" title="${esc((e.method || '-') + ' ' + (e.path || '-') + (e.query ? '?' + e.query : ''))}">
+          <span class="tag">${esc(e.method || '-')}</span>
+          <code class="req-path">${esc((e.path || '-') + (e.query ? '?' + e.query : ''))}</code></td>
+        <td class="col-rules" title="${esc(ruleLabel(e.rule_names || e.rules))}">${esc(ruleLabel(e.rule_names || e.rules))}</td>
+        <td class="col-tags">${riskTagsHtml(e.risk_tags)}</td>
+        <td class="col-score">${e.score}</td>
+        <td class="col-action"><span class="tag ${esc(e.action)}">${esc(actionLabel(e.action))}</span></td>
+        <td class="col-app" title="${esc(appLabel(e.app))}">${esc(appLabel(e.app))}</td>
+        <td class="col-detail"><button onclick="showEventDetail(${i})">详情</button></td>
       </tr>`).join('')}</tbody></table>`;
     eventCache = events;
 
@@ -4671,6 +5252,10 @@ function showEventDetail(i) {
     ['时间', esc(fmtTime(e.ts))],
     ['类型 / 处置', `${esc(kindLabel(e.kind))} · <span class="tag ${esc(e.action)}">${esc(actionLabel(e.action))}</span>`],
     ['来源 IP', `<code>${esc(e.client_ip || '-')}</code>`],
+    ['归属地', e.geo ? esc([e.geo.country, e.geo.province, e.geo.city].filter(Boolean).join(' / ') || '—') : '—'],
+    ['运营商', e.geo && e.geo.isp ? esc(e.geo.isp) : '—'],
+    ['ASN / 机房', e.geo && e.geo.asn ? `<code style="word-break:break-all">${esc(e.geo.asn)}</code>` : '—'],
+    ['域名', e.host ? `<code style="word-break:break-all">${esc(e.host)}</code>` : '—'],
     ['应用', esc(appLabel(e.app))],
     ['请求', `<span class="tag">${esc(e.method || '-')}</span> <code>${esc(e.path || '-')}</code>`],
     ['查询串', e.query ? `<code style="word-break:break-all">${esc(e.query)}</code>` : '—'],
@@ -4679,6 +5264,9 @@ function showEventDetail(i) {
     ['命中规则名称', esc(ruleLabel(e.rule_names || e.rules))],
     ['风险标签', riskTagsHtml(e.risk_tags)],
     ['风险分', String(e.score ?? 0)],
+    ['请求头', e.headers
+      ? `<pre style="margin:0;text-align:left;max-height:240px;overflow:auto;font-size:12px;white-space:pre-wrap;word-break:break-all">${esc(e.headers)}</pre>`
+      : '—'],
     ['请求 ID', e.request_id
       ? `<code>${esc(e.request_id)}</code> <button onclick="gotoLogsByReq('${esc(e.request_id)}', '${esc(e.app || '')}')">查看日志</button>`
       : '—'],
@@ -5061,9 +5649,49 @@ function renderSettings(s) {
           <select id="set-trusted-groups" multiple hidden></select>
         </div></div>
       <div class="wide"><label for="set-headers">头部优先级（逗号分隔）</label>
-        <input id="set-headers" placeholder="CF-Connecting-IP, X-Real-IP" value="${(ri.header_priority || []).join(', ')}"></div>
-      <div class="hint">只有来自可信代理的请求才会解析这些头，其余一律用直连 IP。
-        云 CDN / 回源节点网段会变，选订阅组（需为「放行」动作）可自动跟上。</div>
+        <input id="set-headers" placeholder="CF-Connecting-IP, Aliyun-Cdn-Real-Ip, X-Forwarded-For" value="${(ri.header_priority || []).join(', ')}"></div>
+      <div><label for="set-realip-preset">CDN 预设</label>
+        <select id="set-realip-preset" onchange="onRealIpPresetChange()">
+          <option value="" ${ri.preset ? '' : 'selected'}>不预设（手工配置）</option>
+          <option value="aliyun-cdn" ${ri.preset === 'aliyun-cdn' ? 'selected' : ''}>阿里云 CDN</option>
+          <option value="tencent-cdn" ${ri.preset === 'tencent-cdn' ? 'selected' : ''}>腾讯云 CDN</option>
+          <option value="cloudflare" ${ri.preset === 'cloudflare' ? 'selected' : ''}>Cloudflare</option>
+          <option value="cloudfront" ${ri.preset === 'cloudfront' ? 'selected' : ''}>AWS CloudFront</option>
+          <option value="frp" ${ri.preset === 'frp' ? 'selected' : ''}>frp / 本机反代</option>
+        </select></div>
+      <div><label for="set-realip-untrusted">不可信来源带转发头时</label>
+        <select id="set-realip-untrusted">
+          <option value="ignore" ${ri.on_untrusted_header === 'reject' ? '' : 'selected'}>忽略头部，用直连 IP</option>
+          <option value="reject" ${ri.on_untrusted_header === 'reject' ? 'selected' : ''}>直接拒绝（400）</option>
+        </select></div>
+      <div><label for="set-realip-secret-header">回源标记头名</label>
+        <input id="set-realip-secret-header" placeholder="X-8f3a2b-Real-Forwarded-For（留空不用）" value="${esc(ri.secret_header || '')}"></div>
+      <div><label for="set-realip-secret">回源标记头的值</label>
+        <input id="set-realip-secret" type="password" autocomplete="new-password" placeholder="留空 = 只认头名（头名即密钥）" value="${esc(ri.secret || '')}"></div>
+      <label class="row"><input type="checkbox" id="set-realip-private" ${ri.trust_private_source ? 'checked' : ''}>
+        私有网段来源自动可信（内网直连不必填网段，也不怕 IPv6 前缀漂移）</label>
+      <label class="row"><input type="checkbox" id="set-realip-any" ${ri.trust_any_source ? 'checked' : ''}>
+        信任所有来源（不判断来源，任何请求的转发头都采信 —— 等于关闭防伪造）</label>
+      <label class="row"><input type="checkbox" id="set-realip-require-trusted" ${ri.require_trusted_source ? 'checked' : ''}>
+        拒绝不可信来源（公网绕过 CDN 直连源站一律 403）</label>
+      <div class="hint">勾上后源站只服务「可信网段」与「带标记头的 CDN 回源」，其余全部拒绝——
+        这是回源 IP 拿不到时唯一能挡住绕 CDN 直连的办法。<b>注意</b>：ACME HTTP-01 验证、
+        第三方回调、外部探针、直连应用声明端口的场景都会被误伤，且必须至少配置一个可信来源
+        （内网网段或回源标记头），否则全站 403。</div>
+      <div class="hint">只有来自可信来源的请求才会解析这些头，其余一律用直连 IP。
+        可信来源 = 可信代理网段（手动 ∪ 订阅组）<b>或</b> 回源标记头校验通过
+        <b>或</b> 私有网段自动可信（勾上时）。<br>
+        云 CDN / 回源节点网段会变，选订阅组（需为「放行」动作）可自动跟上；内网直连
+        靠「私有网段自动可信」兜住，不用手抄 <code>10.0.0.0/8</code> 之类，
+        家宽 IPv6 前缀变了也不受影响。<br>
+        阿里云 / 腾讯云这类 CDN 的回源 IP <b>不公开且会漂移</b>，网段白名单走不通，改用 CDN 的
+        「自定义回源 HTTP 请求头」当标记：<br>
+        · <b>头名即密钥</b>：CDN 把客户端 IP 写进自定义头（如
+        <code>X-8f3a2b-Real-Forwarded-For</code>），这里只填头名、值留空，
+        请求带该头且值是合法 IP 才认为经过 CDN；<br>
+        · <b>严格模式</b>：CDN 写固定值（如 <code>X-Origin-Verify: &lt;随机串&gt;</code>），
+        头名和值都填，头名泄露也不致命。<br>
+        两种模式都记得把这个头名加进上面的「头部优先级」，否则拿到了信任却取不到 IP。</div>
     </div>
     <div class="fieldset">
       <h3>CC 防护（限流）</h3>
@@ -5104,6 +5732,9 @@ function renderSettings(s) {
           <button id="set-geoip-download" onclick="downloadGeoip()">下载默认库</button></div></div>
       <div class="hint">用于统计报表与防护大屏的访问来源地图。只在控制台聚合时查询，不影响代理转发；留空时地图显示「未启用地理位置」。<br>
         默认下载源 <code>https://cdn.jsdelivr.net/npm/geolite2-city/GeoLite2-City.mmdb.gz</code>，下载后自动解压到数据目录、写入路径并立即生效。</div>
+      <div class="wide"><label for="set-map-dest">连线目的地坐标（纬度,经度）</label>
+        <input id="set-map-dest" placeholder="39.9042,116.4074（留空默认北京）" value="${esc(s.map_dest || '')}"></div>
+      <div class="hint">「连线」地图上所有来源弧线的汇聚点，填你服务出口所在城市坐标；留空用默认（北京）。</div>
     </div>`;
   fillTrustedGroups(ri.trusted_proxy_groups || []);
 }
@@ -5120,6 +5751,22 @@ async function fillTrustedGroups(selected) {
     ? groups.map(g => `<option value="${esc(g.name)}"${picked.has(g.name) ? ' selected' : ''}>${esc(g.display_name)}（${esc(g.name)}）</option>`).join('')
     : '<option value="" disabled>暂无 IP 组订阅</option>';
   msRender('set-trusted-groups');
+}
+
+/// 选中 CDN 预设时同步头序输入框，避免「界面显示默认头、运行时用预设头」的割裂。
+const REALIP_PRESET_HEADERS = {
+  'cloudflare': 'CF-Connecting-IP, True-Client-IP, X-Forwarded-For',
+  'aliyun-cdn': 'Ali-Cdn-Real-Ip, X-Forwarded-For',
+  'tencent-cdn': 'X-Real-IP, X-Forwarded-For',
+  'cloudfront': 'CloudFront-Viewer-Address, X-Forwarded-For',
+  'frp': 'X-Forwarded-For, X-Real-IP',
+};
+
+function onRealIpPresetChange() {
+  const preset = document.getElementById('set-realip-preset').value;
+  const headers = REALIP_PRESET_HEADERS[preset];
+  if (!headers) return;
+  document.getElementById('set-headers').value = headers;
 }
 
 async function saveSettings() {
@@ -5147,6 +5794,14 @@ async function saveSettings() {
       ri.trusted_proxy_groups = [...tg.selectedOptions].map(o => o.value);
     }
     ri.header_priority = listVal('set-headers');
+    const preset = document.getElementById('set-realip-preset').value;
+    ri.preset = preset || null;
+    ri.on_untrusted_header = document.getElementById('set-realip-untrusted').value;
+    ri.secret_header = document.getElementById('set-realip-secret-header').value.trim() || null;
+    ri.secret = document.getElementById('set-realip-secret').value.trim() || null;
+    ri.require_trusted_source = document.getElementById('set-realip-require-trusted').checked;
+    ri.trust_private_source = document.getElementById('set-realip-private').checked;
+    ri.trust_any_source = document.getElementById('set-realip-any').checked;
 
     const rl = { ...settingsCache.ratelimit };
     rl.enabled = document.getElementById('set-rl-enabled').checked;
@@ -5171,6 +5826,7 @@ async function saveSettings() {
     await api('/settings/ratelimit', { method: 'PUT', body: JSON.stringify(rl) });
     await api('/settings/challenge', { method: 'PUT', body: JSON.stringify(ch) });
     await api('/settings/geoip_db', { method: 'PUT', body: JSON.stringify(document.getElementById('set-geoip').value.trim()) });
+    await api('/settings/map_dest', { method: 'PUT', body: JSON.stringify(document.getElementById('set-map-dest').value.trim()) });
 
     showMsg('设置已保存并立即生效');
     loadSettings(); loadStatistics();
@@ -5282,9 +5938,9 @@ function renderAttackOverview(o) {
     (o.kinds || []).map(k => ({ name: kindLabel(k.name), count: k.count })),
     { center: '事件' });
 
-  const geoText = (g) => g ? [g.country, g.province, g.city].filter(Boolean).join(' · ') : '';
   rankList(document.getElementById('attack-ips'), (o.top_ips || []).map(ip => ({
-    name: ip.ip + (ip.geo ? ' · ' + geoText(ip.geo) : ''),
+    name: ip.ip,
+    sub: geoText(ip.geo) !== '—' ? geoText(ip.geo) : '',
     count: ip.count,
   })), {});
   rankList(document.getElementById('attack-apps'), o.top_apps || [], {});
@@ -5303,20 +5959,28 @@ function renderAttackEvents(res) {
     return;
   }
   el.innerHTML = `<table>
-    <thead><tr><th>时间</th><th>类型</th><th>来源 IP</th><th>应用</th><th>路径</th>
-      <th>命中规则</th><th>风险标签</th><th>分数</th><th>处置</th><th>操作</th></tr></thead>
+    <thead><tr>
+      <th class="col-time">时间</th><th class="col-kind">类型</th><th class="col-ip">来源 IP</th>
+      <th class="col-host">域名</th><th class="col-app">应用</th><th class="col-path">路径</th>
+      <th class="col-rules">命中规则</th><th class="col-tags">风险标签</th><th class="col-score">分数</th>
+      <th class="col-action">处置</th><th class="col-op">操作</th>
+    </tr></thead>
     <tbody>${events.map(e => {
       const rid = 'atk-' + e.id;
       return `<tr style="cursor:pointer" onclick="toggleRaw('${rid}')">
-        <td>${fmtTime(e.ts)}</td><td>${esc(kindLabel(e.kind))}</td>
-        <td><code>${esc(e.client_ip)}</code></td><td>${esc(appLabel(e.app))}</td>
-        <td class="mono" title="${esc(e.path)}">${esc(e.path)}</td>
-        <td><code>${esc(ruleLabel(e.rule_names || e.rules))}</code></td>
-        <td>${riskTagsHtml(e.risk_tags)}</td><td>${e.score}</td>
-        <td><span class="tag ${esc(e.action)}">${esc(actionLabel(e.action))}</span></td>
-        <td><button onclick="event.stopPropagation();banAttackIp('${esc(e.client_ip)}')">封禁</button></td>
+        <td class="col-time">${fmtTime(e.ts)}</td>
+        <td class="col-kind"><span class="tag">${esc(kindLabel(e.kind))}</span></td>
+        <td class="col-ip ev-ip"><code>${esc(e.client_ip)}</code>${e.geo ? `<span class="geo-sub" title="${esc(geoTitle(e.geo))}">${esc(geoText(e.geo))}</span>` : ''}</td>
+        <td class="col-host mono" title="${esc(e.host || '')}">${esc(e.host || '—')}</td>
+        <td class="col-app" title="${esc(appLabel(e.app))}">${esc(appLabel(e.app))}</td>
+        <td class="col-path mono" title="${esc(e.path)}">${esc(e.path)}</td>
+        <td class="col-rules" title="${esc(ruleLabel(e.rule_names || e.rules))}">${esc(ruleLabel(e.rule_names || e.rules))}</td>
+        <td class="col-tags">${riskTagsHtml(e.risk_tags)}</td>
+        <td class="col-score">${e.score}</td>
+        <td class="col-action"><span class="tag ${esc(e.action)}">${esc(actionLabel(e.action))}</span></td>
+        <td class="col-op"><button onclick="event.stopPropagation();banAttackIp('${esc(e.client_ip)}')">封禁</button></td>
       </tr>
-      <tr class="rawrow hidden" id="raw-${rid}"><td colspan="10"><pre>${esc(JSON.stringify(e, null, 2))}</pre></td></tr>`;
+      <tr class="rawrow hidden" id="raw-${rid}"><td colspan="11"><pre>${esc(JSON.stringify(e, null, 2))}</pre></td></tr>`;
     }).join('')}</tbody></table>`;
 
   const pages = Math.max(1, Math.ceil(total / ATTACK_PAGE_SIZE));

@@ -901,6 +901,8 @@ pub fn spawn(state: AdminState, listen: String) -> anyhow::Result<()> {
 
     // 启动前加载 GeoIP。失败只告警，不影响控制台其它功能
     state.geoip.reload_from_store(&state.store);
+    // 在线归属地补充（运营商 / ASN / 城市补全）的持久化缓存，重启不重复请求
+    state.geoip.set_online_cache(&state.data_dir);
     let geo = state.geoip.status();
     match (&geo.error, geo.enabled) {
         (Some(err), _) => tracing::warn!(path = %geo.path, error = %err, "GeoIP 数据库加载失败"),
@@ -1100,18 +1102,7 @@ fn merged_traffic(ctx: &AdminState, range: i64, app: Option<&str>, now: i64) -> 
             .traffic_details(start, boundary, app)
             .unwrap_or_default()
             .into_iter()
-            .map(|r| HistoricalBucket {
-                minute: r.minute,
-                app: r.app,
-                requests: r.requests,
-                pv: r.pv,
-                blocked: r.blocked,
-                detail: r.detail,
-                status_4xx: r.status_4xx,
-                status_5xx: r.status_5xx,
-                unique_ips: r.unique_ips,
-                unique_visitors: r.unique_visitors,
-            })
+            .map(Into::into)
             .collect()
     } else {
         Vec::new()
@@ -1225,14 +1216,86 @@ fn rule_hits(
     out
 }
 
-/// 给来源 IP 排行补上归属地。查库发生在控制台请求路径，不在代理热路径。
-fn ip_rows(geoip: &geoip::GeoIp, pairs: &[(String, usize)]) -> Vec<IpRow> {
+/// 回源密钥头名（`real_ip.secret_header`），上游归属地头的信任判据之一。
+fn secret_header_of(ctx: &AdminState) -> String {
+    ctx.shared
+        .load_full()
+        .real_ip
+        .secret_header
+        .clone()
+        .unwrap_or_default()
+}
+
+/// 从事件 headers 快照反解每个 IP 的上游归属地（`ali-ip-*`），
+/// 只留可信来源（密钥头或 `cdn-loop: esa`）解析出的结果。
+fn upstream_geos(
+    ctx: &AdminState,
+    ips: &[String],
+    since: i64,
+    until: i64,
+) -> std::collections::HashMap<String, geoip::GeoInfo> {
+    let secret = secret_header_of(ctx);
+    let mut out = std::collections::HashMap::new();
+    for (ip, headers) in ctx
+        .store
+        .latest_geo_headers(ips, since, until)
+        .unwrap_or_default()
+    {
+        if let Some(g) = geoip::upstream_geo(&headers, &secret) {
+            out.insert(ip, g);
+        }
+    }
+    out
+}
+
+/// 给来源 IP 排行补上归属地（含运营商 / ASN 机房）。可信的上游 CDN 归属地头
+/// （`ali-ip-*`）优先覆盖 mmdb / 在线结果——边缘按真实客户端 IP 查库，比
+/// mmdb 的国内 IPv6 城市准。查库与在线补充发生在控制台请求路径，不在代理
+/// 热路径；在线结果有持久化缓存，冷启动才发请求。
+fn ip_rows(ctx: &AdminState, pairs: &[(String, usize)], since: i64, until: i64) -> Vec<IpRow> {
+    let parsed: Vec<Option<IpAddr>> = pairs.iter().map(|(ip, _)| ip.parse().ok()).collect();
+    let query: Vec<IpAddr> = parsed.iter().flatten().copied().collect();
+    let mut geos = ctx.geoip.lookup_detailed_batch(&query).into_iter();
+    let ips: Vec<String> = pairs.iter().map(|(ip, _)| ip.clone()).collect();
+    let upstream = upstream_geos(ctx, &ips, since, until);
     pairs
         .iter()
-        .map(|(ip, count)| IpRow {
+        .zip(parsed)
+        .map(|((ip, count), p)| IpRow {
             ip: ip.clone(),
             count: *count,
-            geo: ip.parse::<IpAddr>().ok().and_then(|ip| geoip.lookup(ip)),
+            geo: geoip::overlay_upstream(
+                p.and_then(|_| geos.next().flatten()),
+                upstream.get(ip).cloned(),
+            ),
+        })
+        .collect()
+}
+
+/// 给事件列表补上 IP 归属地（含运营商 / ASN 机房），逐条挂到 JSON 的 `geo` 字段。
+/// 事件 headers 里可信的上游 CDN 归属地头（`ali-ip-*`）优先于 mmdb / 在线结果。
+///
+/// 一页最多 200 条事件，去重后一批在线查询即可，失败时静默降级。
+fn events_with_geo(ctx: &AdminState, events: Vec<homewaf_store::Event>) -> Vec<serde_json::Value> {
+    let secret = secret_header_of(ctx);
+    let parsed: Vec<Option<IpAddr>> = events.iter().map(|e| e.client_ip.parse().ok()).collect();
+    let query: Vec<IpAddr> = parsed.iter().flatten().copied().collect();
+    let mut geos = ctx.geoip.lookup_detailed_batch(&query).into_iter();
+    events
+        .into_iter()
+        .zip(parsed)
+        .map(|(e, p)| {
+            let base = p.and_then(|_| geos.next().flatten());
+            let upstream = geoip::upstream_geo(&e.headers, &secret);
+            let geo = geoip::overlay_upstream(base, upstream);
+            let mut value = serde_json::to_value(&e).unwrap_or(serde_json::Value::Null);
+            if let (Some(obj), Some(geo)) = (value.as_object_mut(), geo) {
+                obj.insert(
+                    "geo".to_string(),
+                    serde_json::to_value(geo).unwrap_or(serde_json::Value::Null),
+                );
+            }
+            value
         })
         .collect()
 }
@@ -1246,6 +1309,25 @@ fn geo_stats_from(geoip: &geoip::GeoIp, pairs: &[(String, usize)]) -> geoip::Geo
     geoip.resolve(&parsed)
 }
 
+/// 连线目的地坐标：设置项 `map_dest`（`纬度,经度`），空 / 非法回落默认（北京）。
+fn map_dest_of(store: &Store) -> (f64, f64) {
+    let raw = store
+        .get_setting::<serde_json::Value>(geoip::MAP_DEST_SETTING)
+        .ok()
+        .flatten()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_default();
+    geoip::parse_dest(&raw)
+}
+
+/// 给地图聚合结果挂上连线目的地（覆盖 resolve 内置的默认值）。
+fn with_dest(mut stats: geoip::GeoStats, store: &Store) -> geoip::GeoStats {
+    let (lat, lon) = map_dest_of(store);
+    stats.dest_lat = lat;
+    stats.dest_lon = lon;
+    stats
+}
+
 /// 百分比，保留两位小数；分母为 0 时返回 0。
 fn rate(part: u64, total: u64) -> f64 {
     if total == 0 {
@@ -1254,8 +1336,9 @@ fn rate(part: u64, total: u64) -> f64 {
     ((part as f64) * 10_000.0 / (total as f64)).round() / 100.0
 }
 
+/// Unix 秒转本地（UTC+8）`YYYY-MM-DD`，报表的「某一天」标签。
 fn date_of(ts: i64) -> String {
-    format_utc(ts).chars().take(10).collect()
+    format_local(ts).chars().take(10).collect()
 }
 
 async fn geoip_status(State(ctx): State<Ctx>, headers: HeaderMap) -> Response {
@@ -1331,7 +1414,7 @@ async fn geo_stats(
         ctx.geoip
             .resolve(&merged_traffic(&ctx, range, app, now).ips)
     };
-    Json(stats).into_response()
+    Json(with_dest(stats, &ctx.store)).into_response()
 }
 
 // ============================================================
@@ -1365,8 +1448,8 @@ struct SecurityStats {
     rules: Vec<NameCount>,
     /// 攻击来源排行（带归属地）
     top_ips: Vec<IpRow>,
-    /// 实时事件流
-    recent: Vec<homewaf_store::Event>,
+    /// 实时事件流（已带 IP 归属地 `geo`）
+    recent: Vec<serde_json::Value>,
 }
 
 async fn security(
@@ -1444,16 +1527,18 @@ async fn security(
         .store
         .top_event_ips(since, until, None, 10)
         .unwrap_or_default();
-    let top_ips = ip_rows(&ctx.geoip, &top);
-    let recent = ctx
-        .store
-        .query_events(&homewaf_store::EventFilter {
-            limit: 20,
-            since: Some(since),
-            ..Default::default()
-        })
-        .map(|(events, _)| events)
-        .unwrap_or_default();
+    let top_ips = ip_rows(&ctx, &top, since, until);
+    let recent = events_with_geo(
+        &ctx,
+        ctx.store
+            .query_events(&homewaf_store::EventFilter {
+                limit: 20,
+                since: Some(since),
+                ..Default::default()
+            })
+            .map(|(events, _)| events)
+            .unwrap_or_default(),
+    );
 
     Json(SecurityStats {
         generated_at: now,
@@ -1571,7 +1656,7 @@ async fn attack_overview(
         .store
         .top_event_ips(since, until, None, 10)
         .unwrap_or_default();
-    let top_ips = ip_rows(&ctx.geoip, &top);
+    let top_ips = ip_rows(&ctx, &top, since, until);
     let app_counts = ctx
         .store
         .event_app_counts(since, until, None, 10)
@@ -1705,13 +1790,13 @@ async fn list_reports(
     Json(serde_json::json!({"reports": reports})).into_response()
 }
 
-/// 汇总某一天的报告数据。`day` 会向下对齐到自然日。
+/// 汇总某一天的报告数据。`day` 会向下对齐到本地自然日（UTC+8）。
 fn build_report(
     ctx: &AdminState,
     day: i64,
     app: Option<&str>,
 ) -> Result<ReportDetail, homewaf_store::StoreError> {
-    let day = day - day.rem_euclid(86_400);
+    let day = homewaf_store::local_day_start(day);
     let until = day + 86_400;
     let totals = ctx.store.traffic_totals(day, until, app)?;
     let series = ctx.store.traffic_series(day, until, app, 3_600)?;
@@ -1731,8 +1816,11 @@ fn build_report(
         .collect();
     let rules = rule_hits(&state, &ctx.store, day, until, 10);
     let top = ctx.store.top_event_ips(day, until, None, 50)?;
-    let top_ips = ip_rows(&ctx.geoip, &top);
-    let geo = geo_stats_from(&ctx.geoip, &ctx.store.top_event_ips(day, until, None, 200)?);
+    let top_ips = ip_rows(ctx, &top, day, until);
+    let geo = with_dest(
+        geo_stats_from(&ctx.geoip, &ctx.store.top_event_ips(day, until, None, 200)?),
+        &ctx.store,
+    );
 
     Ok(ReportDetail {
         id: day,
@@ -1807,7 +1895,7 @@ async fn report_csv(
     for p in &r.series {
         out.push_str(&format!(
             "{},{},{}\r\n",
-            format_utc(p.ts),
+            format_local(p.ts),
             p.requests,
             p.blocked
         ));
@@ -1906,7 +1994,8 @@ struct ScreenData {
     geo: geoip::GeoStats,
     /// 最近 30 天攻击来源地图
     attack_geo: geoip::GeoStats,
-    recent: Vec<homewaf_store::Event>,
+    /// 最近事件（已带 IP 归属地 `geo`）
+    recent: Vec<serde_json::Value>,
 }
 
 async fn screen(State(ctx): State<Ctx>, headers: HeaderMap) -> Response {
@@ -1915,7 +2004,8 @@ async fn screen(State(ctx): State<Ctx>, headers: HeaderMap) -> Response {
     }
 
     let now = homewaf_acl::now_unix();
-    let today = now - now.rem_euclid(86_400);
+    // 「今天」按本地自然日（UTC+8），否则凌晨 0~8 点看到的是昨天的数据
+    let today = homewaf_store::local_day_start(now);
     let totals = ctx
         .store
         .traffic_totals(today, today + 86_400, None)
@@ -1949,7 +2039,7 @@ async fn screen(State(ctx): State<Ctx>, headers: HeaderMap) -> Response {
         .store
         .top_event_ips(today, now + 1, None, 10)
         .unwrap_or_default();
-    let top_ips = ip_rows(&ctx.geoip, &top);
+    let top_ips = ip_rows(&ctx, &top, today, now + 1);
 
     let since_30d = now - 30 * 86_400;
     let trend = ctx
@@ -1969,23 +2059,27 @@ async fn screen(State(ctx): State<Ctx>, headers: HeaderMap) -> Response {
         .collect();
 
     // 访问来源取合并快照（24 小时），攻击来源取事件表（30 天）
-    let geo = ctx
-        .geoip
-        .resolve(&merged_traffic(&ctx, 86_400, None, now).ips);
+    let geo = with_dest(
+        ctx.geoip
+            .resolve(&merged_traffic(&ctx, 86_400, None, now).ips),
+        &ctx.store,
+    );
     let attack_pairs = ctx
         .store
         .top_event_ips(since_30d, now + 1, Some("block"), 500)
         .unwrap_or_default();
-    let attack_geo = geo_stats_from(&ctx.geoip, &attack_pairs);
+    let attack_geo = with_dest(geo_stats_from(&ctx.geoip, &attack_pairs), &ctx.store);
 
-    let recent = ctx
-        .store
-        .query_events(&homewaf_store::EventFilter {
-            limit: 20,
-            ..Default::default()
-        })
-        .map(|(events, _)| events)
-        .unwrap_or_default();
+    let recent = events_with_geo(
+        &ctx,
+        ctx.store
+            .query_events(&homewaf_store::EventFilter {
+                limit: 20,
+                ..Default::default()
+            })
+            .map(|(events, _)| events)
+            .unwrap_or_default(),
+    );
 
     Json(ScreenData {
         generated_at: now,
@@ -3210,7 +3304,7 @@ async fn list_events(
 
     match ctx.store.query_events(&filter) {
         Ok((events, total)) => Json(serde_json::json!({
-            "events": events,
+            "events": events_with_geo(&ctx, events),
             "total": total,
             "limit": filter.limit,
             "offset": filter.offset,
@@ -3253,14 +3347,15 @@ async fn export_events(
 
     let mut out = String::with_capacity(64 + events.len() * 120);
     out.push('\u{feff}');
-    out.push_str("id,时间,类型,来源 IP,应用,路径,命中规则,评分,动作\r\n");
+    out.push_str("id,时间,类型,来源 IP,域名,应用,路径,命中规则,评分,动作\r\n");
     for e in &events {
         out.push_str(&format!(
-            "{},{},{},{},{},{},{},{},{}\r\n",
+            "{},{},{},{},{},{},{},{},{},{}\r\n",
             e.id,
             csv_field(&format_utc(e.ts)),
             e.kind.as_str(),
             csv_field(&e.client_ip),
+            csv_field(&e.host),
             csv_field(&e.app),
             csv_field(&e.path),
             csv_field(&e.rules),
@@ -3324,6 +3419,12 @@ fn format_utc(ts: i64) -> String {
         secs % 3_600 / 60,
         secs % 60
     )
+}
+
+/// Unix 秒转本地（UTC+8）`YYYY-MM-DD HH:MM:SS`。
+/// 固定偏移没有夏令时，给 UTC 时间加上偏移再格式化即可。
+fn format_local(ts: i64) -> String {
+    format_utc(ts + homewaf_store::TZ_OFFSET_SECS)
 }
 
 // ============================================================
@@ -3611,6 +3712,8 @@ async fn get_all_settings(State(ctx): State<Ctx>, headers: HeaderMap) -> Respons
         ),
         // GeoIP 数据库路径，空表示未启用
         ("geoip_db", serde_json::Value::String(String::new())),
+        // 科技连线地图的目的地坐标（纬度,经度），空表示用默认（北京）
+        ("map_dest", serde_json::Value::String(String::new())),
         ("custom_rules", serde_json::Value::Array(Vec::new())),
     ] {
         out.insert(key.to_string(), load(key, value));
@@ -3688,6 +3791,52 @@ async fn put_setting(
     }
 }
 
+/// 拒绝「信任所有来源」的真实 IP 配置。
+///
+/// 填 `0.0.0.0/0` 等于把整条防伪造链路关掉：任何人都能直连源站伪造
+/// `X-Forwarded-For`，ACL 封禁、单 IP 限流、自动封禁、GeoIP 会一起失效。
+/// CDN 回源 IP 不可知（阿里云/腾讯云 CDN）时，正确做法是用回源密钥头。
+///
+/// 校验器的 `/0` 规则只在 CLI 和导入时跑，控制台保存是另一条路径，
+/// 这里补上同一道闸，避免「命令行拒绝、界面放行」的不一致。
+fn check_real_ip_trust(cfg: &homewaf_config::RealIpConfig) -> Result<(), String> {
+    if cfg.trusted_proxies.iter().any(|net| net.prefix_len() == 0) {
+        return Err(
+            "可信代理网段不能是全网段（0.0.0.0/0 或 ::/0）：那等于信任任何来源的转发头，\
+             客户端直连源站伪造一个头就能绕过 IP 封禁和限流。CDN 回源 IP 拿不到时，\
+             请改用「回源密钥头名 + 密钥值」"
+                .to_string(),
+        );
+    }
+
+    // 与「拒绝不可信来源」互斥：全信之后不存在「不可信来源」，后者永不触发，
+    // 用户会以为自己开着防护，实际没有。
+    if cfg.trust_any_source && cfg.require_trusted_source {
+        return Err(
+            "「信任所有来源」与「拒绝不可信来源」互相矛盾：前者让所有来源都算可信，\
+             后者永远不会触发。要挡公网直连请关掉「信任所有来源」"
+                .to_string(),
+        );
+    }
+
+    // 「拒绝不可信来源」+ 零可信来源 = 全站拒绝。私有网段自动可信也算一种来源，
+    // 那种情况内网还能进，不必拦。这类配置一旦存进库，用户只能改库或停机才能恢复。
+    if cfg.require_trusted_source
+        && cfg.trusted_proxies.is_empty()
+        && cfg.trusted_proxy_groups.is_empty()
+        && !cfg.has_secret_header()
+        && !cfg.trust_private_source
+        && !cfg.trust_any_source
+    {
+        return Err(
+            "开启「拒绝不可信来源」但没有配置任何可信来源（可信网段 / 订阅组 / 回源密钥头 / \
+             私有网段自动可信全都不生效），保存后所有请求都会被拒绝。请先填内网网段或回源密钥头名"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// 按 key 校验设置项能否反序列化成对应类型。
 fn check_setting_type(key: &str, value: &serde_json::Value) -> Result<(), String> {
     use homewaf_config::*;
@@ -3698,9 +3847,11 @@ fn check_setting_type(key: &str, value: &serde_json::Value) -> Result<(), String
         "acl" => serde_json::from_value::<AclConfig>(value.clone())
             .map(|_| ())
             .map_err(|e| format!("acl 结构不合法：{e}")),
-        "real_ip" => serde_json::from_value::<RealIpConfig>(value.clone())
-            .map(|_| ())
-            .map_err(|e| format!("real_ip 结构不合法：{e}")),
+        "real_ip" => {
+            let cfg = serde_json::from_value::<RealIpConfig>(value.clone())
+                .map_err(|e| format!("real_ip 结构不合法：{e}"))?;
+            check_real_ip_trust(&cfg)
+        }
         "ratelimit" => serde_json::from_value::<RateLimitConfig>(value.clone())
             .map(|_| ())
             .map_err(|e| format!("ratelimit 结构不合法：{e}")),
@@ -3728,6 +3879,13 @@ fn check_setting_type(key: &str, value: &serde_json::Value) -> Result<(), String
                 .as_str()
                 .ok_or_else(|| "geoip_db 必须是字符串路径".to_string())?;
             geoip::validate_db(path)
+        }
+        // 科技连线地图的目的地坐标，「纬度,经度」或空（用默认）
+        "map_dest" => {
+            let raw = value
+                .as_str()
+                .ok_or_else(|| "map_dest 必须是字符串坐标".to_string())?;
+            geoip::validate_dest(raw)
         }
         // 第三方证书部署 token，必须是字符串
         "api_token" => value
@@ -5752,12 +5910,15 @@ mod tests {
     }
 
     fn state() -> AdminState {
+        let geoip = Arc::new(geoip::GeoIp::new());
+        // 单测禁止在线归属地查询：断言与用例必须与网络状态无关
+        geoip.set_online_enabled(false);
         AdminState {
             store: Arc::new(Store::open_memory().unwrap()),
             shared: homewaf_proxy::shared(empty_runtime()),
             bans: Arc::new(BanTable::new(&AutoBanConfig::default(), 64)),
             metrics: Arc::new(TrafficMetrics::new()),
-            geoip: Arc::new(geoip::GeoIp::new()),
+            geoip,
             allow_regex: false,
             sessions: Default::default(),
             login_failures: Default::default(),
@@ -6165,6 +6326,98 @@ mod tests {
     }
 
     #[test]
+    fn real_ip_rejects_trust_everything() {
+        // 0.0.0.0/0 等于关掉防伪造：客户端直连源站伪造 XFF 就能绕过封禁与限流
+        let err = check_setting_type(
+            "real_ip",
+            &serde_json::json!({ "trusted_proxies": ["0.0.0.0/0"] }),
+        )
+        .unwrap_err();
+        assert!(err.contains("全网段"), "{err}");
+
+        let err = check_setting_type(
+            "real_ip",
+            &serde_json::json!({ "trusted_proxies": ["::/0"] }),
+        )
+        .unwrap_err();
+        assert!(err.contains("全网段"), "{err}");
+    }
+
+    #[test]
+    fn real_ip_accepts_narrow_networks_and_secret() {
+        assert!(check_setting_type(
+            "real_ip",
+            &serde_json::json!({
+                "trusted_proxies": ["127.0.0.1/32", "10.0.0.0/8"],
+                "secret_header": "X-Origin-Verify",
+                "secret": "0123456789abcdef",
+                "preset": "aliyun-cdn"
+            }),
+        )
+        .is_ok());
+
+        // 不填可信网段、只靠回源密钥，是 CDN 回源 IP 不可知时的推荐做法
+        assert!(check_setting_type(
+            "real_ip",
+            &serde_json::json!({
+                "secret_header": "X-Origin-Verify",
+                "secret": "0123456789abcdef"
+            }),
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn real_ip_require_trusted_source_needs_a_source() {
+        // 开了「拒绝不可信来源」却没有任何可信来源 = 全站拒绝，必须在保存前拦住。
+        // 注意私有网段自动可信默认开启，要显式关掉才会走到这条错误。
+        let err = check_setting_type(
+            "real_ip",
+            &serde_json::json!({
+                "enabled": true,
+                "require_trusted_source": true,
+                "trust_private_source": false
+            }),
+        )
+        .unwrap_err();
+        assert!(err.contains("所有请求都会被拒绝"), "{err}");
+
+        // 私有网段自动可信开着就不用拦：内网还能进
+        assert!(check_setting_type(
+            "real_ip",
+            &serde_json::json!({
+                "enabled": true,
+                "require_trusted_source": true
+            }),
+        )
+        .is_ok());
+
+        // 配了回源密钥头就允许
+        assert!(check_setting_type(
+            "real_ip",
+            &serde_json::json!({
+                "enabled": true,
+                "require_trusted_source": true,
+                "trust_private_source": false,
+                "secret_header": "X-8f3a2b-Real-Forwarded-For"
+            }),
+        )
+        .is_ok());
+
+        // 只配内网网段也允许（源站不对公网开放时就是这种形态）
+        assert!(check_setting_type(
+            "real_ip",
+            &serde_json::json!({
+                "enabled": true,
+                "require_trusted_source": true,
+                "trust_private_source": false,
+                "trusted_proxies": ["10.0.0.0/8", "fd00::/8"]
+            }),
+        )
+        .is_ok());
+    }
+
+    #[test]
     fn setting_type_rejects_unknown_key() {
         let err = check_setting_type("nonsense", &serde_json::json!({})).unwrap_err();
         assert!(err.contains("未知"), "{err}");
@@ -6557,9 +6810,10 @@ mod tests {
     }
 
     #[test]
-    fn date_of_takes_calendar_day() {
+    fn date_of_takes_local_calendar_day() {
+        // UTC+8：22:13 UTC 已是次日 06:13 本地
         assert_eq!(date_of(0), "1970-01-01");
-        assert_eq!(date_of(1_700_000_000), "2023-11-14");
+        assert_eq!(date_of(1_700_000_000), "2023-11-15");
     }
 
     #[test]
@@ -6572,7 +6826,8 @@ mod tests {
     #[test]
     fn report_summarizes_day() {
         let st = state();
-        let day = 1_700_006_400;
+        // 本地自然日起点（UTC+8），与 build_report 的日界一致
+        let day = homewaf_store::local_day_start(1_700_006_400);
         st.store
             .save_traffic(&[homewaf_store::TrafficBucketRow {
                 minute: day + 60,
@@ -6610,10 +6865,171 @@ mod tests {
         assert!(r.top_ips[0].geo.is_none(), "未配置 mmdb 时不做归属地");
     }
 
+    /// 事件接口全链路：会话鉴权 → 查库 → 挂在线补充的归属地（缓存播种，不发网络）。
+    #[tokio::test]
+    async fn events_api_includes_geo() {
+        use axum::body::to_bytes;
+
+        let st = Arc::new(state());
+        // 播种在线缓存：1.1.1.1 的运营商 / ASN / 城市补全
+        let dir = std::env::temp_dir().join(format!("homewaf-events-geo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ip: IpAddr = "1.1.1.1".parse().unwrap();
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            ip,
+            serde_json::json!({
+                "country": "美国", "country_code": "US", "province": "", "city": "",
+                "latitude": 0.0, "longitude": 0.0,
+                "isp": "Cloudflare, Inc.", "asn": "AS13335 CLOUDFLARENET"
+            }),
+        );
+        std::fs::write(
+            dir.join("geoip_online.json"),
+            serde_json::to_string(&map).unwrap(),
+        )
+        .unwrap();
+        st.geoip.set_online_cache(&dir);
+
+        st.store
+            .insert_event(
+                &homewaf_store::Event::new(
+                    homewaf_acl::now_unix(),
+                    homewaf_store::EventKind::Detect,
+                    "1.1.1.1",
+                )
+                .with_action("block"),
+            )
+            .unwrap();
+
+        // 造一个有效会话，走 list_events 的真实鉴权路径
+        st.sessions
+            .lock()
+            .unwrap()
+            .insert("test-token".to_string(), homewaf_acl::now_unix() + 3_600);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            header::HeaderValue::from_static("Bearer test-token"),
+        );
+
+        let res = list_events(
+            State(st.clone()),
+            headers,
+            Query(EventQuery {
+                limit: 5,
+                offset: 0,
+                kind: None,
+                ip: None,
+                action: None,
+                since: None,
+                until: None,
+                app: None,
+                path: None,
+                q: None,
+            }),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = to_bytes(res.into_body(), 1 << 20).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let ev = &v["events"][0];
+        assert_eq!(ev["client_ip"], "1.1.1.1");
+        assert_eq!(ev["geo"]["isp"], "Cloudflare, Inc.");
+        assert_eq!(ev["geo"]["asn"], "AS13335 CLOUDFLARENET");
+        assert_eq!(ev["geo"]["country"], "美国");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 上游 CDN 归属地头（ali-ip-*）优先于 mmdb / 在线结果；直连伪造的同名头
+    /// 没有可信证据（无 cdn-loop: esa / 密钥头）不采信。
+    #[tokio::test]
+    async fn events_api_prefers_upstream_geo_headers() {
+        use axum::body::to_bytes;
+
+        let st = Arc::new(state());
+        let now = homewaf_acl::now_unix();
+        // 经 ESA：cdn-loop 在场，采信边缘按真实客户端 IP 查得的国家 / 城市
+        st.store
+            .insert_event(
+                &homewaf_store::Event::new(
+                    now,
+                    homewaf_store::EventKind::Detect,
+                    "2408:8352:e40:4faa:3c9b:97e0:fc5a:88f9",
+                )
+                .with_action("block")
+                .with_headers("cdn-loop: esa;loop=1\nali-ip-country: CN\nali-ip-city: Changsha"),
+            )
+            .unwrap();
+        // 直连伪造 ali-ip-*：没有 cdn-loop / 密钥头，不采信
+        st.store
+            .insert_event(
+                &homewaf_store::Event::new(now, homewaf_store::EventKind::Detect, "9.9.9.9")
+                    .with_action("log")
+                    .with_headers("ali-ip-country: US\nali-ip-city: Nowhere"),
+            )
+            .unwrap();
+
+        // 来源 IP 排行走同一覆盖逻辑
+        let rows = ip_rows(
+            &st,
+            &[("2408:8352:e40:4faa:3c9b:97e0:fc5a:88f9".to_string(), 3)],
+            now - 60,
+            now + 60,
+        );
+        let geo = rows[0].geo.as_ref().expect("上游头应给出归属地");
+        assert_eq!(geo.city, "Changsha");
+        assert_eq!(geo.country_code, "CN");
+        assert_eq!(geo.country, "中国", "国家码一致时补展示名");
+
+        st.sessions
+            .lock()
+            .unwrap()
+            .insert("test-token".to_string(), now + 3_600);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            header::HeaderValue::from_static("Bearer test-token"),
+        );
+        let res = list_events(
+            State(st.clone()),
+            headers,
+            Query(EventQuery {
+                limit: 10,
+                offset: 0,
+                kind: None,
+                ip: None,
+                action: None,
+                since: None,
+                until: None,
+                app: None,
+                path: None,
+                q: None,
+            }),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = to_bytes(res.into_body(), 1 << 20).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let evs = v["events"].as_array().unwrap();
+        let upstream_ev = evs
+            .iter()
+            .find(|e| e["client_ip"] == "2408:8352:e40:4faa:3c9b:97e0:fc5a:88f9")
+            .unwrap();
+        assert_eq!(upstream_ev["geo"]["city"], "Changsha");
+        assert_eq!(upstream_ev["geo"]["country"], "中国");
+        let forged_ev = evs.iter().find(|e| e["client_ip"] == "9.9.9.9").unwrap();
+        assert!(
+            forged_ev.get("geo").is_none(),
+            "直连伪造的 ali-ip-* 不应采信"
+        );
+    }
+
     #[test]
     fn report_filters_by_app() {
         let st = state();
-        let day = 1_700_006_400;
+        let day = homewaf_store::local_day_start(1_700_006_400);
         st.store
             .save_traffic(&[
                 homewaf_store::TrafficBucketRow {

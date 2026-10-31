@@ -122,6 +122,8 @@ pub struct RequestCtx {
     pub user_agent: String,
     /// 该连接的 JA4 TLS 指纹。仅 HTTPS 终结连接有值
     pub ja4: Option<String>,
+    /// 原始请求头快照（`name: value` 逐行），写入事件详情
+    pub headers: String,
     /// 命中的检测规则名称（逗号分隔），供事件展示
     pub matched_rule_names: String,
 }
@@ -404,6 +406,7 @@ impl WafProxy {
             ctx.client_ip.map(|i| i.to_string()).unwrap_or_default(),
         )
         .with_app(app.to_string())
+        .with_host(ctx.original_host.clone())
         .with_path(path.to_string())
         .with_rules(rules.to_string())
         .with_score(score)
@@ -412,7 +415,8 @@ impl WafProxy {
         .with_query(ctx.query.clone().unwrap_or_default())
         .with_user_agent(ctx.user_agent.clone())
         .with_rule_names(ctx.matched_rule_names.clone())
-        .with_risk_tags(risk_tags.to_string());
+        .with_risk_tags(risk_tags.to_string())
+        .with_headers(ctx.headers.clone());
         if let Err(e) = store.insert_event(&event) {
             tracing::warn!(error = %e, "写入安全事件失败");
         }
@@ -437,10 +441,15 @@ impl WafProxy {
             ctx.client_ip.map(|i| i.to_string()).unwrap_or_default(),
         )
         .with_app(app.to_string())
+        .with_host(ctx.original_host.clone())
         .with_path(path.to_string())
         .with_rules(format!("cc-{}", scope.as_str()))
         .with_score(observed)
-        .with_action(action.to_string());
+        .with_action(action.to_string())
+        .with_request(ctx.request_id.clone(), ctx.method.clone())
+        .with_query(ctx.query.clone().unwrap_or_default())
+        .with_user_agent(ctx.user_agent.clone())
+        .with_headers(ctx.headers.clone());
         if let Err(e) = store.insert_event(&event) {
             tracing::warn!(error = %e, "写入 CC 事件失败");
         }
@@ -537,6 +546,15 @@ impl ProxyHttp for WafProxy {
             )
         };
 
+        // 请求上下文快照。ACL 拒绝、限流等早退发生在路由之前，
+        // 事件同样要带上域名、方法与请求头，否则事后无从看起。
+        let host = strip_port(&raw_host);
+        ctx.original_host = host.clone();
+        ctx.method = method.clone();
+        ctx.user_agent = user_agent.clone().unwrap_or_default();
+        ctx.query = query.clone();
+        ctx.headers = flatten_headers(&session.req_header().headers);
+
         // 真实 IP 还原
         let client = realip::resolve(
             direct.as_ref(),
@@ -550,7 +568,53 @@ impl ProxyHttp for WafProxy {
             ctx.ip_source = Some(c.source);
         }
 
-        let host = strip_port(&raw_host);
+        // 来源不可信直接拒绝（`require_trusted_source`）。
+        //
+        // 用于「不配置回源 IP 白名单」的部署：源站只服务内网/反代（命中
+        // `trusted_proxies`）与带密钥头的 CDN 回源，公网直连源站一律拒。
+        // 这是唯一能在「回源 IP 段拿不到」的情况下挡住绕 CDN 直连的办法。
+        if state.real_ip.enabled && state.real_ip.require_trusted_source && !ctx.trusted_proxy {
+            ctx.app_id = String::new();
+            ctx.blocked = true;
+            ctx.acl_reason = Some("来源不在可信代理范围".to_string());
+            ctx.matched_rule_names = "真实 IP 还原：来源不可信".to_string();
+            self.record_security_event(
+                ctx,
+                EventKind::Acl,
+                "-",
+                &path,
+                "untrusted-source",
+                0,
+                "block",
+            );
+            tracing::warn!(
+                req = %ctx.request_id,
+                direct_ip = %ctx.direct_ip.map(|i| i.to_string()).unwrap_or_default(),
+                host = %raw_host,
+                path = %path,
+                "来源不可信（非内网/可信网段且无回源标记头），按 real_ip.require_trusted_source 拒绝",
+            );
+            return write_empty(session, 403).await;
+        }
+
+        // 来源不可信却带了转发头：按配置拒绝。
+        //
+        // 要么是客户端在伪造 IP，要么是代理链没配对（比如 CDN 网段没加进
+        // trusted_proxies）。两种都不该静默按直连 IP 放过——静默正是
+        // 「日志里全是 CDN 回源 IP」却没人察觉的原因。
+        if state.real_ip.enabled
+            && state.real_ip.on_untrusted_header == homewaf_config::UntrustedHeaderAction::Reject
+            && !ctx.trusted_proxy
+            && realip::carries_forwarded_header(&session.req_header().headers, &state.real_ip)
+        {
+            tracing::warn!(
+                req = %ctx.request_id,
+                direct_ip = %ctx.direct_ip.map(|i| i.to_string()).unwrap_or_default(),
+                "来源不可信却携带转发头，按 real_ip.on_untrusted_header=reject 拒绝",
+            );
+            return write_empty(session, 400).await;
+        }
+
         // 端口优先取 Host 头；Host 不带端口时用连接实际落地的本地端口。
         //
         // 不能按 TLS 与否猜 443/80：经过端口映射（公网 443 → 源站 5667）时
@@ -561,7 +625,6 @@ impl ProxyHttp for WafProxy {
         let port = resolve_request_port(&raw_host, local_port, is_tls);
         let scheme: &'static str = if is_tls { "https" } else { "http" };
 
-        ctx.original_host = host.clone();
         ctx.port = port;
         ctx.scheme = scheme;
 
@@ -595,8 +658,7 @@ impl ProxyHttp for WafProxy {
             return write_empty(session, 500).await;
         };
         ctx.app_id = app.id.clone();
-        ctx.method = method.clone();
-        ctx.user_agent = user_agent.clone().unwrap_or_default();
+        // ctx.method / ctx.user_agent 已在 ACL 早退前赋值（见上方上下文快照），此处不再重复
         // 能否接受 JS 挑战：浏览器页面导航可以；API/App/curl 拿到挑战页等同 403
         let browser_like = challenge::is_browser_like(&session.req_header().headers);
         // 应用开了人机验证才允许下发挑战页，否则只按风险处置
@@ -1361,6 +1423,7 @@ impl ProxyHttp for WafProxy {
                         ctx.client_ip.map(|i| i.to_string()).unwrap_or_default(),
                     )
                     .with_app(app.id.clone())
+                    .with_host(ctx.original_host.clone())
                     .with_path(hit.normalized_path.clone())
                     .with_rules(verdict.rule_ids().join(","))
                     .with_score(verdict.score)
@@ -1368,7 +1431,8 @@ impl ProxyHttp for WafProxy {
                     .with_request(ctx.request_id.clone(), ctx.method.clone())
                     .with_query(query.clone().unwrap_or_default())
                     .with_user_agent(ctx.user_agent.clone())
-                    .with_rule_names(ctx.matched_rule_names.clone());
+                    .with_rule_names(ctx.matched_rule_names.clone())
+                    .with_headers(ctx.headers.clone());
                     if let Err(e) = store.insert_event(&event) {
                         tracing::warn!(error = %e, "写入检测事件失败");
                     }
@@ -1378,6 +1442,12 @@ impl ProxyHttp for WafProxy {
                 // 观察模式下不封禁——观察的全部意义就是"先看误报再决定"。
                 if !verdict.observe {
                     if let Some(ip) = ctx.client_ip {
+                        // 检测命中也进进程内风险表。封禁分是 1:1 累积（50 分即封），
+                        // 拦截类规则不缺升级路径；缺的是 Log 类规则——blocking_score
+                        // 恒为 0，反复触发也不会被处置。计入风险后它们能升级成人机验证。
+                        // 权重按总命中分折算（见 risk::detect_weight）。
+                        self.risks
+                            .add(ip, crate::risk::detect_weight(verdict.score));
                         if let Some(outcome) =
                             self.bans.record(ip, verdict.blocking_score, now_secs)
                         {
@@ -2004,10 +2074,12 @@ async fn serve_static(
                         client_ip.map(|i| i.to_string()).unwrap_or_default(),
                     )
                     .with_app(app.id.clone())
+                    .with_host(extract_host(session.req_header()))
                     .with_path(file_path.clone())
                     .with_rules("tamper".to_string())
                     .with_score(100)
-                    .with_action(act.to_string());
+                    .with_action(act.to_string())
+                    .with_headers(flatten_headers(&session.req_header().headers));
                     if let Err(e) = store.insert_event(&event) {
                         tracing::warn!(error = %e, "写入防篡改事件失败");
                     }
@@ -2176,6 +2248,27 @@ fn extract_host(req: &pingora::http::RequestHeader) -> String {
         .to_string()
 }
 
+/// 请求头快照：`name: value` 逐行展开，写入事件供事后溯源。
+/// 单值截到 256 字符、整体约 4KB，防止超长 Cookie 把库撑爆。
+fn flatten_headers(headers: &http::HeaderMap) -> String {
+    const VALUE_CAP: usize = 256;
+    const TOTAL_CAP: usize = 4_096;
+    let mut out = String::with_capacity(512);
+    for (name, value) in headers.iter() {
+        let v = String::from_utf8_lossy(value.as_bytes());
+        let v: String = v.chars().take(VALUE_CAP).collect();
+        out.push_str(name.as_str());
+        out.push_str(": ");
+        out.push_str(&v);
+        out.push('\n');
+        if out.len() >= TOTAL_CAP {
+            out.push_str("…（已截断）\n");
+            break;
+        }
+    }
+    out
+}
+
 /// 去掉 `host:port` 中的端口，处理 IPv6 方括号。
 fn strip_port(host: &str) -> String {
     if let Some(rest) = host.strip_prefix('[') {
@@ -2243,6 +2336,9 @@ pub struct ProxySettings {
     pub watch_interval: std::time::Duration,
     /// 事件保留天数，超期自动清理
     pub events_retention_days: u32,
+    /// 进程启动时刻（Unix 秒）。与控制台 `AdminState::started_at` 必须同源，
+    /// 流量种子合并与「重启前/后」的分界都对齐到这一分钟。
+    pub started_at: i64,
 }
 
 /// 从监听地址里取端口，如 `[::]:5667` / `0.0.0.0:80`。
@@ -2464,6 +2560,47 @@ struct NoTlsCallbacks;
 impl pingora::listeners::TlsAccept for NoTlsCallbacks {}
 
 /// 启动代理服务。
+/// 把内存里的分钟桶快照写入流量聚合表。
+///
+/// `lock` 串行化「快照 + 写入」：周期落库与退出兜底可能撞车，
+/// 后拿锁的一方必然看到不早于前者的计数，UPSERT 覆盖写只会越写越大。
+fn persist_traffic(
+    store: &Store,
+    metrics: &TrafficMetrics,
+    lock: &std::sync::Mutex<()>,
+    after_minute: i64,
+    before_minute: i64,
+) {
+    let _guard = match lock.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let buckets = metrics.completed_buckets(after_minute, before_minute);
+    if buckets.is_empty() {
+        return;
+    }
+    let rows: Vec<homewaf_store::TrafficBucketRow> = buckets
+        .into_iter()
+        .map(|b| homewaf_store::TrafficBucketRow {
+            minute: b.minute,
+            app: b.app,
+            requests: b.requests,
+            pv: b.pv,
+            blocked: b.blocked,
+            status_4xx: b.status_4xx,
+            status_5xx: b.status_5xx,
+            unique_ips: b.unique_ips,
+            unique_visitors: b.unique_visitors,
+            ips: b.ips,
+            visitors: b.visitors,
+            detail: b.detail,
+        })
+        .collect();
+    if let Err(e) = store.save_traffic(&rows) {
+        tracing::warn!(error = %e, "写入流量聚合失败");
+    }
+}
+
 pub fn run(state: SharedState, settings: ProxySettings) -> anyhow::Result<()> {
     if settings.listen.is_empty() && settings.tls_listen.is_empty() {
         anyhow::bail!("没有配置监听地址");
@@ -2482,6 +2619,24 @@ pub fn run(state: SharedState, settings: ProxySettings) -> anyhow::Result<()> {
 
     // 打开持久化层（由调用方传入，因为构建 RuntimeState 时就需要它读订阅状态）
     let store = settings.store.clone();
+
+    // 流量种子合并：重启往往落在某一分钟中段，上一进程退出前已把该分钟
+    // 前半段落库。先把这些计数并进内存桶，新记录在种子之上累加，
+    // 否则落库的 UPSERT 全量覆盖会把旧进程的计数冲掉（重启即丢一半）。
+    if let Some(store) = &store {
+        let boundary = settings.started_at - settings.started_at.rem_euclid(60);
+        match store.traffic_details(boundary, boundary + 60, None) {
+            Ok(rows) if !rows.is_empty() => {
+                let count = rows.len();
+                let history: Vec<crate::metrics::HistoricalBucket> =
+                    rows.into_iter().map(Into::into).collect();
+                settings.metrics.seed_history(&history);
+                tracing::info!(rows = count, "已合并启动前落库的流量种子");
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "读取流量种子失败"),
+        }
+    }
 
     // 恢复未过期的封禁，否则重启就等于给攻击者解封
     if let Some(store) = &store {
@@ -2538,39 +2693,20 @@ pub fn run(state: SharedState, settings: ProxySettings) -> anyhow::Result<()> {
             .expect("启动清理线程失败");
     }
 
-    // 流量聚合落库：每分钟重写最近 5 分钟，既幂等又能补上晚到的日志。
+    // 流量聚合落库：每分钟重写最近 5 分钟（含进行中的当前分钟），
+    // 既幂等又能补上晚到的日志。当前分钟也写：写坏不了——UPSERT 全量覆盖，
+    // 同一分钟计数只增不减，先写个半程值、下一轮再补大，只是重启少丢数据。
+    let flush_lock = Arc::new(std::sync::Mutex::new(()));
     if let Some(store) = store.clone() {
         let metrics = settings.metrics.clone();
+        let flush_lock = flush_lock.clone();
         std::thread::Builder::new()
             .name("homewaf-traffic-flusher".to_string())
             .spawn(move || loop {
                 std::thread::sleep(std::time::Duration::from_secs(60));
                 let now = homewaf_acl::now_unix();
                 let minute = now - now.rem_euclid(60);
-                let buckets = metrics.completed_buckets(minute - 300, minute);
-                if buckets.is_empty() {
-                    continue;
-                }
-                let rows: Vec<homewaf_store::TrafficBucketRow> = buckets
-                    .into_iter()
-                    .map(|b| homewaf_store::TrafficBucketRow {
-                        minute: b.minute,
-                        app: b.app,
-                        requests: b.requests,
-                        pv: b.pv,
-                        blocked: b.blocked,
-                        status_4xx: b.status_4xx,
-                        status_5xx: b.status_5xx,
-                        unique_ips: b.unique_ips,
-                        unique_visitors: b.unique_visitors,
-                        ips: b.ips,
-                        visitors: b.visitors,
-                        detail: b.detail,
-                    })
-                    .collect();
-                if let Err(e) = store.save_traffic(&rows) {
-                    tracing::warn!(error = %e, "写入流量聚合失败");
-                }
+                persist_traffic(&store, &metrics, &flush_lock, minute - 300, minute + 60);
             })
             .expect("启动流量持久化线程失败");
     }
@@ -2603,7 +2739,8 @@ pub fn run(state: SharedState, settings: ProxySettings) -> anyhow::Result<()> {
     let proxy = WafProxy::new(
         state.clone(),
         bans,
-        store,
+        // clone 留一份给退出兜底落库；WafProxy 自己只读不写流量聚合表
+        store.clone(),
         settings.metrics.clone(),
         settings.upstream_read_timeout,
     );
@@ -2670,7 +2807,16 @@ pub fn run(state: SharedState, settings: ProxySettings) -> anyhow::Result<()> {
     );
 
     server.add_service(service);
-    server.run_forever();
+    // 不用 run_forever()：它在 run() 返回后直接 process::exit(0)，
+    // 挂不上退出前的落库。换成等价的 run(RunArgs::default())，
+    // 优雅退出（SIGTERM）返回后把内存里所有分钟桶（含当前分钟）刷盘，
+    // 否则 systemctl restart 会丢掉最后一个未完成分钟的流量。
+    server.run(pingora::server::RunArgs::default());
+    if let Some(store) = &store {
+        persist_traffic(store, &settings.metrics, &flush_lock, i64::MIN, i64::MAX);
+        tracing::info!("流量聚合已兜底落库");
+    }
+    Ok(())
 }
 
 #[cfg(test)]

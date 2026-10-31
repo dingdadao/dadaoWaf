@@ -155,6 +155,21 @@ pub enum RiskLevel {
     Block,
 }
 
+/// 检测规则命中应当折算成多少风险分。
+///
+/// 取**总命中分**而不是 `blocking_score`：封禁分是 1:1 累积、50 分就封，
+/// 拦截类规则的升级路径本来就很短；真正的缺口是 `Log` 类规则——
+/// 它们 `blocking_score` 恒为 0、永远进不了封禁通道，反复触发也毫无后果。
+/// 折算进风险表后，这类“可疑但不够格封”的信号才会升级成人机验证
+/// （浏览器挑战页 / 非浏览器客户端按 `risk_api_ban_threshold` 封）。
+///
+/// 折算按 1/5 并封顶 20：高危（50）一次 10 分、严重（80）一次 16 分，
+/// 单次命中不会把风险直接拉满，要重复触发才升级；
+/// 多规则叠加的单次命中（如 210 分）也只算 20，避免一发入魂。
+pub fn detect_weight(score: u32) -> u32 {
+    (score / 5).min(20)
+}
+
 /// IP 维度的风险累计表。
 ///
 /// 只存内存：风险分是行为信号，重启后重新观察即可；真正需要跨重启的
@@ -380,5 +395,37 @@ mod tests {
             30
         );
         assert!(assess_user_agent("Mozilla/5.0 (Macintosh) Chrome/120").is_empty());
+    }
+
+    #[test]
+    fn detect_weight_scales_with_severity() {
+        // 0 分不产生风险（未命中或纯白名单放行）
+        assert_eq!(detect_weight(0), 0);
+        // medium(25) → 5，high(50) → 10，critical(80) → 16
+        assert_eq!(detect_weight(25), 5);
+        assert_eq!(detect_weight(50), 10);
+        assert_eq!(detect_weight(80), 16);
+        // 多规则叠加封顶 20，单发不会直接把风险打满
+        assert_eq!(detect_weight(210), 20);
+        assert_eq!(detect_weight(10_000), 20);
+    }
+
+    #[test]
+    fn detect_hits_escalate_to_challenge() {
+        let table = RiskTable::new();
+        let addr = ip("203.0.113.20");
+        let cfg = cfg(); // challenge 30 / block 60
+                         // 高危规则命中 2 次 = 20 分，还不够
+        table.add_at(addr, detect_weight(50), 100);
+        table.add_at(addr, detect_weight(50), 110);
+        assert_eq!(table.level_at(addr, &cfg, 110), RiskLevel::Normal);
+        // 第 3 次累计 30 分 → 升级人机验证
+        table.add_at(addr, detect_weight(50), 120);
+        assert_eq!(table.level_at(addr, &cfg, 120), RiskLevel::Challenge);
+        // 再 3 次累计 60 分 → 封禁等级
+        for t in [130, 140, 150] {
+            table.add_at(addr, detect_weight(50), t);
+        }
+        assert_eq!(table.level_at(addr, &cfg, 150), RiskLevel::Block);
     }
 }

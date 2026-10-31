@@ -273,6 +273,96 @@ mod tests {
         assert_eq!(rules[0].pattern[0][0].v, vec!["192.168.1.0/24"]);
         assert!(rules[0].pattern[0][1].v.is_empty());
     }
+
+    // ============================================================
+    // 真实 IP：预设展开与密钥
+    // ============================================================
+
+    use super::{default_real_ip_headers, expand_env, RealIpConfig, RealIpPreset};
+
+    #[test]
+    fn preset_overrides_default_header_order() {
+        let mut cfg = RealIpConfig {
+            preset: Some(RealIpPreset::AliyunCdn),
+            ..Default::default()
+        };
+        cfg.apply_preset();
+        assert_eq!(
+            cfg.header_priority,
+            vec!["Ali-Cdn-Real-Ip".to_string(), "X-Forwarded-For".to_string()],
+            "阿里云 CDN 专有头必须排在第一位，否则会被 XFF 抢先生效"
+        );
+    }
+
+    #[test]
+    fn preset_keeps_customized_header_order() {
+        let mut cfg = RealIpConfig {
+            preset: Some(RealIpPreset::AliyunCdn),
+            header_priority: vec!["X-My-Real-IP".to_string()],
+            ..Default::default()
+        };
+        cfg.apply_preset();
+        assert_eq!(cfg.header_priority, vec!["X-My-Real-IP".to_string()]);
+    }
+
+    #[test]
+    fn frp_preset_adds_loopback_and_dedupes() {
+        let mut cfg = RealIpConfig {
+            preset: Some(RealIpPreset::Frp),
+            ..Default::default()
+        };
+        cfg.apply_preset();
+        cfg.apply_preset();
+        assert_eq!(cfg.trusted_proxies.len(), 2, "重复展开不应累积条目");
+        assert!(cfg
+            .trusted_proxies
+            .contains(&"127.0.0.1/32".parse().unwrap()));
+    }
+
+    #[test]
+    fn cloud_presets_do_not_fake_whitelist() {
+        // 阿里云/腾讯云的回源网段不公开，预设里不能凭空写死网段
+        let mut cfg = RealIpConfig {
+            preset: Some(RealIpPreset::AliyunCdn),
+            ..Default::default()
+        };
+        cfg.apply_preset();
+        assert!(cfg.trusted_proxies.is_empty());
+        assert!(RealIpPreset::AliyunCdn.needs_secret());
+    }
+
+    #[test]
+    fn expand_env_replaces_known_and_keeps_unknown() {
+        std::env::set_var("HOMEWAF_TEST_SECRET", "abc123");
+        assert_eq!(expand_env("v=${HOMEWAF_TEST_SECRET}"), "v=abc123");
+        assert_eq!(
+            expand_env("${HOMEWAF_TEST_SECRET_NOT_SET}"),
+            "${HOMEWAF_TEST_SECRET_NOT_SET}",
+            "变量不存在时必须原样保留，否则密钥会静默变成空串"
+        );
+        assert_eq!(expand_env("plain"), "plain");
+        assert_eq!(expand_env("${unterminated"), "${unterminated");
+    }
+
+    #[test]
+    fn has_secret_requires_both_fields() {
+        let mut cfg = RealIpConfig::default();
+        assert!(!cfg.has_secret_header());
+        assert!(!cfg.has_secret());
+        cfg.secret_header = Some("X-Origin-Verify".into());
+        assert!(cfg.has_secret_header(), "只填头名也算开启了密钥信任");
+        assert!(!cfg.has_secret(), "但没有密钥值时不是严格模式");
+        cfg.secret = Some("0123456789abcdef".into());
+        assert!(cfg.has_secret());
+    }
+
+    #[test]
+    fn default_headers_include_aliyun_cdn() {
+        // 阿里云 CDN 默认就回源带这个头，放进默认顺序才能开箱可用
+        assert!(default_real_ip_headers()
+            .iter()
+            .any(|h| h == "Ali-Cdn-Real-Ip"));
+    }
 }
 
 /// 持久化配置。
@@ -454,8 +544,51 @@ pub struct RealIpConfig {
     #[serde(default)]
     pub trusted_proxy_groups: Vec<String>,
     pub header_priority: Vec<String>,
+    /// 回源密钥头名，例如阿里云 CDN 的 `X-Origin-Verify`。
+    ///
+    /// 有些云 CDN 的回源节点 IP 根本不公开（阿里云 CDN 的
+    /// `DescribeL2VipsByDomain` 要求日峰值带宽 ≥1Gbps 且需工单申请，
+    /// 返回的 IP 还会漂移），靠 IP 白名单不可行。此时改用
+    /// 「只有 CDN 会带」的密钥头来判定来源可信。
+    pub secret_header: Option<String>,
+    /// 回源密钥值。支持 `${ENV_VAR}` 插值，避免把密钥明文写进库/备份。
+    ///
+    /// 与 `secret_header` 必须同时配置；配置后，来源可信 =
+    /// 直连 IP 在 `trusted_proxies` 中 **或** 密钥头匹配。
+    pub secret: Option<String>,
     pub max_chain_depth: u8,
     pub on_untrusted_header: UntrustedHeaderAction,
+    /// 来源不可信时直接拒绝整个请求（不看有没有带转发头）。
+    ///
+    /// 开启后，源站只服务「可信来源」：`trusted_proxies` 里的内网/反代，
+    /// 以及带 `secret_header` 的 CDN 回源。公网直连源站（绕过 CDN）
+    /// 一律拒绝——这是「不依赖回源 IP 白名单」也能挡住绕过的办法。
+    ///
+    /// 代价：任何未经 CDN 的公网访问都会被拒，包括第三方回调、
+    /// 外部探针、ACME HTTP-01 验证、以及直接访问应用声明端口的场景。
+    pub require_trusted_source: bool,
+    /// 私有网段来源自动视为可信（RFC1918 / ULA / 回环 / 链路本地）。
+    ///
+    /// 解决两个实际的麻烦：
+    /// - 内网设备直连 WAF 时本来就不带转发头，不该逼用户把 `10.0.0.0/8`、
+    ///   `192.168.0.0/16`、`fd00::/8` 一条条抄进 `trusted_proxies`；
+    /// - 家宽 / 企业的 IPv6 前缀会变（运营商重新下发布前缀），手填的 `/64`
+    ///   过几天就失效，而 ULA（`fc00::/7`）与链路本地是稳定的。
+    ///
+    /// 私有地址不可能从公网源站出来（运营商不会路由），所以「私有即可信」
+    /// 不会引入公网伪造面；代价仅是**同一局域网内**的客户端可以伪造转发头，
+    /// 让日志记到假 IP。默认开启，家庭 / 办公内网场景下这个代价可以接受。
+    pub trust_private_source: bool,
+    /// 不判断来源，任何请求的转发头都采信（显式选择，默认关闭）。
+    ///
+    /// 用于源站**只能**从可信链路到达的场景（WAF 只绑内网网卡、上游必须是
+    /// 某个反代）。打开后 `trusted_proxies` / `secret_header` / 私有网段
+    /// 判定全部退化为「恒真」，防伪造链路等于关闭。
+    ///
+    /// 为什么不默认开启：这是一个 fail-open 开关。默认开会让「忘配网段」
+    /// 从「还原失效」静默降级成「全网可伪造 IP」，而且日志里看不出区别。
+    /// 作为显式选项，用户自己承担这个取舍；作为默认值，没人会察觉。
+    pub trust_any_source: bool,
     /// 日志同时记录直连 IP 与还原 IP
     pub log_both: bool,
 }
@@ -471,15 +604,100 @@ impl Default for RealIpConfig {
             header_priority: default_real_ip_headers(),
             max_chain_depth: 3,
             on_untrusted_header: UntrustedHeaderAction::Ignore,
+            // 默认关闭：开启后公网直连源站一律被拒，属于需要用户明确选择的强策略
+            require_trusted_source: false,
+            // 默认开启：内网直连不该被迫手填网段，也躲开 IPv6 前缀漂移
+            trust_private_source: true,
+            // 默认关闭：fail-open 开关必须显式选择
+            trust_any_source: false,
             log_both: true,
+            secret_header: None,
+            secret: None,
         }
     }
+}
+
+impl RealIpConfig {
+    /// 展开 `preset`：把预设的头序与固定回环网段填进配置。
+    ///
+    /// 只在用户没自定义头序（仍等于默认值）时覆盖 `header_priority`，
+    /// 这样「选预设」与「手工微调」不会互相打架。
+    pub fn apply_preset(&mut self) {
+        let Some(preset) = self.preset else { return };
+
+        if self.header_priority == default_real_ip_headers() {
+            self.header_priority = preset.headers().iter().map(|h| h.to_string()).collect();
+        }
+        for net in preset.trusted_proxies() {
+            if let Ok(net) = net.parse::<IpNet>() {
+                if !self.trusted_proxies.contains(&net) {
+                    self.trusted_proxies.push(net);
+                }
+            }
+        }
+    }
+
+    /// 把 `secret` 里的 `${ENV_VAR}` 替换成环境变量值。
+    ///
+    /// 只有整串或片段命中才替换；变量不存在时原样保留，启动校验会把它当成
+    /// 未配置的密钥而报错，而不是静默变成空字符串。
+    pub fn expand_secret(&mut self) {
+        if let Some(secret) = self.secret.take() {
+            self.secret = Some(expand_env(&secret));
+        }
+    }
+
+    /// 是否配了回源密钥头（只要头名非空即算）。
+    ///
+    /// 头名非空就意味着「密钥信任」这条路已开启：填了密钥值是严格模式，
+    /// 不填则退化为「头名即密钥」——适用于 CDN 把客户端 IP 写进自定义头的场景。
+    pub fn has_secret_header(&self) -> bool {
+        self.secret_header.as_deref().is_some_and(|h| !h.is_empty())
+    }
+
+    /// 是否配了「头名 + 密钥值」的严格模式。
+    pub fn has_secret(&self) -> bool {
+        self.has_secret_header() && self.secret.as_deref().is_some_and(|s| !s.is_empty())
+    }
+}
+
+/// 展开字符串里的 `${NAME}` 环境变量引用。
+pub fn expand_env(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        match after.find('}') {
+            Some(end) => {
+                let name = &after[..end];
+                match std::env::var(name) {
+                    Ok(value) => out.push_str(&value),
+                    // 变量不存在：原样保留，让校验阶段报「密钥没配」而不是空值
+                    Err(_) => {
+                        out.push_str("${");
+                        out.push_str(name);
+                        out.push('}');
+                    }
+                }
+                rest = &after[end + 1..];
+            }
+            None => {
+                out.push_str(&rest[start..]);
+                rest = "";
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 pub fn default_real_ip_headers() -> Vec<String> {
     vec![
         "CF-Connecting-IP".to_string(),
         "True-Client-IP".to_string(),
+        "Ali-Cdn-Real-Ip".to_string(),
         "X-Real-IP".to_string(),
         "X-Forwarded-For".to_string(),
     ]
@@ -493,6 +711,42 @@ pub enum RealIpPreset {
     TencentCdn,
     Cloudfront,
     Frp,
+}
+
+impl RealIpPreset {
+    /// 预设对应的转发头顺序。
+    ///
+    /// 各家专有头都放在 `X-Forwarded-For` 之前：专有头由 CDN 强制覆盖写入，
+    /// 客户端伪造无效；XFF 是追加式的，左侧可被污染，只能兜底。
+    pub fn headers(self) -> &'static [&'static str] {
+        match self {
+            RealIpPreset::Cloudflare => &["CF-Connecting-IP", "True-Client-IP", "X-Forwarded-For"],
+            RealIpPreset::AliyunCdn => &["Ali-Cdn-Real-Ip", "X-Forwarded-For"],
+            RealIpPreset::TencentCdn => &["X-Real-IP", "X-Forwarded-For"],
+            RealIpPreset::Cloudfront => &["CloudFront-Viewer-Address", "X-Forwarded-For"],
+            RealIpPreset::Frp => &["X-Forwarded-For", "X-Real-IP"],
+        }
+    }
+
+    /// 预设自带的可信代理网段。
+    ///
+    /// 只有 frp 这类「本机/内网入口」才有固定地址可填；云 CDN 的网段
+    /// 要么不公开（阿里云/腾讯云），要么需要单独订阅（Cloudflare），
+    /// 硬编码进预设会误导用户以为配了就能生效。
+    pub fn trusted_proxies(self) -> &'static [&'static str] {
+        match self {
+            RealIpPreset::Frp => &["127.0.0.1/32", "::1/128"],
+            _ => &[],
+        }
+    }
+
+    /// 该预设的回源 IP 是否不公开，必须靠密钥头才能判定来源可信。
+    pub fn needs_secret(self) -> bool {
+        matches!(
+            self,
+            RealIpPreset::AliyunCdn | RealIpPreset::TencentCdn | RealIpPreset::Cloudfront
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -1610,6 +1864,13 @@ pub struct Policy {
     pub deny_cidr: Option<Vec<IpNet>>,
     pub max_body_size: Option<Size>,
     pub ratelimit: Option<RateLimitConfig>,
+    /// 兼容位：`require_challenge` 已由应用级 `features.challenge` 取代。
+    ///
+    /// 库里存量的应用 JSON 仍带这个键（值为 null），而本结构开着
+    /// `deny_unknown_fields`，删掉字段会让整条应用解析失败——启动直接退出。
+    /// 因此保留一个只读占位：解析时吞掉，序列化时不再写出，下次保存即清理。
+    #[serde(default, rename = "require_challenge", skip_serializing)]
+    pub legacy_require_challenge: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]

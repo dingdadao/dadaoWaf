@@ -34,6 +34,29 @@ fn full_config_roundtrip_is_stable() {
 }
 
 #[test]
+fn legacy_require_challenge_key_still_parses() {
+    // 库里的存量应用 JSON 仍带 policy.require_challenge（值为 null）。
+    // Policy 开着 deny_unknown_fields，缺了兼容位会让整条应用解析失败 →
+    // load_state_from_db 返回 Err → 进程启动即退出。这条测试锁住该行为。
+    let json = r#"{
+        "id": "lei-1",
+        "name": "fn",
+        "domains": { "primary": "fn.niao.fun" },
+        "upstreams": [{ "addr": "10.0.0.5", "port": 8080 }],
+        "policy": { "preset": "balanced", "require_challenge": null },
+        "features": { "attack": true, "cc": true, "bot": false, "auth": false }
+    }"#;
+    let app: Application = serde_json::from_str(json).expect("存量应用应能解析");
+
+    // 回写时不应再出现该键，保存一次即完成清理
+    let out = serde_json::to_string(&app).unwrap();
+    assert!(
+        !out.contains("require_challenge"),
+        "旧键不应被重新写出: {out}"
+    );
+}
+
+#[test]
 fn duration_roundtrip_keeps_unit() {
     let yaml = r#"
 limits:

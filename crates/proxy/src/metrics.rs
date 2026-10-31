@@ -148,6 +148,34 @@ impl AppBucket {
             }
         }
     }
+
+    /// 加并另一个桶（重启种子合并用）。
+    /// 计数类字段相加，集合类字段取并，排行沿用 [`merge_top`] 的容量上限。
+    fn merge(&mut self, other: &AppBucket) {
+        self.requests += other.requests;
+        self.pv += other.pv;
+        self.blocked += other.blocked;
+        self.legacy_ips += other.legacy_ips;
+        self.legacy_visitors += other.legacy_visitors;
+        for (s, n) in &other.statuses {
+            *self.statuses.entry(*s).or_insert(0) += n;
+        }
+        for (ip, n) in &other.ips {
+            *self.ips.entry(*ip).or_insert(0) += n;
+        }
+        self.visitors.extend(other.visitors.iter().copied());
+        self.blocked_ips.extend(other.blocked_ips.iter().copied());
+        for (i, n) in other.os.iter().enumerate() {
+            self.os[i] += n;
+        }
+        for (i, n) in other.browsers.iter().enumerate() {
+            self.browsers[i] += n;
+        }
+        merge_top(&mut self.hosts, &other.hosts);
+        merge_top(&mut self.paths, &other.paths);
+        merge_top(&mut self.referer_hosts, &other.referer_hosts);
+        merge_top(&mut self.referer_urls, &other.referer_urls);
+    }
 }
 
 impl TrafficMetrics {
@@ -312,7 +340,11 @@ impl TrafficMetrics {
         data
     }
 
-    /// 已完成分钟桶的快照，供持久化线程使用。
+    /// 分钟桶快照，供持久化线程使用。
+    ///
+    /// 区间是开区间 `(after_minute, before_minute)`。传 `当前分钟 + 60` 作为上界
+    /// 即可把进行中的当前分钟一并导出——落库是 UPSERT 全量覆盖，重复写同一分钟
+    /// 幂等，因此把当前分钟提前落库没有副作用，只换来重启少丢数据。
     pub fn completed_buckets(&self, after_minute: i64, before_minute: i64) -> Vec<BucketSnapshot> {
         let inner = match self.inner.lock() {
             Ok(g) => g,
@@ -353,6 +385,50 @@ impl TrafficMetrics {
                     .collect::<Vec<_>>()
             })
             .collect()
+    }
+
+    /// 把「启动前已落库的分钟」种子合并进内存桶。
+    ///
+    /// 重启发生在某一分钟中段时，上一进程已经把该分钟的前半段落库；
+    /// 新进程若从零开始计数，落库的 UPSERT 全量覆盖会把旧计数冲掉。
+    /// 启动时先并入数据库里的同分钟数据，后续记录在种子之上累加，
+    /// 同一分钟的计数从此只增不减，覆盖写才安全。
+    ///
+    /// 只应在启动时、开始接受流量前调用一次；重复调用会重复累加。
+    pub fn seed_history(&self, rows: &[HistoricalBucket]) {
+        if rows.is_empty() {
+            return;
+        }
+        let mut inner = match self.inner.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        for row in rows {
+            // 按分钟有序插入，保持 record() 依赖的「尾部即当前分钟」不变式
+            let idx = match inner.buckets.iter().position(|b| b.minute == row.minute) {
+                Some(i) => i,
+                None => {
+                    let at = inner
+                        .buckets
+                        .iter()
+                        .position(|b| b.minute > row.minute)
+                        .unwrap_or(inner.buckets.len());
+                    inner.buckets.insert(
+                        at,
+                        Bucket {
+                            minute: row.minute,
+                            apps: HashMap::new(),
+                        },
+                    );
+                    at
+                }
+            };
+            inner.buckets[idx]
+                .apps
+                .entry(row.app.clone())
+                .or_default()
+                .merge(&row.to_bucket());
+        }
     }
 }
 
@@ -569,6 +645,23 @@ impl HistoricalBucket {
         b.legacy_ips = self.unique_ips.saturating_sub(b.ips.len() as u64);
         b.legacy_visitors = self.unique_visitors.saturating_sub(b.visitors.len() as u64);
         b
+    }
+}
+
+impl From<homewaf_store::TrafficDetailRow> for HistoricalBucket {
+    fn from(r: homewaf_store::TrafficDetailRow) -> Self {
+        HistoricalBucket {
+            minute: r.minute,
+            app: r.app,
+            requests: r.requests,
+            pv: r.pv,
+            blocked: r.blocked,
+            detail: r.detail,
+            status_4xx: r.status_4xx,
+            status_5xx: r.status_5xx,
+            unique_ips: r.unique_ips,
+            unique_visitors: r.unique_visitors,
+        }
     }
 }
 
@@ -994,5 +1087,62 @@ mod tests {
         assert_eq!(status("400"), 2, "旧行用 4xx 汇总降级");
         assert_eq!(d.paths[0].name, "/old");
         assert_eq!(d.hosts[0].name, "nas.home.lan");
+    }
+
+    #[test]
+    fn seed_history_merges_with_live_records() {
+        let m = TrafficMetrics::new();
+        let minute = NOW - NOW.rem_euclid(60);
+        let detail = r#"{"statuses":{"200":3},"ips":[["9.9.9.9",3]],"blocked_ips":[],"visitors":[42],"os":[0,0,0,0,0,0,3],"browsers":[0,0,0,0,0,0,0,0,0,3],"hosts":[["nas.home.lan",3]],"paths":[["/old",3]],"referer_hosts":[],"referer_urls":[]}"#;
+        m.seed_history(&[HistoricalBucket {
+            minute,
+            app: "nas".to_string(),
+            requests: 3,
+            pv: 3,
+            detail: detail.to_string(),
+            unique_ips: 1,
+            unique_visitors: 1,
+            ..Default::default()
+        }]);
+        // 重启后同分钟继续来流量：必须在种子之上累加，而不是从 0 重计
+        m.record(sample(NOW, "1.1.1.1", "/new", false));
+        m.record(sample(NOW, "1.1.1.1", "/new", false));
+
+        let buckets = m.completed_buckets(minute - 60, minute + 60);
+        assert_eq!(buckets.len(), 1);
+        assert_eq!(buckets[0].requests, 5, "种子计数与新记录累加");
+        assert_eq!(buckets[0].unique_ips, 2, "种子 IP 与新 IP 去重合并");
+        assert_eq!(buckets[0].unique_visitors, 2);
+        assert!(buckets[0].detail.contains("/old"));
+        assert!(buckets[0].detail.contains("/new"));
+    }
+
+    #[test]
+    fn seed_history_keeps_bucket_order_for_later_records() {
+        let m = TrafficMetrics::new();
+        let minute = NOW - NOW.rem_euclid(60);
+        m.seed_history(&[
+            HistoricalBucket {
+                minute: minute - 60,
+                app: "nas".to_string(),
+                requests: 1,
+                ..Default::default()
+            },
+            HistoricalBucket {
+                minute,
+                app: "nas".to_string(),
+                requests: 2,
+                ..Default::default()
+            },
+        ]);
+        // 种子之后新分钟的记录要能正常追加，且快照按分钟升序
+        m.record(sample(NOW + 60, "1.1.1.1", "/next", false));
+
+        let buckets = m.completed_buckets(minute - 120, minute + 120);
+        let minutes: Vec<i64> = buckets.iter().map(|b| b.minute).collect();
+        assert_eq!(minutes, vec![minute - 60, minute, minute + 60]);
+        assert_eq!(buckets[0].requests, 1);
+        assert_eq!(buckets[1].requests, 2);
+        assert_eq!(buckets[2].requests, 1);
     }
 }
